@@ -1,0 +1,46 @@
+# Independent backup project; do not merge into the application deployment.
+# BAKABEL_IMAGE must be the same actual immutable image ID as config.worker_image.
+# Complete the one-shot backup and independent restore drill before scheduling.
+services:
+  scheduler:
+    image: ${BAKABEL_IMAGE:?export the locally inspected immutable image ID}
+    command: ["--config", "/etc/bakabel/bakabel.yaml", "serve"]
+    labels:
+      bakabel.role: scheduler
+      bakabel.installation: backup-main
+    restart: unless-stopped
+    stop_grace_period: 30s
+    volumes:
+      - type: bind
+        source: ${BAKABEL_HOME:-/srv/bakabel}/bakabel.yaml
+        target: /etc/bakabel/bakabel.yaml
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${BAKABEL_HOME:-/srv/bakabel}/state
+        target: /var/lib/bakabel
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${BAKABEL_HOME:-/srv/bakabel}/repository
+        target: /repository
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${BAKABEL_HOME:-/srv/bakabel}/credentials/restic-password
+        target: /run/secrets/restic-password
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${DOCKER_SOCKET:-/var/run/docker.sock}
+        target: /var/run/docker.sock
+        read_only: true
+        bind:
+          create_host_path: false
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

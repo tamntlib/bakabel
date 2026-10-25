@@ -1,0 +1,10 @@
+# TEMPLATE: replace worker_image with the actual local image ID before use.
+version: 1
+installation: backup-main
+platform: compose
+scope: [myapp]
+repository: /repository
+credentials:
+  password_file: /run/secrets/restic-password
+worker_image: REPLACE_WITH_DOCKER_IMAGE_ID
+schedule: "0 2 * * *"

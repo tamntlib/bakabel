@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GO_IMAGE: golang:1.26.8-bookworm@sha256:dc9ad6c05acc7a88e5b71bde60a5fe3bd4b9f0db209011711b464107438a8107
+      RESTIC_IMAGE: restic/restic:0.18.1@sha256:39d9072fb5651c80d75c7a811612eb60b4c06b32ffe87c2e9f3c7222e1797e76
+      MODULE_CACHE: bakabel-ci-mod-${{ github.run_id }}-${{ github.run_attempt }}
+      BUILD_CACHE: bakabel-ci-build-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Prepare pinned tools and module cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker pull "$RESTIC_IMAGE"
+          extractor=$(docker create "$RESTIC_IMAGE" version)
+          trap 'docker rm "$extractor" >/dev/null' EXIT
+          docker cp "$extractor:/usr/bin/restic" "$RUNNER_TEMP/restic"
+          docker volume create "$MODULE_CACHE"
+          docker volume create "$BUILD_CACHE"
+          docker run --rm --cpus 2 --entrypoint taskset \
+            -e GOTOOLCHAIN=local -e GOMAXPROCS=2 \
+            -v "$PWD:/work" -w /work -v "$MODULE_CACHE:/go/pkg/mod" \
+            "$GO_IMAGE" -c 0,1 sh -c 'go mod download && go mod verify'
+      - name: Fixture transport and documentation guard tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          taskset -c 0,1 python3 -m unittest discover \
+            -s tests/integration/fixtures -p 'test_*.py' -v
+          taskset -c 0,1 python3 -m unittest discover \
+            -s tests -p test_documentation.py -v
+      - name: Race tests and vet
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --cpus 2 --entrypoint taskset \
+            -e GOTOOLCHAIN=local -e GOAMD64=v1 -e GOMAXPROCS=2 \
+            -e RESTIC_TEST_BINARY=/usr/bin/restic \
+            -v "$RUNNER_TEMP/restic:/usr/bin/restic:ro" \
+            -v "$PWD:/work" -w /work \
+            -v "$MODULE_CACHE:/go/pkg/mod" -v "$BUILD_CACHE:/root/.cache/go-build" \
+            "$GO_IMAGE" -c 0,1 sh -c 'umask 0077; go test -race -count=1 -v ./... && go vet ./...'
+      - name: Build and smoke-test minimal image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --build-arg BUILD_CPUSET=0,1 \
+            --cpu-quota 200000 --cpu-period 100000 -t bakabel:ci .
+          docker run --rm --network none --cpus 2 \
+            --entrypoint /usr/bin/restic bakabel:ci version
+      - name: Remove only this job's caches
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          for volume in "$MODULE_CACHE" "$BUILD_CACHE"; do
+            if docker volume inspect "$volume" >/dev/null 2>&1; then
+              docker volume rm "$volume"
+            fi
+          done

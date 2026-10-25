@@ -1,0 +1,160 @@
+name: Manual acceptance
+
+# Exclusive disposable VM only. No PR trigger, publication or production secrets.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bakabel-acceptance-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GO_IMAGE: golang:1.26.8-bookworm@sha256:dc9ad6c05acc7a88e5b71bde60a5fe3bd4b9f0db209011711b464107438a8107
+      RESTIC_IMAGE: restic/restic:0.18.1@sha256:39d9072fb5651c80d75c7a811612eb60b4c06b32ffe87c2e9f3c7222e1797e76
+      PG_IMAGE: postgres:18.6-alpine3.24@sha256:83148c0bc09eac4d598b70a61e1404d0212b76c95c504bfd6c81a4c59ec91792
+      MINIO_SOURCE_SHA256: 267c949e03f6d931f3b2da07c067f02483cb2b2604b627e1eb9b96acb0fd9192
+      HELPER: bakabel-minio-build-${{ github.run_id }}-${{ github.run_attempt }}
+      CANDIDATE: bakabel:acceptance-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install pinned rootful Engine on disposable hosted VM
+        id: engine
+        uses: docker/setup-docker-action@e43656e248c0bd0647d3f5c195d116aacf6fcaf4 # v4
+        with:
+          version: v29.6.1
+          rootless: false
+          daemon-config: '{"features":{"containerd-snapshotter":true}}'
+      - name: Preflight without changing daemon policy
+        env:
+          ENGINE_SOCKET: ${{ steps.engine.outputs.sock }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test "$GITHUB_ACTIONS" = true
+          test -S "$ENGINE_SOCKET"
+          printf 'DOCKER_HOST=unix://%s\nENGINE_SOCKET=%s\n' "$ENGINE_SOCKET" "$ENGINE_SOCKET" >> "$GITHUB_ENV"
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP \
+            python3 tests/integration/fixtures/run_hosted_acceptance.py \
+            --socket "$ENGINE_SOCKET" --exclusive-hosted-daemon --preflight-only
+          python3 - <<'PY'
+          import os, shutil
+          from pathlib import Path
+          assert {0,1} <= os.sched_getaffinity(0), 'CPU 0,1 unavailable'
+          memory=int(next(l.split()[1] for l in Path('/proc/meminfo').read_text().splitlines() if l.startswith('MemTotal:')))*1024
+          assert memory >= 4*1024**3, 'at least 4 GiB VM RAM required'
+          assert shutil.disk_usage(os.environ['RUNNER_TEMP']).free >= 12*1024**3, 'at least 12 GiB scratch space required'
+          PY
+      - name: Offline fixture and documentation tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          taskset -c 0,1 python3 -m unittest discover -s tests/integration/fixtures -p 'test_*.py' -v
+          taskset -c 0,1 python3 -m unittest discover -s tests -p test_documentation.py -v
+      - name: Fetch pinned tools and verified unmodified MinIO source
+        shell: bash
+        run: |
+          set -euo pipefail
+          for image in "$GO_IMAGE" "$RESTIC_IMAGE" "$PG_IMAGE"; do docker pull "$image"; done
+          docker tag "$GO_IMAGE" golang:1.26.8-bookworm
+          docker tag "$RESTIC_IMAGE" restic/restic:0.18.1
+          docker tag "$PG_IMAGE" postgres:18.6-alpine3.24
+          mkdir -m 0700 "$RUNNER_TEMP/bakabel-tools"
+          curl --fail --location --retry 3 \
+            https://codeload.github.com/minio/minio/tar.gz/refs/tags/RELEASE.2024-01-18T22-51-28Z \
+            --output "$RUNNER_TEMP/bakabel-tools/minio.tar.gz"
+          python3 - <<'PY'
+          import hashlib, os, tarfile
+          from pathlib import Path
+          root=Path(os.environ['RUNNER_TEMP'])/'bakabel-tools'
+          archive=root/'minio.tar.gz'
+          assert hashlib.sha256(archive.read_bytes()).hexdigest()==os.environ['MINIO_SOURCE_SHA256'], 'upstream archive changed'
+          with tarfile.open(archive) as tar: tar.extractall(root,filter='data')
+          PY
+          docker run --rm --name "$HELPER" --cpus 2 --entrypoint taskset \
+            -e CGO_ENABLED=0 -e GOAMD64=v1 -e GOMAXPROCS=2 -e GOTOOLCHAIN=local \
+            -v "$RUNNER_TEMP/bakabel-tools:/build" \
+            -w /build/minio-RELEASE.2024-01-18T22-51-28Z \
+            "$GO_IMAGE" -c 0,1 go build -p 2 -trimpath -o /build/minio .
+          test -x "$RUNNER_TEMP/bakabel-tools/minio"
+      - name: Build candidate and bind exact commit source image and daemon
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --platform linux/amd64 --build-arg BUILD_CPUSET=0,1 \
+            --cpu-quota 200000 --cpu-period 100000 -t "$CANDIDATE" .
+          python3 - <<'PY'
+          import hashlib,json,os,subprocess,sys
+          from pathlib import Path
+          sys.path.insert(0,'tests/integration/fixtures')
+          from run_compose_pg_acceptance import fingerprint
+          from run_resource_probe import Engine
+          engine=Engine(os.environ['ENGINE_SOCKET'])
+          source=Path.cwd()
+          commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          assert commit==os.environ['GITHUB_SHA'], 'checkout does not match workflow SHA'
+          image=json.loads(subprocess.check_output(['docker','image','inspect',os.environ['CANDIDATE']],text=True))[0]['Id']
+          report={'commit':commit,'source_sha256':fingerprint(source),'image_id':image,'daemon':engine.call('GET','/info')['ID'],'minio_source_sha256':os.environ['MINIO_SOURCE_SHA256'],'minio_binary_sha256':hashlib.sha256((Path(os.environ['RUNNER_TEMP'])/'bakabel-tools/minio').read_bytes()).hexdigest(),'docker_version':engine.call('GET','/version')['Version']}
+          (Path(os.environ['RUNNER_TEMP'])/'bakabel-candidate.json').write_text(json.dumps(report,indent=2)+'\n')
+          PY
+      - name: Real Compose and Swarm local and S3 core CLI matrix
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_hash=$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/bakabel-candidate.json"))["source_sha256"])')
+          image_id=$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/bakabel-candidate.json"))["image_id"])')
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP \
+            taskset -c 0,1 python3 tests/integration/fixtures/run_hosted_acceptance.py \
+            --socket "$ENGINE_SOCKET" --exclusive-hosted-daemon --platform all \
+            --source "$PWD" --runtime "$RUNNER_TEMP/bakabel-acceptance" \
+            --minio-binary "$RUNNER_TEMP/bakabel-tools/minio" --image "$image_id" \
+            --expected-source-sha256 "$source_hash" --expected-image-id "$image_id"
+      - name: Independent exact-target cleanup and receipt readback
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo taskset -c 0,1 python3 tests/integration/fixtures/verify_hosted_acceptance.py \
+            --socket "$ENGINE_SOCKET" --source "$PWD" \
+            --candidate "$RUNNER_TEMP/bakabel-candidate.json" \
+            --runtime "$RUNNER_TEMP/bakabel-acceptance" \
+            --output "$RUNNER_TEMP/bakabel-acceptance/verified.json"
+      - name: Export only allowlisted evidence even on failure
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -d "$RUNNER_TEMP/bakabel-acceptance"; then
+            if test -f "$RUNNER_TEMP/bakabel-candidate.json"; then
+              sudo cp "$RUNNER_TEMP/bakabel-candidate.json" "$RUNNER_TEMP/bakabel-acceptance/candidate.json"
+            fi
+            sudo taskset -c 0,1 python3 tests/integration/fixtures/hosted_evidence.py \
+              --runtime "$RUNNER_TEMP/bakabel-acceptance" --output "$RUNNER_TEMP/bakabel-public"
+            sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/bakabel-public"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: acceptance-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/bakabel-public/
+          if-no-files-found: warn
+          retention-days: 7
+          include-hidden-files: false
+      - name: Remove exact build helper if interrupted
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -n "${ENGINE_SOCKET:-}" && test -S "$ENGINE_SOCKET"; then
+            if docker container inspect "$HELPER" >/dev/null 2>&1; then docker rm -f "$HELPER"; fi
+          fi
+          # setup-docker-action tears down its daemon; the hosted VM is discarded.
+          # Never broad-prune or fall back to another Docker context.

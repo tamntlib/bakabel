@@ -1,0 +1,15 @@
+/bakabel
+/build/
+/dist/
+/evidence/
+/.test*/
+/.b2-*/
+**/files-fixture-*/
+.env
+.env.*
+.local*
+/credentials/
+/secrets/
+/bakabel.local.yaml
+__pycache__/
+*.pyc

@@ -1,0 +1,46 @@
+# Independent backup stack, on the exact manager holding the source volumes.
+# BAKABEL_IMAGE: locally inspected image ID also used in config.worker_image.
+# Replace REPLACE_WITH_EXACT_MANAGER_NODE_ID; prepare host paths on that node.
+# Complete the one-shot backup and independent restore drill before scheduling.
+version: "3.8"
+services:
+  scheduler:
+    image: ${BAKABEL_IMAGE:?export the locally inspected immutable image ID}
+    command: ["--config", "/etc/bakabel/bakabel.yaml", "serve"]
+    stop_grace_period: 30s
+    # Container labels are required even in Swarm, not only deploy.labels.
+    labels:
+      bakabel.role: scheduler
+      bakabel.installation: backup-main
+    volumes:
+      - type: bind
+        source: ${BAKABEL_HOME:-/srv/bakabel}/bakabel.yaml
+        target: /etc/bakabel/bakabel.yaml
+        read_only: true
+      - type: bind
+        source: ${BAKABEL_HOME:-/srv/bakabel}/state
+        target: /var/lib/bakabel
+      - type: bind
+        source: ${BAKABEL_HOME:-/srv/bakabel}/repository
+        target: /repository
+      - type: bind
+        source: ${BAKABEL_HOME:-/srv/bakabel}/credentials/restic-password
+        target: /run/secrets/restic-password
+        read_only: true
+      - type: bind
+        source: ${DOCKER_SOCKET:-/var/run/docker.sock}
+        target: /var/run/docker.sock
+        read_only: true
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+          - node.id == REPLACE_WITH_EXACT_MANAGER_NODE_ID
+      restart_policy:
+        condition: on-failure
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
