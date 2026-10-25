@@ -2,10 +2,34 @@
 from pathlib import Path
 import re
 import unittest
+import os
+import socket
+import subprocess
+import sys
+import tempfile
 
 ROOT=Path(__file__).resolve().parents[3]
 
 class WorkflowContract(unittest.TestCase):
+    def test_action_socket_uri_becomes_real_unix_socket_path(self):
+        text=(ROOT/'.github/workflows/acceptance.yaml').read_text()
+        normalization='ENGINE_SOCKET=${ENGINE_SOCKET#unix://}'
+        self.assertIn(normalization,text)
+        self.assertLess(text.index(normalization),text.index('test -S "$ENGINE_SOCKET"'))
+        with tempfile.TemporaryDirectory() as directory:
+            path=str(Path(directory)/'docker.sock')
+            with socket.socket(socket.AF_UNIX) as listener:
+                listener.bind(path)
+                for endpoint in (path,'unix://'+path):
+                    cp=subprocess.run(['bash','-eu','-c',normalization+'; test -S "$ENGINE_SOCKET"'],env={**os.environ,'ENGINE_SOCKET':endpoint},capture_output=True)
+                    self.assertEqual(cp.returncode,0)
+
+    def test_resource_test_needs_no_hermes_home_on_clean_runner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home=Path(directory)/'home';home.mkdir()
+            cp=subprocess.run([sys.executable,'-m','unittest','test_resource_failure.FailureProof.test_space_probe_preserves_errno_and_removes_own_probe'],cwd=ROOT/'tests/integration/fixtures',env={**os.environ,'HOME':str(home)},text=True,capture_output=True)
+            self.assertEqual(cp.returncode,0,cp.stderr)
+
     def test_manual_vm_direct_engine_and_allowlisted_artifacts(self):
         path=ROOT/'.github/workflows/acceptance.yaml'
         self.assertTrue(path.exists(),'manual acceptance workflow is missing')

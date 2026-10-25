@@ -26,7 +26,7 @@ class FailureProof(unittest.TestCase):
         with self.assertRaises(AssertionError):
             assert_bounded_recovery(job,'2026-01-01T00:00:45.5Z','2026-01-01T00:01:10Z')
     def test_space_probe_preserves_errno_and_removes_own_probe(self):
-        with tempfile.TemporaryDirectory(dir=Path.home()/'.hermes/cache/scratch') as d:
+        with tempfile.TemporaryDirectory() as d:
             p=Path(d)
             self.assertEqual(minimal_space_probe(p)['errno'],0)
             self.assertEqual(list(p.iterdir()),[])

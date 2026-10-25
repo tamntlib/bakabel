@@ -41,6 +41,7 @@ jobs:
           set -euo pipefail
           test "$RUNNER_ENVIRONMENT" = github-hosted
           test "$GITHUB_ACTIONS" = true
+          ENGINE_SOCKET=${ENGINE_SOCKET#unix://}
           test -S "$ENGINE_SOCKET"
           printf 'DOCKER_HOST=unix://%s\nENGINE_SOCKET=%s\n' "$ENGINE_SOCKET" "$ENGINE_SOCKET" >> "$GITHUB_ENV"
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP \
