@@ -10,6 +10,9 @@ def public_receipt(raw):
     fields=('platform','source_sha256','image_id','daemon','started_at','finished_at','runtime_matrix_pass','full_plan_acceptance_pass','direct_engine','cpu_fields_omitted','cells','file_restore_exercised','swarm_exercised')
     out={k:raw[k] for k in fields if k in raw}
     out['failed']=bool(raw.get('error') or raw.get('cleanup_error'))
+    if 'failure' in raw:
+        failure=raw['failure']
+        out['failure']={'kind':failure['kind'],'frames':[{k:f[k] for k in ('file','line','function')} for f in failure['frames']]}
     out['gates']=[g['name'] for g in raw.get('gates',[])]
     cleanup=raw.get('cleanup',{})
     out['cleanup']={k:cleanup[k] for k in ('containers_absent','volumes_absent','private_paths_absent') if k in cleanup}

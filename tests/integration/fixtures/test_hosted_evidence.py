@@ -3,6 +3,22 @@ import importlib
 import unittest
 
 class ArtifactSafety(unittest.TestCase):
+    def test_failure_location_exposes_no_exception_text_or_locals(self):
+        import run_hosted_acceptance as runner
+        self.assertTrue(hasattr(runner,'failure_location'),'hosted failures need safe source locations, not secret-bearing tracebacks')
+        secret='unit-exception-text-must-not-escape'
+        try:raise RuntimeError(secret)
+        except RuntimeError as error:location=runner.failure_location(error)
+        import json
+        self.assertNotIn(secret,json.dumps(location))
+        self.assertEqual(location['kind'],'RuntimeError')
+        self.assertEqual(location['frames'][-1]['file'],'test_hosted_evidence.py')
+        self.assertIsInstance(location['frames'][-1]['line'],int)
+        m=importlib.import_module('hosted_evidence')
+        public=m.public_receipt({'failure':{**location,'message':secret},'error':secret})
+        self.assertNotIn(secret,json.dumps(public))
+        self.assertEqual(public['failure'],location)
+
     def test_raw_commands_errors_env_and_arbitrary_fields_are_never_exported(self):
         try:m=importlib.import_module('hosted_evidence')
         except ModuleNotFoundError:m=None

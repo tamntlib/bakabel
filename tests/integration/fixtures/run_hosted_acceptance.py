@@ -275,6 +275,10 @@ class HostedProbe(ComposeProbe):
         self.save()
 
 
+def failure_location(error):
+    return {'kind':type(error).__name__,'frames':[{'file':Path(frame.filename).name,'line':frame.lineno,'function':frame.name} for frame in traceback.extract_tb(error.__traceback__)]}
+
+
 def run_platform(args):
     # Construction is inventory + owned file setup only, never Engine writes.
     # Keep the partially initialized object reachable if credential copy fails.
@@ -290,6 +294,8 @@ def run_platform(args):
         error=type(exc).__name__
         result['error']=error
         result['error_frames']=traceback.format_tb(exc.__traceback__)
+        result['failure']=failure_location(exc)
+        print(json.dumps({'failure':result['failure']}),flush=True)
     finally:
         try:
             if initialized:
