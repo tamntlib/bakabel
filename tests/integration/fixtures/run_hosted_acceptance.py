@@ -218,7 +218,14 @@ class HostedProbe(ComposeProbe):
         self.remove_source(checker,keep_volumes=True)
         self.call_cli('restore','--snapshot',snapshot,'--volume',alternate,fresh=True,expect=1)
         self.gate(backend+'-file-alternate-same-backing-volume-refused',same_device_inode=True,reason_boundary='aliased non-default driver is inadmissible; not an unmeasured branch claim')
-        current=self.second_snapshots[backend]
+        self.result['backends'][backend]['file_restore_exercised']=True
+        self.result['cells'][backend]=['postgres','volume']
+
+    def refuse_incomplete_snapshots(self,backend,current):
+        # Retag needs an exclusive repository lock. Do this before deliberate
+        # SIGKILL can leave another container's young shared Restic lock behind.
+        # Never force-unlock a repository merely to make acceptance pass.
+        empty=self.restores[backend]['directory']
         for previous,status in (('complete','unknown'),('unknown','partial')):
             self.restic('tag','--remove','bakabel.status='+previous,'--add','bakabel.status='+status,current)
             snapshots=json.loads(self.restic('snapshots','--json'))
@@ -226,21 +233,18 @@ class HostedProbe(ComposeProbe):
             self.call_cli('restore','--snapshot',current,'--directory',str(empty),fresh=True,expect=1)
             if list(empty.iterdir()):raise ValueError('incomplete snapshot wrote destination')
         self.gate(backend+'-file-unknown-partial-refused',method='real operator Restic retag; not a generated exit3 claim')
-        self.result['backends'][backend]['file_restore_exercised']=True
-        self.result['cells'][backend]=['postgres','volume']
 
     def gate(self,name,**kw):
         backend=name.split('-',1)[0]
         if name.endswith('-mixed-online-CLI-backup-with-default-worker-limits'):
             self.source_snapshots[backend]=kw['file_snapshot']
-        if name.endswith('-file-parent-reused-no-new-data-and-complete-payload-readback'):
-            self.second_snapshots[backend]=kw['second']
         super().gate(name,**kw)
+        if name.endswith('-file-parent-reused-no-new-data-and-complete-payload-readback'):
+            self.refuse_incomplete_snapshots(backend,kw['second'])
         if name.endswith('-fresh-source-and-history-absent-PG-restore-different-role-OIDs-owner-ACL-preserved'):
             self.restore_files(backend,self.result['backends'][backend]['file_snapshot'])
 
     def run(self):
-        self.second_snapshots={}
         if self.platform=='swarm':
             self.e.call('POST','/swarm/init',{'ListenAddr':'127.0.0.1:2377','AdvertiseAddr':'127.0.0.1','DataPathAddr':'127.0.0.1','Spec':{'Name':self.prefix}})
             self.owns_swarm=True

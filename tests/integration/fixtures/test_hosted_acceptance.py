@@ -6,6 +6,17 @@ import tempfile
 import unittest
 
 class HostedPreflight(unittest.TestCase):
+    def test_status_negatives_execute_before_parent_injects_worker_kill(self):
+        m=self.module()
+        from unittest.mock import patch
+        probe=m.HostedProbe.__new__(m.HostedProbe)
+        probe.second_snapshots={}
+        events=[]
+        probe.refuse_incomplete_snapshots=lambda backend,snapshot:events.append((backend,snapshot))
+        with patch.object(m.ComposeProbe,'gate',return_value=None):
+            probe.gate('local-file-parent-reused-no-new-data-and-complete-payload-readback',second='exact-second-snapshot')
+        self.assertEqual(events,[('local','exact-second-snapshot')])
+
     def module(self):
         try:
             module=importlib.import_module('run_hosted_acceptance')
