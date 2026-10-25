@@ -6,6 +6,17 @@ import tempfile
 import unittest
 
 class HostedPreflight(unittest.TestCase):
+    def test_swarm_init_keeps_engine_default_cluster_name_and_tracks_intent(self):
+        m=self.module()
+        from unittest.mock import Mock
+        probe=m.HostedProbe.__new__(m.HostedProbe)
+        probe.platform='swarm';probe.prefix='owned';probe.owns_swarm=False
+        probe.e=Mock();probe.e.call.side_effect=RuntimeError('unit-only lost init response')
+        with self.assertRaises(RuntimeError):probe.run()
+        body=probe.e.call.call_args.args[2]
+        self.assertEqual(body.get('Spec',{}).get('Name','default'),'default')
+        self.assertTrue(probe.owns_swarm,'fresh exclusive daemon initialization must remain cleanup-owned if its response is lost')
+
     def test_status_negatives_execute_before_parent_injects_worker_kill(self):
         m=self.module()
         from unittest.mock import patch

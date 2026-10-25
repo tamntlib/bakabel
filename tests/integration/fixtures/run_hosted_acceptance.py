@@ -246,8 +246,8 @@ class HostedProbe(ComposeProbe):
 
     def run(self):
         if self.platform=='swarm':
-            self.e.call('POST','/swarm/init',{'ListenAddr':'127.0.0.1:2377','AdvertiseAddr':'127.0.0.1','DataPathAddr':'127.0.0.1','Spec':{'Name':self.prefix}})
             self.owns_swarm=True
+            self.e.call('POST','/swarm/init',{'ListenAddr':'127.0.0.1:2377','AdvertiseAddr':'127.0.0.1','DataPathAddr':'127.0.0.1'})
             if self.e.call('GET','/info')['Swarm']['LocalNodeState']!='active':raise ValueError('Swarm init not observed')
         super().run()
         verify_matrix(self.result)
@@ -263,7 +263,9 @@ class HostedProbe(ComposeProbe):
             self.e.call('DELETE','/services/'+sid,missing=True)
         self.services.clear()
         if self.owns_swarm:
-            self.e.call('POST','/swarm/leave?force=true')
+            if self.e.call('GET','/info')['Swarm']['LocalNodeState']!='inactive':
+                self.e.call('POST','/swarm/leave?force=true')
+                self.wait(lambda:self.e.call('GET','/info')['Swarm']['LocalNodeState']=='inactive',30,'owned Swarm leave readback')
             self.owns_swarm=False
         for path in list(reversed(self.mounted)):self.unmount(path)
         super().cleanup()
