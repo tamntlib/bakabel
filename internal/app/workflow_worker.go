@@ -128,7 +128,9 @@ func advanceDumpCheckpoint(o *state.Owner, proof docker.TerminalProof, verificat
 }
 
 func backupFileTarget(ctx context.Context, c *docker.Client, repo backup.Repository, j workflowJob, t docker.Target) backup.Result {
-	fail := func(e error) backup.Result { return backup.Result{Status: "unknown", Err: e} }
+	fail := func(e error) backup.Result {
+		return backup.Result{Status: "unknown", Err: e, FailureStage: "file_preflight"}
+	}
 	if len(t.Mounts) != 1 {
 		return fail(docker.ErrQuarantine)
 	}
@@ -155,6 +157,25 @@ func backupFileTarget(ctx context.Context, c *docker.Client, repo backup.Reposit
 		forbidden = append(forbidden, j.Config.Repository)
 	}
 	return files.Backup(ctx, repo, m, j.RunID+"-"+targetHash(t.ID), j.Config.Installation, forbidden, j.Protected...)
+}
+
+func backupTargetResult(id string, res backup.Result) TargetResult {
+	tr := TargetResult{TargetID: id, Status: res.Status, SnapshotID: res.SnapshotID, Error: "backup failed"}
+	if res.Err == nil && res.Status == "complete" {
+		tr.Error = ""
+	}
+	if res.Err != nil {
+		tr.FailureCode = res.FailureStage
+		var commandErr *backup.CommandError
+		if errors.As(res.Err, &commandErr) {
+			exit := commandErr.ExitCode()
+			if exit >= 0 && exit <= 255 {
+				tr.ResticExitCode = &exit
+			}
+			tr.ResticReason = commandErr.Reason()
+		}
+	}
+	return tr
 }
 
 func runWorkflow(ctx context.Context) int {
@@ -208,11 +229,7 @@ func runWorkflow(ctx context.Context) int {
 			} else {
 				res = backupFileTarget(ctx, c, repo, j, t)
 			}
-			tr.Status = res.Status
-			tr.SnapshotID = res.SnapshotID
-			if res.Err == nil && res.Status == "complete" {
-				tr.Error = ""
-			}
+			tr = backupTargetResult(t.ID, res)
 			current, err := o.Load()
 			blocked = err != nil || current.Phase == state.PhaseQuarantine || current.SourceContainerID != ""
 		}

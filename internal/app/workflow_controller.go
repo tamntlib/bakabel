@@ -52,6 +52,22 @@ func readWorkflowResult(c config.Config, j workflowJob) (WorkflowResult, error) 
 	}
 	success := true
 	for i, tr := range res.Targets {
+		if (tr.FailureCode != "" || tr.ResticExitCode != nil || tr.ResticReason != "") && (j.Restore != nil || tr.Error != "backup failed") {
+			return res, docker.ErrQuarantine
+		}
+		switch tr.FailureCode {
+		case "", "file_preflight", "list_before", "backup", "list_after", "source_verification", "tag", "final_readback", "metadata_readback":
+		default:
+			return res, docker.ErrQuarantine
+		}
+		switch tr.ResticReason {
+		case "", "enospc", "permission", "backend", "unknown":
+		default:
+			return res, docker.ErrQuarantine
+		}
+		if tr.ResticExitCode != nil && (*tr.ResticExitCode < 0 || *tr.ResticExitCode > 255) {
+			return res, docker.ErrQuarantine
+		}
 		if j.Restore == nil && tr.Status == "restored" || j.Restore != nil && (tr.Status == "complete" || tr.SnapshotID != j.Restore.SnapshotID) {
 			return res, docker.ErrQuarantine
 		}

@@ -12,7 +12,9 @@ import (
 // The caller owns worker lifecycle and the installation lock. Unreadable files
 // and Restic exit 3 propagate through the existing exact snapshot finalizer.
 func Backup(ctx context.Context, r backup.Repository, m backup.Metadata, run, installation string, forbidden []string, protected ...ProtectedIdentity) backup.Result {
-	fail := func(e error) backup.Result { return backup.Result{Status: "unknown", Err: e} }
+	fail := func(e error) backup.Result {
+		return backup.Result{Status: "unknown", Err: e, FailureStage: "file_preflight"}
+	}
 	if installation == "" || m.Kind != "volume" || len(m.Paths) != 1 || len(m.Mounts) != 1 || m.Mounts[0].SnapshotPath != WorkerPath(m.Source, m.Mounts[0].Destination) {
 		return fail(errors.New("single stable volume source required"))
 	}

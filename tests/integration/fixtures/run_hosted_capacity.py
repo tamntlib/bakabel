@@ -24,7 +24,7 @@ from run_compose_pg_acceptance import fingerprint
 from run_hosted_acceptance import require_hosted_daemon, failure_location
 
 # Reviewed completion-protocol candidate; never infer admission from CLI input.
-STOCK_SOURCE = 'bac9e9eef9e4a4fd303f2a515a69d25f48a6b76c186c63d295cab61d23238322'
+STOCK_SOURCE = '87ae2798a7c388c0eaad4d17e7604758000db052d34dc08c73282f3b8fabf9ac'
 
 
 FILES = 8192
@@ -68,6 +68,18 @@ def project_outcomes(rows):
     def code(row):
         value = row.get('error')
         return codes.get(value, 'unknown') if isinstance(value, str) else 'unknown'
+    def failure(row):
+        stages = ('file_preflight', 'list_before', 'backup', 'list_after',
+                  'source_verification', 'tag', 'final_readback', 'metadata_readback')
+        reasons = ('enospc', 'permission', 'backend', 'unknown')
+        fields = {}
+        if row.get('failureCode') in stages:
+            fields['failure_code'] = row['failureCode']
+        if type(row.get('resticExitCode')) is int and 0 <= row['resticExitCode'] <= 255:
+            fields['restic_exit_code'] = row['resticExitCode']
+        if row.get('resticReason') in reasons:
+            fields['restic_reason'] = row['resticReason']
+        return fields
     if len(rows) > 128:
         raise ValueError('capacity diagnostic row bound exceeded')
     out = []
@@ -78,7 +90,7 @@ def project_outcomes(rows):
         if not isinstance(targets, list) or len(targets) > 128:
             raise ValueError('capacity diagnostic target bound exceeded')
         out.append({'status': status(row), 'error_code': code(row),
-                    'targets': [{'status': status(t), 'error_code': code(t)}
+                    'targets': [{'status': status(t), 'error_code': code(t), **failure(t)}
                                 for t in targets if isinstance(t, dict)]})
     return out
 
@@ -125,6 +137,9 @@ def project_sample(raw):
            'memory_events': selected_numbers(kv_numbers(raw.get('memory.events', '')), {'oom', 'oom_kill', 'max', 'high', 'low'}),
            'log_bytes': numeric(raw.get('log_bytes')),
            'tmp_capacity_bytes': numeric(raw.get('tmp_capacity_bytes'))}
+    for key in ('tmp_available_bytes', 'tmp_used_bytes'):
+        value = raw.get(key)
+        out[key] = value if type(value) is int and value >= 0 else None
     for source, target in (('tmp_cache_footprint', 'tmp'), ('state_footprint', 'state')):
         out[target] = {k: numeric(raw[source].get(k)) for k in
                        ('files', 'bytes', 'allocated_bytes', 'unlinked_during_sample')} if source in raw else None
@@ -150,6 +165,7 @@ def summarize_samples(samples):
                       if s['processes'] and all(p[key] is not None for p in s['processes'])]
             return peak(totals)
         first, last = ss[0], ss[-1]
+        available = [s['tmp_available_bytes'] for s in ss if s.get('tmp_available_bytes') is not None]
         io_delta = None
         if first['io_devices'] is not None and last['io_devices'] is not None:
             io_delta = {dev: counter_delta(first['io_devices'][dev], last['io_devices'][dev])
@@ -173,6 +189,8 @@ def summarize_samples(samples):
                      'sampled_process_pss_sum_peak_bytes': proc_peak('pss_bytes'),
                      'process_pss_missing_observations': sum(p['pss_bytes'] is None for s in ss for p in s['processes']),
                      'sampled_tmp_bytes_peak': peak(s['tmp']['bytes'] for s in ss if s['tmp']),
+                     'sampled_tmp_available_bytes_min': min(available) if available else None,
+                     'sampled_tmp_used_bytes_peak': peak(s.get('tmp_used_bytes') for s in ss),
                      'sampled_state_bytes_peak': peak(s['state']['bytes'] for s in ss if s['state']),
                      **{kind+'_unlinked_during_sample':
                         sum(s[kind]['unlinked_during_sample'] for s in ss)
@@ -181,7 +199,11 @@ def summarize_samples(samples):
                      'sampled_log_bytes_peak': peak(s['log_bytes'] for s in ss),
                      'cgroup_cpu_observed_seconds': cpu['usage_usec']/1e6 if cpu and 'usage_usec' in cpu else None,
                      'cgroup_io_observed_delta': io_delta})
-    return {'containers': rows, 'sample_count': len(samples), 'limits': LIMITS}
+    return {'containers': rows, 'sample_count': len(samples), 'limits': LIMITS,
+            'tmp_filesystem_boundary':
+                'Filesystem occupancy includes other files and open-unlinked packs, not just named cache files. '
+                'Available-byte minima and used-byte peaks are sampled, not continuous or failure-instant proof; '
+                'zero available bytes alone does not prove ENOSPC.'}
 
 
 def generate_corpus(directory, files=FILES, file_bytes=FILE_BYTES, *, changed=None):
@@ -644,6 +666,10 @@ class CapacityProbe(Probe):
             try:
                 s = os.statvfs(Path('/proc')/str(row['main_pid'])/'root/tmp')
                 row['tmp_capacity_bytes'] = s.f_blocks*s.f_frsize
+                # Filesystem occupancy includes open-unlinked Restic packs that
+                # a named-file footprint cannot see; it is not pack attribution.
+                row['tmp_available_bytes'] = s.f_bavail*s.f_frsize
+                row['tmp_used_bytes'] = (s.f_blocks-s.f_bfree)*s.f_frsize
             except (FileNotFoundError, ProcessLookupError, PermissionError):
                 pass
         return row

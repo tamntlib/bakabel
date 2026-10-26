@@ -36,10 +36,13 @@ type WorkflowHandle struct {
 }
 
 type TargetResult struct {
-	TargetID   string `json:"targetID"`
-	Status     string `json:"status"`
-	SnapshotID string `json:"snapshotID,omitempty"`
-	Error      string `json:"error,omitempty"`
+	TargetID       string `json:"targetID"`
+	Status         string `json:"status"`
+	SnapshotID     string `json:"snapshotID,omitempty"`
+	Error          string `json:"error,omitempty"`
+	FailureCode    string `json:"failureCode,omitempty"`
+	ResticExitCode *int   `json:"resticExitCode,omitempty"`
+	ResticReason   string `json:"resticReason,omitempty"`
 }
 
 type WorkflowResult struct {

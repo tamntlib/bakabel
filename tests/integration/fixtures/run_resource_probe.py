@@ -55,13 +55,33 @@ def footprint(path):
             out['files'] += 1; out['bytes'] += s.st_size; out['allocated_bytes'] += s.st_blocks*512
     return out
 
+class _DeadlineSocket(socket.socket):
+    """Refresh the remaining budget at each HTTP buffered read/write boundary."""
+    def __init__(self, deadline):
+        super().__init__(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.deadline = deadline
+    def _set_remaining(self):
+        remaining = self.deadline-time.monotonic()
+        if remaining <= 0: raise TimeoutError('Engine deadline exceeded')
+        self.settimeout(remaining)
+    def connect(self, address):
+        self._set_remaining()
+        return super().connect(address)
+    def sendall(self, data, flags=0):
+        self._set_remaining()
+        return super().sendall(data, flags)
+    def recv_into(self, buffer, nbytes=0, flags=0):
+        self._set_remaining()
+        return super().recv_into(buffer, nbytes, flags)
+
 class Engine:
     def __init__(self, sock): self.sock = str(sock)
-    def call(self, method, path, body=None, raw=False, missing=False):
+    def call(self, method, path, body=None, raw=False, missing=False, *, deadline=None):
         c = http.client.HTTPConnection('localhost', timeout=45)
-        c.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        c.sock.settimeout(45); c.sock.connect(self.sock)
+        c.sock = (socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) if deadline is None
+                  else _DeadlineSocket(deadline))
         try:
+            c.sock.settimeout(45); c.sock.connect(self.sock)
             c.request(method, '/v1.55'+path, None if body is None else json.dumps(body), {'Content-Type':'application/json'})
             r = c.getresponse(); b = r.read()
             if r.status == 404 and missing: return None
@@ -71,7 +91,8 @@ class Engine:
                 raise error
             return b if raw else (json.loads(b) if b else None)
         finally: c.close()
-    def inspect(self, cid, missing=False): return self.call('GET','/containers/'+cid+'/json',missing=missing)
+    def inspect(self, cid, missing=False, *, deadline=None):
+        return self.call('GET','/containers/'+cid+'/json',missing=missing,deadline=deadline)
     def exec(self, cid, argv, detached=False, env=None):
         obj = self.call('POST','/containers/'+cid+'/exec',{'Cmd':argv,'AttachStdout':not detached,'AttachStderr':not detached,'Tty':False,'Env':env or []})
         b = self.call('POST','/exec/'+obj['Id']+'/start',{'Detach':detached,'Tty':False},raw=True)

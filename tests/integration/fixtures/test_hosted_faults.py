@@ -391,9 +391,236 @@ class FixtureContracts(unittest.TestCase):
             for key,value in (('cpu.max','200000 100000'),('memory.max','536870912'),('memory.peak','4096')):
                 (cgroup/key).write_text(value)
             probe.owner = Mock(return_value=owner); probe.e = Mock(); probe.e.inspect.return_value = obj
+            probe.e.call.return_value = {'ID': probe.daemon}
             probe.pin_container = Mock(); probe.cgroup = Mock(return_value=cgroup)
             probe.worker_records = {}; probe.worker_owners = {}; probe.roles = {}
-            yield probe, obj, owner, cgroup
+            probe.clock = 0.0; probe.sleeps = []
+            def sleep(seconds):
+                self.assertGreater(seconds, 0)
+                self.assertLessEqual(seconds, .05)
+                probe.sleeps.append(seconds); probe.clock += seconds
+            with patch.object(m.time, 'monotonic', side_effect=lambda: probe.clock), patch.object(m.time, 'sleep', side_effect=sleep):
+                yield probe, obj, owner, cgroup
+
+    def test_worker_cgroup_delayed_terminal_settles_with_exact_safe_readback_sequence(self):
+        for terminal_kind in ('stopped', 'absent'):
+            with self.subTest(terminal=terminal_kind), self.worker_observation_probe() as (probe,obj,_,__):
+                probe.capture_owned_worker()
+                stopped = json.loads(json.dumps(obj))
+                stopped['State'] = {'Running':False, 'Pid':0, 'ExitCode':137,
+                                    'StartedAt':'private-timestamp', 'FinishedAt':'private-timestamp'}
+                probe.e.inspect.side_effect = [obj, obj, stopped if terminal_kind == 'stopped' else None]
+                probe.cgroup.return_value = None
+                probe.capture_owned_worker()
+                record = probe.worker_records[obj['Id']]
+                self.assertEqual(record['cpu.max'], '200000 100000')
+                self.assertEqual(record['kernel_readback_state'], 'historical')
+                gap = record['observation_gaps'][-1]
+                self.assertEqual(gap['reason'], 'unavailable')
+                self.assertEqual(gap['resolution'], 'terminal_'+terminal_kind)
+                self.assertEqual(len(gap['rows']), 3)
+                self.assertEqual([row['running'] for row in gap['rows']], [True, True, False if terminal_kind == 'stopped' else None])
+                self.assertEqual(gap['rows'][-1]['exit_code'], 137 if terminal_kind == 'stopped' else None)
+                self.assertEqual(gap['rows'][-1]['observation_state'], 'observed' if terminal_kind == 'stopped' else 'missing')
+                self.assertTrue(probe.sleeps)
+                self.assertLessEqual(probe.clock, 1)
+                self.assertEqual([call.args for call in probe.e.inspect.call_args_list], [(obj['Id'],)]*4)
+                self.assertEqual([call.kwargs for call in probe.e.inspect.call_args_list],
+                                 [{'missing':True}]*2+[{'missing':True, 'deadline':1.0}]*2)
+                self.assertTrue(all(call.args == ('GET', '/info') and call.kwargs == {'deadline':1.0}
+                                    for call in probe.e.call.call_args_list))
+                with tempfile.TemporaryDirectory() as directory:
+                    probe.root = Path(directory); probe.values = []; probe.result = {}
+                    probe.save()
+                    receipt = json.loads((probe.root/'receipt.json').read_text())
+                    self.assertEqual(receipt['workers'][obj['Id']], record)
+                    self.assertNotIn('private-timestamp', json.dumps(receipt))
+
+    def test_worker_cgroup_permission_failure_is_retained_before_fail_closed(self):
+        for source in ('lookup', 'kernel-file'):
+            with self.subTest(source=source), self.worker_observation_probe() as (probe,obj,_,__):
+                probe.capture_owned_worker()
+                if source == 'lookup':
+                    probe.cgroup.side_effect = PermissionError('private-permission-path')
+                    manager = contextlib.nullcontext()
+                else:
+                    manager = patch.object(Path, 'read_text', side_effect=PermissionError('private-permission-path'))
+                with manager, self.assertRaisesRegex(ValueError, 'exact worker cgroup unavailable'):
+                    probe.capture_owned_worker()
+                record = probe.worker_records[obj['Id']]
+                self.assertEqual(record['kernel_readback_state'], 'historical')
+                self.assertEqual(record['observation_gaps'][-1]['resolution'], 'failed')
+                self.assertEqual(record['observation_gaps'][-1]['reason'], 'unavailable')
+                self.assertEqual(probe.sleeps, [])
+                self.assertNotIn('private-permission-path', json.dumps(record))
+
+    def test_worker_gap_unknown_readback_is_retained_and_never_resolves_as_terminal(self):
+        variants = ('transport', 'permission', 'null-state', 'unknown-running', 'numeric-running', 'invalid-pid')
+        for variant in variants:
+            with self.subTest(unknown=variant), self.worker_observation_probe() as (probe,obj,_,__):
+                unknown = json.loads(json.dumps(obj))
+                if variant == 'null-state': unknown['State'] = None
+                elif variant == 'unknown-running': unknown['State']['Running'] = None
+                elif variant == 'numeric-running': unknown['State']['Running'] = 0
+                elif variant == 'invalid-pid': unknown['State']['Pid'] = 'private-pid'
+                elif variant == 'transport': unknown = ConnectionError('private-error-path')
+                else: unknown = PermissionError('private-error-path')
+                probe.e.inspect.side_effect = [obj, obj, unknown]
+                probe.cgroup.return_value = None
+                with self.assertRaises((ValueError, ConnectionError, PermissionError)):
+                    probe.capture_owned_worker()
+                record = probe.worker_records[obj['Id']]
+                gap = record['observation_gaps'][-1]
+                self.assertEqual(gap['resolution'], 'failed')
+                self.assertEqual(len(gap['rows']), 3)
+                self.assertEqual(gap['rows'][-1]['observation_state'], 'unavailable')
+                self.assertNotIn('private-', json.dumps(record))
+                self.assertFalse(any(key in record for key in ('cpu.max', 'memory.max', 'memory.peak')))
+
+    def test_worker_gap_cannot_resolve_absence_on_changed_daemon(self):
+        with self.worker_observation_probe() as (probe,obj,_,__):
+            probe.e.inspect.side_effect = [obj, None]
+            probe.e.call.return_value = {'ID': 'private-replacement-daemon'}
+            probe.cgroup.return_value = None
+            with self.assertRaisesRegex(ValueError, 'daemon'):
+                probe.capture_owned_worker()
+            gap = probe.worker_records[obj['Id']]['observation_gaps'][-1]
+            self.assertEqual(gap['resolution'], 'failed')
+            self.assertEqual(gap['rows'][-1]['observation_state'], 'unavailable')
+            self.assertNotIn('private-replacement-daemon', json.dumps(gap))
+
+    def test_stopped_worker_marks_prior_kernel_proof_historical_without_opening_gap(self):
+        with self.worker_observation_probe() as (probe,obj,_,__):
+            probe.capture_owned_worker()
+            stopped = json.loads(json.dumps(obj)); stopped['State'] = {'Running':False, 'Pid':0, 'ExitCode':0}
+            probe.e.inspect.return_value = stopped
+            probe.capture_owned_worker()
+            record = probe.worker_records[obj['Id']]
+            self.assertEqual(record['cpu.max'], '200000 100000')
+            self.assertEqual(record['kernel_readback_state'], 'historical')
+            self.assertNotIn('observation_gaps', record)
+            self.assertEqual(probe.sleeps, [])
+
+    def test_worker_gap_does_not_accept_terminal_readback_after_monotonic_budget(self):
+        with self.worker_observation_probe() as (probe,obj,_,__):
+            probe.cgroup.return_value = None
+            stopped = json.loads(json.dumps(obj)); stopped['State'] = {'Running':False, 'Pid':0}
+            calls = []
+            def inspect(cid, **kwargs):
+                calls.append(cid)
+                if len(calls) == 1: return obj
+                probe.clock += 1.01
+                return stopped
+            probe.e.inspect.side_effect = inspect
+            with self.assertRaisesRegex(ValueError, 'exact worker cgroup unavailable'):
+                probe.capture_owned_worker()
+            self.assertEqual(probe.worker_records[obj['Id']]['observation_gaps'][-1]['resolution'], 'failed')
+
+    def test_worker_gap_does_not_accept_kernel_recovery_after_monotonic_budget(self):
+        with self.worker_observation_probe() as (probe,obj,_,cgroup):
+            calls = []
+            def kernel(pid):
+                calls.append(pid)
+                if len(calls) == 1: return None
+                probe.clock += 1.01
+                return cgroup
+            probe.cgroup.side_effect = kernel
+            with self.assertRaisesRegex(ValueError, 'exact worker cgroup unavailable'):
+                probe.capture_owned_worker()
+            record = probe.worker_records[obj['Id']]
+            self.assertEqual(record['observation_gaps'][-1]['resolution'], 'failed')
+            self.assertNotIn('cpu.max', record)
+
+    def test_worker_gap_wrong_cgroup_identity_cannot_be_excused_by_later_stop(self):
+        with self.worker_observation_probe() as (probe,obj,_,cgroup):
+            stopped = json.loads(json.dumps(obj)); stopped['State'] = {'Running':False, 'Pid':0}
+            probe.e.inspect.side_effect = [obj, obj, stopped]
+            probe.cgroup.side_effect = [None, cgroup.parent/'private-other-worker']
+            with self.assertRaisesRegex(ValueError, 'cgroup identity'):
+                probe.capture_owned_worker()
+            record = probe.worker_records[obj['Id']]
+            self.assertEqual(record['observation_gaps'][-1]['resolution'], 'failed')
+            self.assertNotIn('private-other-worker', json.dumps(record))
+            self.assertEqual(probe.e.inspect.call_count, 2)
+
+    def test_worker_gap_live_recovery_requires_fresh_pid_bound_kernel_readback(self):
+        for cached in (False, True):
+            with self.subTest(cached=cached), self.worker_observation_probe() as (probe,obj,_,cgroup):
+                if cached: probe.capture_owned_worker()
+                recovered = json.loads(json.dumps(obj)); recovered['State']['Pid'] = 456
+                (cgroup/'memory.peak').write_text('8192')
+                probe.pin_container.reset_mock()
+                probe.e.inspect.side_effect = [obj, obj, recovered]
+                probe.cgroup.side_effect = [None, None, cgroup]
+                probe.capture_owned_worker()
+                probe.pin_container.assert_called_once_with(obj['Id'])
+                record = probe.worker_records[obj['Id']]
+                self.assertEqual(record['kernel_readback_state'], 'observed')
+                self.assertEqual(record['memory.peak'], 8192)
+                self.assertEqual(record['cpu.max'], '200000 100000')
+                self.assertEqual(record['memory.max'], '536870912')
+                self.assertEqual(record['observation_gaps'][-1]['resolution'], 'kernel_observed')
+                self.assertEqual([row['pid'] for row in record['observation_gaps'][-1]['rows']], [123,123,456])
+                self.assertEqual(probe.cgroup.call_args.args, (456,))
+                self.assertLessEqual(probe.clock, 1)
+
+    def test_worker_gap_live_recovery_does_not_use_cached_kernel_limits(self):
+        for field,value in (('cpu.max','max 100000'), ('memory.max','max')):
+            with self.subTest(field=field), self.worker_observation_probe() as (probe,obj,_,cgroup):
+                probe.capture_owned_worker()
+                (cgroup/field).write_text(value)
+                probe.cgroup.side_effect = [None, None, cgroup]
+                with self.assertRaisesRegex(ValueError, 'kernel worker limits differ'):
+                    probe.capture_owned_worker()
+                record = probe.worker_records[obj['Id']]
+                self.assertEqual(record['kernel_readback_state'], 'historical')
+                self.assertEqual(record['observation_gaps'][-1]['resolution'], 'failed')
+                self.assertEqual(record[field], {'cpu.max':'200000 100000', 'memory.max':'536870912'}[field])
+
+    def test_worker_gap_revalidates_every_intermediate_and_terminal_worker_snapshot(self):
+        for running in (False, True):
+            for field in ('Id','Image','Name','run','daemon','Cmd','Entrypoint','Memory','NanoCpus','socket'):
+                with self.subTest(running=running,field=field), self.worker_observation_probe() as (probe,obj,_,__):
+                    changed = json.loads(json.dumps(obj))
+                    changed['State'] = {'Running':running, 'Pid':123 if running else 0, 'ExitCode':137}
+                    if field in ('Id','Image','Name'): changed[field] = 'private-drift'
+                    elif field in ('run','daemon'): changed['Config']['Labels']['bakabel.'+field] = 'private-drift'
+                    elif field in ('Cmd','Entrypoint'): changed['Config'][field] = ['private-drift']
+                    elif field == 'socket': changed['Mounts'][0]['Source'] = '/private-drift.sock'
+                    else: changed['HostConfig'][field] = 0
+                    probe.e.inspect.side_effect = [obj, obj, changed]
+                    probe.cgroup.return_value = None
+                    with self.assertRaises(ValueError): probe.capture_owned_worker()
+                    record = probe.worker_records[obj['Id']]
+                    gap = record['observation_gaps'][-1]
+                    self.assertEqual(gap['resolution'], 'failed')
+                    self.assertEqual(len(gap['rows']), 3)
+                    self.assertEqual(gap['rows'][-1]['container_id'], obj['Id'])
+                    self.assertNotIn('private-drift', json.dumps(record))
+                    self.assertEqual(probe.e.inspect.call_count, 3)
+
+    def test_worker_gap_receipt_caps_history_at_64_gaps(self):
+        with self.worker_observation_probe() as (probe,obj,_,__):
+            probe.cgroup.return_value = None
+            for index in range(66):
+                obj['State']['Pid'] = index+1
+                probe.e.inspect.side_effect = [obj, None]
+                probe.capture_owned_worker()
+            gaps = probe.worker_records[obj['Id']]['observation_gaps']
+            self.assertEqual(len(gaps), 64)
+            self.assertEqual(gaps[0]['rows'][0]['pid'], 3)
+            self.assertEqual(gaps[-1]['rows'][0]['pid'], 66)
+            self.assertTrue(all(gap['resolution'] == 'terminal_absent' and len(gap['rows']) == 2 for gap in gaps))
+            self.assertEqual(probe.sleeps, [])
+
+    def test_initial_unknown_worker_state_cannot_produce_live_kernel_proof(self):
+        for field,value in (('Running',None), ('Running',0), ('Pid',True), ('Pid',0), ('Pid','private-pid')):
+            with self.subTest(field=field,value=value), self.worker_observation_probe() as (probe,obj,_,__):
+                obj['State'][field] = value
+                with self.assertRaisesRegex(ValueError, 'worker state unavailable'):
+                    probe.capture_owned_worker()
+                self.assertEqual(probe.worker_records, {})
+                self.assertEqual(probe.sleeps, [])
 
     def test_worker_cgroup_exit_race_requires_exact_terminal_readback_preserves_cached_limits(self):
         for terminal_kind in ('stopped','absent'):
@@ -404,16 +631,34 @@ class FixtureContracts(unittest.TestCase):
                 probe.e.inspect.side_effect = [obj, stopped if terminal_kind == 'stopped' else None]
                 probe.cgroup.return_value = None
                 probe.capture_owned_worker()
-                self.assertEqual(probe.worker_records[obj['Id']], cached)
-                self.assertEqual(probe.e.inspect.call_args.kwargs, {'missing':True})
+                retained = probe.worker_records[obj['Id']]
+                self.assertEqual({key: retained[key] for key in cached if key != 'kernel_readback_state'},
+                                 {key: value for key, value in cached.items() if key != 'kernel_readback_state'})
+                self.assertEqual(retained['kernel_readback_state'], 'historical')
+                self.assertEqual(retained['observation_gaps'][-1]['resolution'], 'terminal_'+terminal_kind)
+                self.assertEqual(probe.e.inspect.call_args.kwargs, {'missing':True, 'deadline':1.0})
                 self.assertEqual(probe.worker_owners[obj['Id']], owner)
 
     def test_worker_cgroup_unexplained_live_failure_is_not_hidden_by_cached_proof(self):
-        with self.worker_observation_probe() as (probe,obj,_,__):
-            probe.capture_owned_worker()
-            probe.cgroup.return_value = None
-            with self.assertRaisesRegex(ValueError, 'exact worker cgroup unavailable'):
-                probe.capture_owned_worker()
+        for cached in (False, True):
+            with self.subTest(cached=cached), self.worker_observation_probe() as (probe,obj,_,__):
+                if cached: probe.capture_owned_worker()
+                probe.cgroup.return_value = None
+                with self.assertRaisesRegex(ValueError, 'exact worker cgroup unavailable'):
+                    probe.capture_owned_worker()
+                record = probe.worker_records[obj['Id']]
+                self.assertEqual(record['kernel_readback_state'], 'historical' if cached else 'unavailable')
+                gap = record['observation_gaps'][-1]
+                self.assertEqual(gap['resolution'], 'failed')
+                self.assertEqual(len(gap['rows']), 20)
+                self.assertTrue(all(row['running'] is True and row['pid'] == 123 and row['observation_state'] == 'observed' for row in gap['rows']))
+                self.assertTrue(probe.sleeps)
+                self.assertLessEqual(probe.clock, 1)
+                self.assertEqual([row['elapsed_ms'] for row in gap['rows']], sorted(row['elapsed_ms'] for row in gap['rows']))
+                with tempfile.TemporaryDirectory() as directory:
+                    probe.root = Path(directory); probe.values = []; probe.result = {}
+                    probe.save()
+                    self.assertEqual(json.loads((probe.root/'receipt.json').read_text())['workers'][obj['Id']], record)
 
     def test_worker_disappearing_cgroup_files_do_not_invent_kernel_readback(self):
         for terminal_kind in ('stopped','absent','live'):
@@ -421,7 +666,7 @@ class FixtureContracts(unittest.TestCase):
                 (cgroup/'memory.max').unlink()
                 stopped = json.loads(json.dumps(obj)); stopped['State'] = {'Running':False,'Pid':0}
                 terminal = {'stopped':stopped,'absent':None,'live':obj}[terminal_kind]
-                probe.e.inspect.side_effect = [obj, terminal]
+                probe.e.inspect.side_effect = None if terminal_kind == 'live' else [obj, terminal]
                 if terminal_kind == 'live':
                     with self.assertRaisesRegex(ValueError, 'exact worker cgroup unavailable'):
                         probe.capture_owned_worker()

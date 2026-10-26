@@ -27,7 +27,7 @@ from run_hosted_acceptance import require_hosted_daemon, failure_location
 from run_hosted_capacity import CapacityEngine
 
 # Reviewed completion-protocol candidate; never infer admission from CLI input.
-FROZEN_SOURCE = 'bac9e9eef9e4a4fd303f2a515a69d25f48a6b76c186c63d295cab61d23238322'
+FROZEN_SOURCE = '87ae2798a7c388c0eaad4d17e7604758000db052d34dc08c73282f3b8fabf9ac'
 
 
 def relay_path(root, case):
@@ -78,39 +78,102 @@ class FaultProbe(ComposeProbe):
         self.relay.observer = self.observe_transport
         self.relay.start()
 
-    def worker_proof(self, obj, owner):
+    def worker_identity_proof(self, obj, owner):
         if (not worker_owned(obj, owner, self.image, self.daemon) or
                 obj['Config'].get('Cmd') != ['_workflow'] or
                 obj['Config'].get('Entrypoint') != ['/usr/local/bin/bakabel'] or
                 obj['HostConfig'].get('NanoCpus') != 2000000000 or
                 obj['HostConfig'].get('Memory') != 536870912):
             raise ValueError('ordinary worker identity or default limits changed')
+        state = obj.get('State')
+        if (not isinstance(state, dict) or type(state.get('Running')) is not bool or
+                (state['Running'] and (type(state.get('Pid')) is not int or state['Pid'] <= 0))):
+            raise ValueError('exact worker state unavailable')
         proof = {'container_id': obj['Id'], 'run_id': owner['runID'], 'image_id': obj['Image'],
                  'nanocpus': 2000000000, 'memory_bytes': 536870912,
                  'socket': socket_binding_proof(obj['Mounts'], self.sock)}
-        if obj['State']['Running']:
-            self.pin_container(obj['Id'])
+        return proof
+
+    @staticmethod
+    def worker_observation(cid, obj, started):
+        # Only the known ID and typed scalar state survive; never raw inspect,
+        # timestamps, cgroup paths/text, Env, or exception messages.
+        state = obj.get('State') if isinstance(obj, dict) else None
+        if not isinstance(state, dict): state = {}
+        known = (type(state.get('Running')) is bool and
+                 (state['Running'] is False or (type(state.get('Pid')) is int and state['Pid'] > 0)))
+        return {'container_id': cid, 'elapsed_ms': max(0, int((time.monotonic()-started)*1000)),
+                'observation_state': 'missing' if obj is None else 'observed' if known else 'unavailable',
+                'running': state.get('Running') if type(state.get('Running')) is bool else None,
+                'pid': state.get('Pid') if type(state.get('Pid')) is int else None,
+                'exit_code': state.get('ExitCode') if type(state.get('ExitCode')) is int else None}
+
+    def worker_proof(self, obj, owner):
+        proof = self.worker_identity_proof(obj, owner)
+        cid = proof['container_id']; gap = None; started = None
+        while True:
+            # Revalidate every exact Engine snapshot, even a terminal one.
+            proof = self.worker_identity_proof(obj, owner)
+            if obj['State']['Running'] is False:
+                if gap is not None: gap['resolution'] = 'terminal_stopped'
+                return proof
+            # Keep the existing one-time affinity action outside settling;
+            # gap retries are read-only exact inspections and kernel reads.
+            if gap is None: self.pin_container(cid)
             try:
                 cgroup = self.cgroup(obj['State']['Pid'])
-                if cgroup is None or obj['Id'] not in str(cgroup):
+                if cgroup is None:
                     raise FileNotFoundError('exact worker cgroup unavailable')
+                if cid not in str(cgroup):
+                    raise ValueError('exact worker cgroup identity changed')
                 kernel = {'cpu.max': (cgroup/'cpu.max').read_text().strip(),
                           'memory.max': (cgroup/'memory.max').read_text().strip(),
                           'memory.peak': int((cgroup/'memory.peak').read_text().strip())}
-            except (FileNotFoundError, ProcessLookupError):
-                # Engine Running/Pid is a snapshot: the exact worker may have
-                # exited before /proc or cgroup readback. Only a second exact
-                # absent/stopped readback resolves that race. Never suppress a
-                # still-live failure, even if an earlier limits proof exists.
-                terminal = self.e.inspect(obj['Id'], missing=True)
-                if terminal is None: return proof
-                if terminal['State']['Running'] is not False:
+            except (FileNotFoundError, ProcessLookupError, PermissionError) as exc:
+                if gap is None:
+                    started = time.monotonic()
+                    gap = {'reason': 'unavailable', 'resolution': 'failed',
+                           'rows': [self.worker_observation(cid, obj, started)]}
+                    old = self.worker_records.get(cid, {})
+                    # Retain a genuine prior kernel read only as historical.
+                    self.worker_records[cid] = {**old, **proof,
+                        'kernel_readback_state': 'historical' if 'cpu.max' in old else 'unavailable',
+                        'observation_gaps': [*old.get('observation_gaps', [])[-63:], gap]}
+                if isinstance(exc, PermissionError):
                     raise ValueError('exact worker cgroup unavailable') from None
-                return self.worker_proof(terminal, owner)
+                # This settles only missing kernel observation, not a product
+                # deadline or liveness threshold. Bound both time and read count.
+                remaining = 1.0-(time.monotonic()-started)
+                if remaining <= 0 or len(gap['rows']) >= 20:
+                    raise ValueError('exact worker cgroup unavailable') from None
+                if len(gap['rows']) > 1: time.sleep(min(.05, remaining))
+                if time.monotonic()-started >= 1.0:
+                    raise ValueError('exact worker cgroup unavailable') from None
+                try:
+                    if self.e.call('GET', '/info', deadline=started+1.0)['ID'] != self.daemon:
+                        raise ValueError('worker observation daemon changed')
+                    obj = self.e.inspect(cid, missing=True, deadline=started+1.0)
+                except Exception:
+                    row = self.worker_observation(cid, {}, started)
+                    gap['rows'].append(row)
+                    raise
+                row = self.worker_observation(cid, obj, started)
+                gap['rows'].append(row)
+                if time.monotonic()-started >= 1.0:
+                    raise ValueError('exact worker cgroup unavailable') from None
+                if row['observation_state'] == 'unavailable':
+                    raise ValueError('exact worker state unavailable')
+                if obj is None:
+                    gap['resolution'] = 'terminal_absent'
+                    return proof
+                continue
+            if gap is not None and time.monotonic()-started >= 1.0:
+                raise ValueError('exact worker cgroup unavailable')
             if kernel['cpu.max'] != '200000 100000' or kernel['memory.max'] != '536870912':
                 raise ValueError('kernel worker limits differ from ordinary defaults')
-            proof.update(kernel)
-        return proof
+            proof.update(kernel, kernel_readback_state='observed')
+            if gap is not None: gap['resolution'] = 'kernel_observed'
+            return proof
 
     def exercise_stream_fault(self):
         controller = self.controller('run')
@@ -262,6 +325,8 @@ class FaultProbe(ComposeProbe):
         self.worker_owners[cid] = owner  # Cleanup authority survives failed limits audit.
         proof = self.worker_proof(obj, owner)
         old = self.worker_records.get(cid, {})
+        if proof.get('kernel_readback_state') != 'observed':
+            proof['kernel_readback_state'] = 'historical' if 'cpu.max' in old else 'unavailable'
         self.worker_records[cid] = {**old, **proof}
         self.roles[cid] = 'worker'
 
