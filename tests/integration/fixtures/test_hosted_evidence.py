@@ -3,6 +3,16 @@ import importlib
 import unittest
 
 class ArtifactSafety(unittest.TestCase):
+    def test_sampler_diagnostics_preserve_locations_not_raw_messages(self):
+        m=importlib.import_module('hosted_evidence')
+        secret='unit-sampler-error-message-not-public'
+        raw={'sampler_errors':[{'type':'RuntimeError','message':secret,'frames':[{'file':'run_resource_probe.py','line':213,'function':'sampler','source':secret}]}]}
+        public=m.public_receipt(raw)
+        import json
+        self.assertNotIn(secret,json.dumps(public))
+        self.assertTrue(public['failed'])
+        self.assertEqual(public['sampler_diagnostics'],[{'type':'RuntimeError','frames':[{'file':'run_resource_probe.py','line':213,'function':'sampler'}]}])
+
     def test_failure_location_exposes_no_exception_text_or_locals(self):
         import run_hosted_acceptance as runner
         self.assertTrue(hasattr(runner,'failure_location'),'hosted failures need safe source locations, not secret-bearing tracebacks')

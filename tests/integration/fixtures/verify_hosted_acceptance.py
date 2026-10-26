@@ -59,7 +59,10 @@ def verify(runtime,source,candidate,socket):
         metrics=json.loads((directory/'metrics.json').read_text())
         if not any(row['role']=='worker' and row.get('memory.max')=='536870912' and row.get('cpu.max')=='200000 100000' for row in metrics):
             raise ValueError('no observed kernel worker resource limits')
-        if result.get('sampler_errors'):raise ValueError('sampler had unclassified errors')
+        if result.get('sampler_errors'):
+            from hosted_evidence import public_receipt
+            print(json.dumps({'platform':platform,'sampler_diagnostics':public_receipt(result)['sampler_diagnostics']}),flush=True)
+            raise ValueError('sampler had unclassified errors')
         report['platforms'][platform]={'gates':[g['name'] for g in result['gates']],'cells':result['cells'],'exact_container_absence_count':len(result['cleanup']['containers_absent']),'exact_volume_absence_count':len(result['cleanup']['volumes_absent']),'receipt_sha256':hashlib.sha256(path.read_bytes()).hexdigest(),'metrics_sha256':hashlib.sha256((directory/'metrics.json').read_bytes()).hexdigest()}
     if engine.call('GET','/containers/json?all=true'):
         raise ValueError('exclusive hosted daemon unexpectedly still contains containers')

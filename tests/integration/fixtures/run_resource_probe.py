@@ -61,7 +61,10 @@ class Engine:
             c.request(method, '/v1.55'+path, None if body is None else json.dumps(body), {'Content-Type':'application/json'})
             r = c.getresponse(); b = r.read()
             if r.status == 404 and missing: return None
-            if r.status >= 300: raise RuntimeError('Engine '+method+' '+path+' HTTP '+str(r.status)+': '+b.decode(errors='replace')[:500])
+            if r.status >= 300:
+                error=RuntimeError('Engine '+method+' '+path+' HTTP '+str(r.status)+': '+b.decode(errors='replace')[:500])
+                error.http_status=r.status
+                raise error
             return b if raw else (json.loads(b) if b else None)
         finally: c.close()
     def inspect(self, cid, missing=False): return self.call('GET','/containers/'+cid+'/json',missing=missing)
@@ -214,7 +217,7 @@ class Probe:
                     laststats=time.monotonic()
                 self.samples.extend(rows)
             except Exception as exc:
-                self.result.setdefault('sampler_errors',[]).append({'at':utc(),'type':type(exc).__name__,'message':str(exc)[:200]})
+                self.result.setdefault('sampler_errors',[]).append({'at':utc(),'type':type(exc).__name__,'message':str(exc)[:200],'http_status':getattr(exc,'http_status',None),'frames':[{'file':Path(frame.filename).name,'line':frame.lineno,'function':frame.name} for frame in traceback.extract_tb(exc.__traceback__)]})
             self.stopped.wait(.15)
     def sql(self,cid,q):
         r=self.e.exec(cid,['psql','-XAt','-U','postgres','-d','fixture','-v','ON_ERROR_STOP=1','-c',q])
