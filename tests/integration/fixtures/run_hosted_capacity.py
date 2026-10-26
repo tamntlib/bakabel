@@ -23,7 +23,8 @@ from run_resource_probe import Engine, PG, Probe, footprint, kv_numbers, sha, ut
 from run_compose_pg_acceptance import fingerprint
 from run_hosted_acceptance import require_hosted_daemon, failure_location
 
-STOCK_SOURCE = '6a592fcf1159d301bbe9acf0ff82e3e681913de4d1fb6f17ccc2d05c9d394ef8'
+# Reviewed completion-protocol candidate; never infer admission from CLI input.
+STOCK_SOURCE = 'bac9e9eef9e4a4fd303f2a515a69d25f48a6b76c186c63d295cab61d23238322'
 
 
 FILES = 8192
@@ -1036,7 +1037,7 @@ def parser():
 
 def validate_paths(args, env):
     if args.expected_source_sha256 != STOCK_SOURCE:
-        raise ValueError('only the fixed stock R3 core source is admitted')
+        raise ValueError('only the fixed stock reviewed core source is admitted')
     temporary = Path(env['RUNNER_TEMP']).resolve()
     runtime = args.runtime.resolve()
     if (runtime == temporary or not runtime.is_relative_to(temporary) or

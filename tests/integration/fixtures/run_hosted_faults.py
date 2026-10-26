@@ -26,7 +26,8 @@ from verify_hosted_faults import CASES, CREATE_GAPS, verify_case, verify_report
 from run_hosted_acceptance import require_hosted_daemon, failure_location
 from run_hosted_capacity import CapacityEngine
 
-FROZEN_SOURCE = '6a592fcf1159d301bbe9acf0ff82e3e681913de4d1fb6f17ccc2d05c9d394ef8'
+# Reviewed completion-protocol candidate; never infer admission from CLI input.
+FROZEN_SOURCE = 'bac9e9eef9e4a4fd303f2a515a69d25f48a6b76c186c63d295cab61d23238322'
 
 
 def relay_path(root, case):
@@ -955,7 +956,7 @@ def main(argv=None):
     if not all((args.source,args.image,args.expected_image_id,args.expected_source_sha256)):
         parser.error('explicit source/image and exact source/image binding required')
     if args.expected_source_sha256 != FROZEN_SOURCE or fingerprint(args.source) != args.expected_source_sha256:
-        parser.error('frozen R3 source binding differs')
+        parser.error('frozen reviewed source binding differs')
     if not re.fullmatch('sha256:[a-f0-9]{64}',args.expected_image_id): parser.error('literal full candidate image ID required')
     if engine.call('GET','/images/'+quote(args.image,safe='')+'/json')['Id'] != args.expected_image_id:
         parser.error('ordinary candidate image differs from exact binding')
