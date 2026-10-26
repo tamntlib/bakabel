@@ -10,7 +10,7 @@ import tempfile
 import unittest
 
 HERE = Path(__file__).resolve().parent
-SCRATCH = Path(os.environ.get('TMPDIR', str(Path.home()/'.hermes/cache/scratch')))
+SCRATCH = Path(tempfile.gettempdir())
 
 
 def validator_fixture():

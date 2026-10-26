@@ -76,11 +76,24 @@ class WorkflowContract(unittest.TestCase):
                     cp=subprocess.run(['bash','-eu','-c',normalization+'; test -S "$ENGINE_SOCKET"'],env={**os.environ,'ENGINE_SOCKET':endpoint},capture_output=True)
                     self.assertEqual(cp.returncode,0)
 
-    def test_resource_test_needs_no_hermes_home_on_clean_runner(self):
+    def test_entire_fixture_suite_needs_no_hermes_home_or_tmpdir(self):
         with tempfile.TemporaryDirectory() as directory:
             home=Path(directory)/'home';home.mkdir()
-            cp=subprocess.run([sys.executable,'-m','unittest','test_resource_failure.FailureProof.test_space_probe_preserves_errno_and_removes_own_probe'],cwd=ROOT/'tests/integration/fixtures',env={**os.environ,'HOME':str(home)},text=True,capture_output=True)
+            temporary=Path(directory)/'portable-temp';temporary.mkdir()
+            env={k:v for k,v in os.environ.items() if k not in ('TMPDIR','TMP','TEMP')}
+            env.update(HOME=str(home),TEMP=str(temporary))
+            script='''import sys,unittest
+def flatten(suite):
+    for item in suite:
+        if isinstance(item,unittest.TestSuite):yield from flatten(item)
+        else:yield item
+tests=[test for test in flatten(unittest.defaultTestLoader.discover('.',pattern='test_*.py')) if test.id()!=sys.argv[1]]
+assert any(test.id().startswith('test_hosted_capacity.') for test in tests)
+raise SystemExit(not unittest.TextTestRunner(verbosity=0).run(unittest.TestSuite(tests)).wasSuccessful())
+'''
+            cp=subprocess.run([sys.executable,'-B','-c',script,self.id()],cwd=ROOT/'tests/integration/fixtures',env=env,text=True,capture_output=True)
             self.assertEqual(cp.returncode,0,cp.stderr)
+            self.assertFalse((home/'.hermes').exists())
 
     def test_manual_vm_direct_engine_and_allowlisted_artifacts(self):
         path=ROOT/'.github/workflows/acceptance.yaml'
