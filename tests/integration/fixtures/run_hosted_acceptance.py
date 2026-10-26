@@ -285,11 +285,12 @@ def failure_location(error):
     return {'kind':type(error).__name__,'frames':[{'file':Path(frame.filename).name,'line':frame.lineno,'function':frame.name} for frame in traceback.extract_tb(error.__traceback__)]}
 
 
-def run_platform(args):
+def run_platform(args,probe_class=None):
     # Construction is inventory + owned file setup only, never Engine writes.
     # Keep the partially initialized object reachable if credential copy fails.
     if args.runtime.exists():raise ValueError('platform runtime must be fresh')
-    probe=HostedProbe.__new__(HostedProbe)
+    factory=probe_class or HostedProbe
+    probe=factory.__new__(factory)
     initialized=False;error=None
     result={'platform':args.platform,'source_sha256':args.expected_source_sha256,'image_id':args.expected_image_id,'runtime_matrix_pass':False,'full_plan_acceptance_pass':False}
     try:

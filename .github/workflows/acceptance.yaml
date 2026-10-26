@@ -128,6 +128,18 @@ jobs:
             --candidate "$RUNNER_TEMP/bakabel-candidate.json" \
             --runtime "$RUNNER_TEMP/bakabel-acceptance" \
             --output "$RUNNER_TEMP/bakabel-acceptance/verified.json"
+      - name: Scheduled lifecycle resource and actual OOM ENOSPC replay
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_hash=$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/bakabel-candidate.json"))["source_sha256"])')
+          image_id=$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/bakabel-candidate.json"))["image_id"])')
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP \
+            taskset -c 0,1 python3 tests/integration/fixtures/run_hosted_resources.py \
+            --socket "$ENGINE_SOCKET" --exclusive-hosted-daemon \
+            --source "$PWD" --runtime "$RUNNER_TEMP/bakabel-resources" \
+            --minio-binary "$RUNNER_TEMP/bakabel-tools/minio" --image "$image_id" \
+            --expected-source-sha256 "$source_hash" --expected-image-id "$image_id"
       - name: Export only allowlisted evidence even on failure
         if: always()
         shell: bash
@@ -139,6 +151,9 @@ jobs:
             fi
             sudo taskset -c 0,1 python3 tests/integration/fixtures/hosted_evidence.py \
               --runtime "$RUNNER_TEMP/bakabel-acceptance" --output "$RUNNER_TEMP/bakabel-public"
+            if sudo test -f "$RUNNER_TEMP/bakabel-resources/resources-public.json"; then
+              sudo cp "$RUNNER_TEMP/bakabel-resources/resources-public.json" "$RUNNER_TEMP/bakabel-public/resources.json"
+            fi
             sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/bakabel-public"
           fi
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

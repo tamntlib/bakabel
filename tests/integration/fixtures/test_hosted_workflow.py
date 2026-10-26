@@ -11,6 +11,14 @@ import tempfile
 ROOT=Path(__file__).resolve().parents[3]
 
 class WorkflowContract(unittest.TestCase):
+    def test_extended_resource_replay_is_mandatory_and_public_report_only(self):
+        text=(ROOT/'.github/workflows/acceptance.yaml').read_text()
+        self.assertIn('run_hosted_resources.py',text)
+        self.assertIn('bakabel-resources/resources-public.json',text)
+        self.assertIn('sudo test -f "$RUNNER_TEMP/bakabel-resources/resources-public.json"',text)
+        self.assertIn('"$RUNNER_TEMP/bakabel-public/resources.json"',text)
+        self.assertNotIn('bakabel-resources/receipt.json',text)
+
     def test_action_socket_uri_becomes_real_unix_socket_path(self):
         text=(ROOT/'.github/workflows/acceptance.yaml').read_text()
         normalization='ENGINE_SOCKET=${ENGINE_SOCKET#unix://}'
