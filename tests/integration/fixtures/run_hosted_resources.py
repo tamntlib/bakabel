@@ -38,7 +38,7 @@ def public_measurements(summary):
     result={}
     result['idle']=numeric_fields(summary.get('idle',{}),('seconds_between_samples','cgroup_cpu_seconds_delta','one_core_percent','RSS_first_bytes','RSS_last_bytes','PSS_first_bytes','PSS_last_bytes'))
     result['image']=numeric_fields(summary.get('image',{}),('actual_save_tar_bytes','oci_compressed_layer_bytes','actual_merged_export_tar_bytes','actual_export_extracted_regular_file_allocated_bytes','merged_export_regular_file_payload_bytes','merged_export_regular_files'))
-    metrics=('sample_count','process_RSS_sum_peak_bytes','process_rollup_RSS_sum_peak_bytes','process_PSS_sum_peak_bytes','cgroup_memory_peak_bytes','sampled_cgroup_memory_current_peak_bytes','cpu_usage_seconds_observed_delta','cpu_throttled_seconds_observed_delta','io_stat_available','tmp_cache_file_bytes_peak_sampled','log_bytes_peak_sampled','state_bytes_peak_sampled','process_rollup_missing_observations')
+    metrics=('sample_count','process_RSS_sum_peak_bytes','process_rollup_RSS_sum_peak_bytes','process_PSS_sum_peak_bytes','cgroup_memory_peak_bytes','sampled_cgroup_memory_current_peak_bytes','cpu_usage_seconds_observed_delta','cpu_throttled_seconds_observed_delta','io_stat_available','tmp_cache_file_bytes_peak_sampled','log_bytes_peak_sampled','state_bytes_peak_sampled','process_rollup_missing_observations','footprint_unlinked_observations')
     roles={'source-pg','source-files','restore-pg','worker','scheduler','controller','fixture-s3-backend','operator-readback','operator-restic','image-audit','health-monitor'}
     result['containers']=[]
     for row in summary.get('containers',[]):

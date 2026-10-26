@@ -44,11 +44,15 @@ def sha(path):
     return h.hexdigest()
 def footprint(path):
     path = Path(path)
-    out = {'files':0,'bytes':0,'allocated_bytes':0}
+    out = {'files':0,'bytes':0,'allocated_bytes':0,'unlinked_during_sample':0}
     if not path.exists(): return out
     for p in path.rglob('*'):
         if p.is_file():
-            s = p.stat(); out['files'] += 1; out['bytes'] += s.st_size; out['allocated_bytes'] += s.st_blocks*512
+            try:s = p.stat()
+            except FileNotFoundError:
+                out['unlinked_during_sample'] += 1
+                continue
+            out['files'] += 1; out['bytes'] += s.st_size; out['allocated_bytes'] += s.st_blocks*512
     return out
 
 class Engine:

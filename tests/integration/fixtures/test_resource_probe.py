@@ -3,6 +3,18 @@ from pathlib import Path
 import unittest
 
 class ProbeSafety(unittest.TestCase):
+    def test_disappearing_state_file_is_an_explicit_footprint_gap(self):
+        from unittest.mock import Mock,patch
+        import tempfile
+        with tempfile.TemporaryDirectory() as directory:
+            entry=Mock();entry.is_file.return_value=True
+            entry.stat.side_effect=FileNotFoundError(2,'unit-only atomic rename race')
+            with patch.object(Path,'rglob',return_value=iter([entry])):result=self.p.footprint(directory)
+            self.assertEqual(result['files'],0)
+            self.assertEqual(result['unlinked_during_sample'],1)
+            entry.stat.side_effect=PermissionError(13,'unit-only inaccessible file')
+            with patch.object(Path,'rglob',return_value=iter([entry])),self.assertRaises(PermissionError):self.p.footprint(directory)
+
     @classmethod
     def setUpClass(cls):
         spec = importlib.util.spec_from_file_location('probe', Path(__file__).with_name('run_resource_probe.py'))

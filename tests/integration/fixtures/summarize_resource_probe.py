@@ -40,6 +40,7 @@ def summarize(root):
             'docker_stats_samples':len(stats),'tmp_cache_file_bytes_peak_sampled':max((t['bytes'] for t in tmp),default=None),
             'log_bytes_peak_sampled':max((s.get('log_bytes') or 0 for s in ss),default=0),
             'state_bytes_peak_sampled':max((s.get('state_footprint',{}).get('bytes',0) for s in ss),default=0),
+            'footprint_unlinked_observations':sum(s.get('state_footprint',{}).get('unlinked_during_sample',0)+s.get('tmp_cache_footprint',{}).get('unlinked_during_sample',0) for s in ss),
             'process_rollup_missing_observations':sum('memory' not in p for p in processes),
             'notes':'process peaks are sampled; cgroup memory.peak is kernel high-water through last live sample, not measured hard bound; exit-race missing counters remain null'
         }
