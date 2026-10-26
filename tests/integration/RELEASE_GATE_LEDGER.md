@@ -64,6 +64,23 @@ Capacity reports must retain worker/scheduler/source/restore scope separately, a
 
 ## Preserved new failed attempts
 
+Run `40331046893` at `88d41bc73dbd77607439b92acfc46d3b4159b2c8`
+remains failed overall, but now has independent core 44 and capacity C01–C06
+PASS receipts, plus successful hosted scheduler eight-gate and active-OOM
+verification. Capacity has 2,808 samples, both full 8,192-file/1 GiB checksum
+readbacks, a matching fresh 400,000-row PostgreSQL restore, zero sampler
+errors, and independently recorded cleanup of 37 containers and five volumes.
+The active-OOM update was accepted, effective RAM was 16 MiB with zero swap,
+the source was unlocked, kernel oom_kill reached two, and terminal OOMKilled
+was true; exact worker/source recovery and cleanup passed. This is the stated
+mid-run lock-wait injection, not proof that OOM began after dump bytes streamed.
+The repository-ENOSPC case then failed the observer-error gate, after a failed
+worker and recorded cleanup of eight containers and three volumes. Its public
+projection does not retain which observer failed or its exception type/frame;
+the historical cause is therefore unknown. Early configured OOM was not run.
+The new PASS receipts do not relabel older failures or close F13–F22, and the
+overall resources/full-plan release gate remains failed.
+
 Run `40324792653` at `db1c946ee9924d422ebaa3292ce533f9d859602c`
 remains failed. The faults job passed; the core runner completed its 44 runtime
 checks, but its independent verifier rejected a Compose sampler `OSError`
@@ -102,7 +119,7 @@ the changed candidate needs fresh exact-source hosted replay.
 | `40264921665` | Safe diagnostics identified `FileNotFoundError` in footprint `is_file` → `stat` observation. Resource cases skipped. |
 | `40265884540` | Footprint fix applied; verifier instead retained `OSError` while reading a cgroup control file. Recorded diagnostics lacked errno, so this historical exception is **not** asserted to have a proven errno. Resource cases skipped. |
 
-The unlink race has a deterministic RED→GREEN regression and explicit missing-observation counters. Cgroup handling is narrowed to ENODEV **only after a second exact-container inspection proves disappearance/exit/PID change**; unexplained live errors still fail. Numeric errno diagnostics preserve the next unknown failure without exporting messages or locals.
+The unlink race has a deterministic RED→GREEN regression and explicit missing-observation counters. The earlier cgroup guard handled ENODEV after one confirming inspection and allowed PID-change resolution. The current shared sampler instead settles ENODEV/ENOENT/ESRCH within one absolute second, accepting only exact owned absence/stoppage or complete fresh kernel readback. Live PID or identity drift and unexplained live errors fail. Numeric diagnostics exclude arbitrary messages and locals; these rules do not establish historical exit timing.
 
 ## Completion rule
 

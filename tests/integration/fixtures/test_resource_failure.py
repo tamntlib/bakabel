@@ -22,6 +22,39 @@ class FailureProof(unittest.TestCase):
         self.addCleanup(probe.stop_failure_observers)
         return probe,owner,worker,cg
 
+    def test_observer_diagnostics_are_bounded_typed_private_and_fatal(self):
+        import json,threading
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from run_resource_probe import Probe
+        with tempfile.TemporaryDirectory() as directory:
+            probe,owner,worker,cg=self.cgroup_probe(directory)
+            (probe.root/'state').mkdir();(probe.root/'state/owner.json').write_text(json.dumps(owner))
+            probe.args=SimpleNamespace(mode='oom-active');probe.result.update(owner_history=[],restic_effective_env=[])
+            probe.e.inspect=Mock(side_effect=TimeoutError(110,'PRIVATE-CANARY /private/path Env=secret'))
+            waits=iter([False]*40+[True])
+            probe.observe_fast(SimpleNamespace(wait=lambda _:next(waits)))
+            errors=probe.result['fast_observer_errors']
+            self.assertEqual(probe.result.get('fast_observer_errors_count'),40)
+            self.assertEqual(len(errors),32)
+            self.assertEqual(errors[0]['code'],'observer_failure')
+            self.assertEqual(errors[0]['type'],'TimeoutError');self.assertEqual(errors[0]['errno'],110)
+            self.assertTrue(any(f['file']=='run_resource_failures.py' and f['function']=='observe_fast' and type(f['line']) is int for f in errors[0]['frames']))
+            self.assertNotIn('PRIVATE-CANARY',json.dumps(errors))
+            probe.sock='/unused';probe.stopped=threading.Event()
+            def sampler(p):
+                for _ in range(40):
+                    p.result.setdefault('sampler_errors',[]).append({'type':'OSError','message':'PRIVATE-CANARY','errno':5,
+                        'frames':[{'file':'run_resource_probe.py','line':346,'function':'sampler','source':'PRIVATE-CANARY'}]*20})
+            with patch.object(Probe,'sampler',sampler):probe.sampler()
+            self.assertEqual(probe.result.get('sampler_errors_count'),40)
+            self.assertEqual(len(probe.result['sampler_errors']),32)
+            self.assertEqual(len(probe.result['sampler_errors'][0]['frames']),8)
+            self.assertNotIn('PRIVATE-CANARY',json.dumps(probe.result))
+            with patch.object(Probe,'gate') as gate:
+                with self.assertRaisesRegex(AssertionError,'observer_failure'):probe.gate('must-remain-fatal')
+                gate.assert_not_called()
+
     def test_kernel_counter_survives_blocked_inspect_and_deleted_path(self):
         import json,os,shutil,threading,time
         from types import SimpleNamespace
@@ -187,6 +220,251 @@ class FailureProof(unittest.TestCase):
             finally:release.set();observer.join(2)
             self.assertFalse(observer.is_alive())
 
+    def test_delayed_terminal_inspect_after_missing_cgroup_is_not_false_observer_error(self):
+        import copy,json,time
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as directory:
+            probe,owner,worker,cg=self.cgroup_probe(directory)
+            worker['State']['StartedAt']='2026-01-01T00:00:00Z'
+            probe.sample_failure_cgroup(worker,owner)
+            (probe.root/'state').mkdir();(probe.root/'state/owner.json').write_text(json.dumps(owner))
+            probe.args=SimpleNamespace(mode='enospc');probe.result.update(owner_history=[],restic_effective_env=[])
+            terminal=copy.deepcopy(worker);terminal['State'].update(Running=False,Pid=0,OOMKilled=False,ExitCode=1)
+            probe.cgroup=Mock(return_value=None);probe.pids=Mock(return_value=[])
+            # Ordinary inspect sees Running, kernel /proc is gone, first exact
+            # reinspection still Running, next exact reinspection is terminal.
+            probe.e.inspect=Mock(side_effect=[worker,worker,worker,terminal])
+            waits=iter([False,True]);started=time.monotonic()
+            probe.observe_fast(SimpleNamespace(wait=lambda _:next(waits)))
+            self.assertFalse(probe.result.get('fast_observer_errors'),probe.result.get('fast_observer_errors'))
+            self.assertEqual(probe.e.inspect.call_count,4)
+            self.assertEqual(probe.result['terminal_cgroup_sample']['observer_pid'],0)
+            bounds=[call.kwargs['deadline'] for call in probe.e.inspect.call_args_list]
+            self.assertTrue(all(bound==bounds[0] for bound in bounds),'never renew the outer 1s I/O budget')
+            self.assertLessEqual(bounds[0],started+1.1)
+
+    def test_live_settle_permission_error_cannot_be_excused_by_fresh_or_terminal(self):
+        import copy
+        from unittest.mock import Mock
+        from run_resource_probe import Probe
+        for phase in ('initial-proc','settle-proc','directory','cpu.max','memory.events'):
+            for outcome in ('fresh','terminal'):
+                with self.subTest(phase=phase,outcome=outcome),tempfile.TemporaryDirectory() as directory:
+                    probe,owner,worker,cg=self.cgroup_probe(directory)
+                    probe.sample_failure_cgroup(worker,owner)
+                    terminal=copy.deepcopy(worker);terminal['State'].update(Running=False,Pid=0)
+                    probe.e.inspect=Mock(side_effect=[worker,terminal if outcome=='terminal' else worker])
+                    read=Path.read_text;stat=Path.stat;resolutions=[0];denied=[False]
+                    def cgroup(pid,**kwargs):
+                        resolutions[0]+=1
+                        if phase=='initial-proc' and resolutions[0]==1 or phase=='settle-proc' and resolutions[0]==2:
+                            # Exercise the real resolver: non-strict mode swallows
+                            # this exact /proc EACCES and lets later evidence win.
+                            return Probe.cgroup(probe,pid,**kwargs)
+                        if resolutions[0]==1:return None
+                        return cg
+                    probe.cgroup=Mock(side_effect=cgroup)
+                    def read_text(path,*args,**kwargs):
+                        if path==Path('/proc/123/cgroup'):
+                            denied[0]=True;raise PermissionError(13,'PRIVATE-CANARY')
+                        if phase==path.name and path.parent==cg and not denied[0]:
+                            denied[0]=True;raise PermissionError(13,'PRIVATE-CANARY')
+                        return read(path,*args,**kwargs)
+                    def directory_stat(path,*args,**kwargs):
+                        if phase=='directory' and path==cg and not denied[0]:
+                            denied[0]=True;raise PermissionError(13,'PRIVATE-CANARY')
+                        return stat(path,*args,**kwargs)
+                    with patch.object(Path,'read_text',read_text),patch.object(Path,'stat',directory_stat):
+                        with self.assertRaises(PermissionError):probe.sample_failure_cgroup(worker,owner)
+                    self.assertTrue(denied[0])
+                    self.assertEqual(len(probe.result['failure_cgroup_samples']),1)
+                    self.assertNotIn('terminal_cgroup_sample',probe.result)
+
+    def test_strict_proc_missing_errnos_settle_and_terminal_permission_stays_unknown(self):
+        import copy
+        from unittest.mock import Mock
+        for code in (2,3,19):
+            for phase in ('initial-proc','settle-proc','post-read-proc'):
+                for outcome in ('fresh','terminal'):
+                    with self.subTest(errno=code,phase=phase,outcome=outcome),tempfile.TemporaryDirectory() as directory:
+                        probe,owner,worker,cg=self.cgroup_probe(directory);probe.sample_failure_cgroup(worker,owner)
+                        terminal=copy.deepcopy(worker);terminal['State'].update(Running=False,Pid=0)
+                        after=terminal if outcome=='terminal' else worker
+                        probe.e.inspect=Mock(side_effect=[after] if phase=='initial-proc' else [worker,after])
+                        calls=[0];fail_at={'initial-proc':1,'settle-proc':2,'post-read-proc':3}[phase]
+                        def cgroup(pid,**kwargs):
+                            self.assertTrue(kwargs.get('strict'),'every live resolution must be strict')
+                            calls[0]+=1
+                            if calls[0]==fail_at:raise OSError(code,'PRIVATE-CANARY')
+                            return None if calls[0]==1 else cg
+                        probe.cgroup=Mock(side_effect=cgroup)
+                        row=probe.sample_failure_cgroup(worker,owner)
+                        self.assertEqual(row['observer_pid'],0 if outcome=='terminal' else 123)
+                        self.assertEqual(row['counter_status'],'observed')
+                        self.assertEqual(len(probe.result['failure_cgroup_samples']),2)
+        with tempfile.TemporaryDirectory() as directory:
+            probe,owner,worker,cg=self.cgroup_probe(directory);probe.sample_failure_cgroup(worker,owner)
+            terminal=copy.deepcopy(worker);terminal['State'].update(Running=False,Pid=0)
+            read=Path.read_text
+            def denied_counter(path,*args,**kwargs):
+                if path==cg/'memory.events':raise PermissionError(13,'PRIVATE-CANARY')
+                return read(path,*args,**kwargs)
+            with patch.object(Path,'read_text',denied_counter):row=probe.sample_failure_cgroup(terminal,owner)
+            self.assertEqual(row['counter_status'],'unavailable');self.assertEqual(row['memory.events'],'')
+            self.assertEqual(row['unavailable_errno']['memory.events'],13)
+
+    def test_settle_reinspections_share_absolute_budget_on_real_unix_socket(self):
+        import copy,time
+        from unittest.mock import Mock
+        from test_engine_deadline import peer,reply,trickle
+        def stalled(conn,stopped):stopped.wait(2)
+        def stalled_body(conn,stopped):
+            conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n{');stopped.wait(2)
+        for mode in ('headers','body','trickle','late-terminal'):
+            with self.subTest(mode=mode),tempfile.TemporaryDirectory() as directory:
+                probe,owner,worker,cg=self.cgroup_probe(directory);probe.sample_failure_cgroup(worker,owner)
+                terminal=copy.deepcopy(worker);terminal['State'].update(Running=False,Pid=0)
+                script={'headers':stalled,'body':stalled_body,
+                        'trickle':trickle(b'HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}'),
+                        'late-terminal':reply(terminal,delay=.3)}[mode]  # pyright: ignore[reportArgumentType]
+                probe.cgroup=Mock(return_value=None)
+                with peer([reply(worker,delay=.12),script]) as (engine,requests):  # pyright: ignore[reportArgumentType]
+                    probe.e=engine  # pyright: ignore[reportAttributeAccessIssue]
+                    started=time.monotonic()
+                    with self.assertRaises(TimeoutError):probe.sample_failure_cgroup(worker,owner,deadline=started+.3)
+                    elapsed=time.monotonic()-started
+                    self.assertGreaterEqual(elapsed,.28);self.assertLess(elapsed,.6)
+                    self.assertEqual(requests,[b'GET /v1.55/containers/'+owner['workerContainerID'].encode()+b'/json HTTP/1.1']*2)
+                self.assertEqual(len(probe.result['failure_cgroup_samples']),1)
+                self.assertNotIn('terminal_cgroup_sample',probe.result)
+
+    def test_gap_fresh_kernel_readback_is_complete_validated_and_not_cached(self):
+        from unittest.mock import Mock
+        for mode in ('fresh','cpu.max','memory.max','memory.swap.max','memory.events','inode-during-read','path-during-read'):
+            with self.subTest(mode=mode),tempfile.TemporaryDirectory() as directory:
+                probe,owner,worker,cg=self.cgroup_probe(directory)
+                probe.sample_failure_cgroup(worker,owner)
+                (cg/'memory.max').write_text('33554432')
+                if mode in ('cpu.max','memory.max','memory.swap.max','memory.events'):(cg/mode).write_text('PRIVATE-CANARY')
+                probe.cgroup=Mock(side_effect=[None,cg]+[cg/'foreign' if mode=='path-during-read' else cg]*30)
+                read=Path.read_text
+                def read_text(path,*args,**kwargs):
+                    value=read(path,*args,**kwargs)
+                    if mode=='inode-during-read' and path==cg/'memory.events':
+                        cg.rename(cg.with_name('retired'));cg.mkdir()
+                    return value
+                with patch.object(Path,'read_text',read_text):
+                    if mode=='fresh':
+                        row=probe.sample_failure_cgroup(worker,owner)
+                        self.assertEqual(row['memory.max'],'33554432')
+                        self.assertEqual(row['counter_status'],'observed')
+                        self.assertEqual(len(probe.result['failure_cgroup_samples']),2)
+                    else:
+                        with self.assertRaisesRegex(AssertionError,'identity'):probe.sample_failure_cgroup(worker,owner)
+                        self.assertEqual(len(probe.result['failure_cgroup_samples']),1)
+
+    def test_fresh_read_disappearing_before_identity_check_still_requires_terminal(self):
+        import copy
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as directory:
+            probe,owner,worker,cg=self.cgroup_probe(directory);probe.sample_failure_cgroup(worker,owner)
+            terminal=copy.deepcopy(worker);terminal['State'].update(Running=False,Pid=0)
+            probe.cgroup=Mock(side_effect=[None,cg]);probe.e.inspect=Mock(side_effect=[worker,terminal])
+            read=Path.read_text
+            def read_text(path,*args,**kwargs):
+                value=read(path,*args,**kwargs)
+                if path==cg/'memory.events':cg.rename(cg.with_name('retired'))
+                return value
+            with patch.object(Path,'read_text',read_text):
+                try:row=probe.sample_failure_cgroup(worker,owner)
+                except OSError:self.fail('missing kernel post-read must settle to exact terminal, not escape as an ignored observer file error')
+            self.assertEqual(row['observer_pid'],0);self.assertEqual(row['counter_status'],'unavailable')
+            self.assertEqual(probe.e.inspect.call_count,2)
+            self.assertEqual(len(probe.result['failure_cgroup_samples']),1)
+
+    def test_terminal_cgroup_deadline_rejects_late_reads_before_any_record_or_return(self):
+        import copy
+        from unittest.mock import Mock
+        from run_resource_probe import kv_numbers
+        for route in ('terminal','gap-terminal'):
+            for phase in ('observed','unavailable','directory','before-record','already-expired','no-cache'):
+                with self.subTest(route=route,phase=phase),tempfile.TemporaryDirectory() as directory:
+                    probe,owner,worker,cg=self.cgroup_probe(directory);probe.sample_failure_cgroup(worker,owner)
+                    terminal=copy.deepcopy(worker);terminal['State'].update(Running=False,Pid=0)
+                    probe.cgroup=Mock(return_value=None);probe.e.inspect=Mock(return_value=terminal)
+                    if phase=='no-cache':probe._cgroup_identities.clear()
+                    before=copy.deepcopy(probe.result);clock=[10.21 if phase in ('already-expired','no-cache') else 10.0]
+                    read=Path.read_text;stat=Path.stat;reads=[]
+                    def read_text(path,*args,**kwargs):
+                        reads.append(path);value=read(path,*args,**kwargs)
+                        if path==cg/'memory.events' and phase in ('observed','unavailable'):
+                            clock[0]=10.21
+                            if phase=='unavailable':raise FileNotFoundError(2,'PRIVATE-CANARY')
+                        return value
+                    def directory_stat(path,*args,**kwargs):
+                        if path==cg and phase=='directory':
+                            clock[0]=10.21;raise FileNotFoundError(2,'PRIVATE-CANARY')
+                        return stat(path,*args,**kwargs)
+                    def parse(value):
+                        result=kv_numbers(value)
+                        if phase=='before-record':clock[0]=10.21
+                        return result
+                    with patch('run_resource_failures.time.monotonic',side_effect=lambda:clock[0]),patch.object(Path,'read_text',read_text),patch.object(Path,'stat',directory_stat),patch('run_resource_failures.kv_numbers',side_effect=parse):
+                        with self.assertRaisesRegex(AssertionError,'cgroup_identity'):
+                            probe.sample_failure_cgroup(terminal if route=='terminal' else worker,owner,deadline=10.2)
+                    self.assertEqual(probe.result,before,'late terminal observations must leave no receipt mutation')
+                    if phase in ('already-expired','no-cache'):self.assertEqual(reads,[])
+
+    def test_gap_settle_keeps_identity_failures_and_absolute_deadline_fatal(self):
+        import copy
+        from unittest.mock import Mock
+        for mode in ('pid','start','image','owner','id','name','daemon','path','inode','permission','unexpected-errno','timeout','expired','persistent'):
+            with self.subTest(mode=mode),tempfile.TemporaryDirectory() as directory:
+                probe,owner,worker,cg=self.cgroup_probe(directory)
+                worker['State']['StartedAt']='2026-01-01T00:00:00Z';probe.sample_failure_cgroup(worker,owner)
+                after=copy.deepcopy(worker);clock=[10.0];calls=[]
+                if mode=='pid':after['State']['Pid']+=1
+                if mode=='start':after['State']['StartedAt']='2026-01-01T00:00:01Z'
+                if mode=='image':after['Image']='foreign'
+                if mode=='owner':after['Config']['Labels']['bakabel.run']='d'*32
+                if mode=='id':after['Id']='d'*64
+                if mode=='name':after['Name']='/foreign'
+                if mode=='daemon':after['Config']['Labels']['bakabel.daemon']='foreign'
+                probe.cgroup=Mock(return_value=None)
+                def inspect(cid,**kwargs):
+                    calls.append((cid,kwargs))
+                    if mode=='path':probe.cgroup=Mock(return_value=cg/'foreign')
+                    if mode=='inode':
+                        cg.rename(cg.with_name('retired'));cg.mkdir();probe.cgroup=Mock(return_value=cg)
+                    if mode in ('permission','unexpected-errno'):raise OSError(13 if mode=='permission' else 5,'PRIVATE-CANARY')
+                    if mode=='timeout':raise TimeoutError('PRIVATE-CANARY')
+                    if mode=='expired':clock[0]=10.21;after['State'].update(Running=False,Pid=0)
+                    return after
+                probe.e.inspect=Mock(side_effect=inspect)
+                with patch('run_resource_failures.time.monotonic',side_effect=lambda:clock[0]),patch('run_resource_failures.time.sleep',side_effect=lambda delay:clock.__setitem__(0,clock[0]+delay)):
+                    with self.assertRaises((AssertionError,OSError)):probe.sample_failure_cgroup(worker,owner,deadline=10.2)
+                self.assertTrue(calls);self.assertLessEqual(len(calls),20)
+                self.assertTrue(all(cid==owner['workerContainerID'] and kw['deadline']==10.2 for cid,kw in calls))
+                self.assertEqual(len(probe.result['failure_cgroup_samples']),1)
+                self.assertNotIn('terminal_cgroup_sample',probe.result)
+
+    def test_real_sampler_sanitizes_exception_at_append_without_raw_text(self):
+        import json
+        from unittest.mock import Mock
+        with tempfile.TemporaryDirectory() as directory:
+            probe,owner,worker,cg=self.cgroup_probe(directory)
+            probe.sock='/unused';probe.worker_records={};probe.roles={'unit':'worker'};probe.samples=[]
+            probe.stopped=Mock();probe.stopped.is_set.side_effect=[False,True]
+            probe.measure=Mock(side_effect=OSError(5,'PRIVATE-CANARY /private/path Env=secret'))
+            probe.sampler()
+            self.assertEqual(probe.result['sampler_errors_count'],1)
+            row=probe.result['sampler_errors'][0]
+            self.assertEqual(row['type'],'OSError');self.assertEqual(row['errno'],5)
+            self.assertEqual(row['code'],'sampler_failure')
+            self.assertTrue(any(f['file']=='run_resource_probe.py' and f['function']=='sampler' for f in row['frames']))
+            self.assertNotIn('PRIVATE-CANARY',json.dumps(probe.result))
+
     def test_running_inspect_missing_proc_requires_exact_terminal_reinspection(self):
         import copy,time
         from types import SimpleNamespace
@@ -208,9 +486,12 @@ class FailureProof(unittest.TestCase):
                     self.assertNotIn('fast_observer_errors',probe.result)
                 else:
                     with self.assertRaisesRegex(AssertionError,'identity'):probe.sample_failure_cgroup(worker,owner)
-                probe.e.inspect.assert_called_once()
-                self.assertEqual(probe.e.inspect.call_args.args,(owner['workerContainerID'],))
+                self.assertGreaterEqual(probe.e.inspect.call_count,2 if outcome=='still-running' else 1)
+                self.assertLessEqual(probe.e.inspect.call_count,20)
+                self.assertLess(time.monotonic()-started,1.15)
+                self.assertTrue(all(call.args==(owner['workerContainerID'],) for call in probe.e.inspect.call_args_list))
                 deadline=probe.e.inspect.call_args.kwargs.get('deadline')
+                self.assertTrue(all(call.kwargs['deadline']==deadline for call in probe.e.inspect.call_args_list))
                 self.assertIsNotNone(deadline);self.assertGreater(deadline,started);self.assertLessEqual(deadline,started+1.1)
 
     def test_running_unavailable_cgroup_files_are_not_silently_accepted_as_live(self):
@@ -232,7 +513,8 @@ class FailureProof(unittest.TestCase):
                         self.assertEqual(row['memory.events'],'')
                     else:
                         with self.assertRaisesRegex(AssertionError,'identity'):probe.sample_failure_cgroup(worker,owner)
-                    probe.e.inspect.assert_called_once()
+                    self.assertGreaterEqual(probe.e.inspect.call_count,1 if terminal else 2)
+                    self.assertLessEqual(probe.e.inspect.call_count,20)
 
     def test_oom_activation_reads_effective_no_swap_cap_before_unlock(self):
         from types import SimpleNamespace

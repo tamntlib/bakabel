@@ -56,6 +56,126 @@ class HostedResources(unittest.TestCase):
                 self.assertIsNone(value['failure_code']);self.assertIsNone(value['update_status'])
                 self.assertNotIn('PRIVATE-CANARY',json.dumps(value))
 
+    def test_failure_observer_public_projection_reaches_failed_case_and_rejects_canaries(self):
+        module=self.module()
+        import copy,json,tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        item={'code':'observer_failure','type':'AssertionError','reason':'cgroup_identity','errno':19,
+              'frames':[{'file':'run_resource_failures.py','function':'terminal_reinspection','line':103,'source':'PRIVATE-CANARY'}],
+              'message':'PRIVATE-CANARY','Env':['PRIVATE-CANARY'],'path':'PRIVATE-CANARY'}
+        raw={'fast_observer_errors':[item]*40,'fast_observer_errors_count':50,
+             'sampler_errors':[dict(item,code='sampler_failure',type='TimeoutError',reason=None,errno=110)],'sampler_errors_count':1}
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);case=root/'enospc';case.mkdir()
+            (case/'receipt.json').write_text(json.dumps(raw))
+            with patch.object(module,'run_platform',return_value={'failed':True}):public=module.run_case(SimpleNamespace(runtime=root),'enospc',None)
+            section=public['failure_diagnostics'].get('observer_errors')
+            self.assertIsNotNone(section,'fatal observers must survive the public receipt boundary')
+            self.assertEqual(section['fast']['count'],50);self.assertEqual(len(section['fast']['items']),32)
+            self.assertEqual(section['fast']['items'][0],{k:item[k] for k in ('code','type','reason','errno')}|{'frames':[{'file':'run_resource_failures.py','function':'terminal_reinspection','line':103}]})
+            self.assertEqual(section['sampler']['count'],1)
+            self.assertEqual(section['sampler']['items'][0]['type'],'TimeoutError')
+            self.assertFalse(public['verified']);self.assertTrue(public['failed'])
+            self.assertEqual(json.loads((case/'public.json').read_text()),public)
+            self.assertNotIn('PRIVATE-CANARY',json.dumps(public))
+        for bad in ('PRIVATE-CANARY',True,-1,1.5,float('nan'),float('inf'),[],{}):
+            with self.subTest(bad=bad):
+                poisoned=copy.deepcopy(item)
+                poisoned.update({k:bad for k in ('code','type','reason','errno')})
+                poisoned['frames']=[{'file':bad,'function':bad,'line':bad},
+                    {'file':'run_resource_failures.py','function':'PRIVATE-CANARY','line':103},
+                    {'file':'/private/run_resource_failures.py','function':'observe_fast','line':103},
+                    {'file':'run_resource_probe.py','function':'sampler','line':bad}]*10
+                value=module.public_failure_diagnostics({'fast_observer_errors':[poisoned]*40,'fast_observer_errors_count':bad})['observer_errors']['fast']
+                self.assertIsNone(value['count']);self.assertEqual(len(value['items']),32)
+                row=value['items'][0]
+                self.assertTrue(all(row[k] is None for k in ('code','type','reason','errno')))
+                self.assertEqual(len(row['frames']),8)
+                self.assertTrue(all(f['line'] is None for f in row['frames']))
+                self.assertNotIn('PRIVATE-CANARY',json.dumps(value))
+        for malformed in (None,{},'PRIVATE-CANARY',True):
+            with self.subTest(malformed=malformed):
+                value=module.public_failure_diagnostics({'sampler_errors':malformed})['observer_errors']['sampler']
+                self.assertEqual(value,{'count':None,'items':[]})
+
+    def test_entire_resource_public_json_bounds_legacy_sampler_diagnostics_for_every_case(self):
+        module=self.module();assert module is not None
+        import copy,json,tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        canary='PRIVATE-CANARY'
+        frames=[{'file':'run_resource_probe.py' if i%2==0 else canary,
+                 'function':'sampler' if i%2==0 else canary,'line':100+i if i%2==0 else canary,
+                 'source':canary,'locals':canary} for i in range(40)]
+        errors=[{'code':'sampler_failure','type':'TimeoutError' if i%2==0 else canary,
+                 'errno':110 if i%2==0 else canary,'http_status':canary,'frames':frames,
+                 'message':canary,'Env':[canary],'path':canary} for i in range(40)]
+        for case in module.CASES:
+            for platform_failed in (True,False):
+                with self.subTest(case=case,platform_failed=platform_failed),tempfile.TemporaryDirectory() as directory:
+                    root=Path(directory);target=root/case;target.mkdir()
+                    raw={'sampler_errors':copy.deepcopy(errors),'sampler_errors_count':40}
+                    receipt=target/'receipt.json';receipt.write_text(json.dumps(raw));before=receipt.read_bytes()
+                    args=SimpleNamespace(runtime=root,source=root,expected_source_sha256='d'*64,expected_image_id='candidate')
+                    with patch.object(module,'run_platform',return_value={'failed':platform_failed}),patch.object(module,'verify_cleanup',wraps=module.verify_cleanup) as verify:
+                        public=module.run_case(args,case,None)
+                    saved=(target/'public.json').read_text()
+                    self.assertFalse(canary in saved,'canary leaked in ENTIRE artifact, outside clean failure_diagnostics')
+                    self.assertEqual(json.loads(saved),public)
+                    self.assertEqual(receipt.read_bytes(),before,'raw errors are immutable inputs to all failure gates')
+                    self.assertTrue(public['failed']);self.assertFalse(public['verified'])
+                    if platform_failed:verify.assert_not_called()
+                    else:
+                        self.assertEqual(verify.call_count,1)
+                        self.assertEqual(verify.call_args.args[0]['sampler_errors'],errors)
+                    legacy=public['sampler_diagnostics']
+                    self.assertEqual(len(legacy),32)
+                    self.assertEqual(legacy[0]['type'],'TimeoutError');self.assertEqual(legacy[0]['errno'],110)
+                    self.assertIsNone(legacy[1]['type']);self.assertIsNone(legacy[1]['errno'])
+                    for item in legacy:
+                        self.assertEqual(set(item),{'code','type','reason','errno','frames'})
+                        self.assertEqual(len(item['frames']),8)
+                        self.assertEqual(item['frames'][0],{'file':'run_resource_probe.py','function':'sampler','line':132})
+                        self.assertEqual(item['frames'][1],{'file':None,'function':None,'line':None})
+                    if case!='scheduler':
+                        section=public['failure_diagnostics']['observer_errors']['sampler']
+                        self.assertEqual(section,{'count':40,'items':legacy})
+
+    def test_resource_public_projection_keeps_clean_success_and_malformed_errors_fatal(self):
+        module=self.module();assert module is not None
+        import json,tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        for case in module.CASES:
+            for errors in ([],[None],'PRIVATE-CANARY',
+                           [{'type':['PRIVATE-CANARY'],'errno':True,'http_status':{'bad':'PRIVATE-CANARY'},'frames':None}]):
+                with self.subTest(case=case,errors=errors),tempfile.TemporaryDirectory() as directory:
+                    root=Path(directory);target=root/case;target.mkdir()
+                    raw={'sampler_errors':errors,'failure_terminal_proof':{},'failure_cgroup_samples':[],
+                         'repository_space_samples':[]}
+                    receipt=target/'receipt.json';receipt.write_text(json.dumps(raw));before=receipt.read_bytes()
+                    args=SimpleNamespace(runtime=root,source=root,expected_source_sha256='d'*64,expected_image_id='candidate')
+                    verifier=module.verify_cleanup if errors else lambda *args:None
+                    with patch.object(module,'run_platform',return_value={'failed':False}),patch.object(module,'verify_cleanup',wraps=verifier) as verify,patch.object(module,'summarize',return_value={}),patch.object(module,'verify_early_oom',return_value={}),patch.object(module.subprocess,'run',return_value=SimpleNamespace(returncode=0,stdout='',stderr='')),patch.object(module,'sha',return_value='e'*64):
+                        public=module.run_case(args,case,None)
+                    saved=(target/'public.json').read_text()
+                    self.assertNotIn('PRIVATE-CANARY',saved)
+                    self.assertEqual(json.loads(saved),public)
+                    self.assertEqual(receipt.read_bytes(),before)
+                    self.assertEqual(verify.call_count,1)
+                    self.assertEqual(verify.call_args.args[0],json.loads(before))
+                    self.assertEqual(public['failed'],bool(errors));self.assertEqual(public['verified'],not errors)
+                    if not errors:self.assertNotIn('sampler_diagnostics',public)
+                    else:
+                        self.assertEqual(len(public['sampler_diagnostics']),1)
+                        item=public['sampler_diagnostics'][0]
+                        self.assertEqual(set(item),{'code','type','reason','errno','frames'})
+                        self.assertIsNone(item['type']);self.assertIsNone(item['errno']);self.assertEqual(item['frames'],[])
+
     def test_failed_probe_cannot_reuse_an_older_successful_receipt(self):
         module=self.module()
         from pathlib import Path

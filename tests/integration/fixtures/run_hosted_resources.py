@@ -14,7 +14,7 @@ from urllib.parse import quote
 
 from run_compose_pg_acceptance import fingerprint
 from run_hosted_acceptance import require_hosted_daemon,run_platform
-from run_resource_failures import FailureProbe
+from run_resource_failures import FailureProbe,observer_error_fields
 from run_resource_probe import Engine,PG,Probe,kv_numbers,sha,utc
 from summarize_resource_probe import summarize
 from hosted_evidence import public_receipt
@@ -138,6 +138,11 @@ def public_failure_diagnostics(raw):
         item=value.get(key);out[key]=item if isinstance(item,str) and item in allowed else None
     fields=scheduler_completion_fields({'targets':value.get('targets',[])})
     out['targets']=[] if fields is None else [{k:row[k] for k in ('failureCode','resticExitCode','resticReason')} for row in fields['targets']]
+    out['observer_errors']={}
+    for label,key in (('fast','fast_observer_errors'),('sampler','sampler_errors')):
+        rows=raw.get(key,[]);count=raw.get(key+'_count',len(rows) if isinstance(rows,list) else None)
+        count=max(count,len(rows)) if isinstance(rows,list) and type(count) is int and 0<=count<2**63 else None
+        out['observer_errors'][label]={'count':count,'items':[observer_error_fields(row) for row in rows[:32]] if isinstance(rows,list) else []}
     return out
 
 
@@ -350,7 +355,12 @@ def run_case(args,case,engine):
     for key,value in case_settings(case).items():setattr(args,key,value)
     row=run_platform(args,probe_class=HostedResourceProbe if case=='scheduler' else HostedFailureProbe)
     directory=args.runtime;raw=json.loads((directory/'receipt.json').read_text())
-    public=public_receipt(raw);public['case']=case;public['verified']=False
+    # Bound the legacy shared projection too, before it touches untrusted rows.
+    # This copy is public-only: verification below still receives every raw error.
+    errors=raw.get('sampler_errors')
+    sampler=[observer_error_fields(row) for row in errors[:32]] if isinstance(errors,list) else ([observer_error_fields({})] if errors else [])
+    public=public_receipt({**raw,'sampler_errors':sampler});public['case']=case;public['verified']=False
+    if errors:public['sampler_diagnostics']=sampler
     public['raw_receipt_sha256']=sha(directory/'receipt.json')
     if case!='scheduler':
         public['failure_diagnostics']=public_failure_diagnostics(raw)

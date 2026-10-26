@@ -5,6 +5,66 @@ from pathlib import Path
 from run_resource_probe import Engine, Probe, PG, worker_owned, sha, utc, kv_numbers
 
 
+# Fixed diagnostic vocabulary. Never persist arbitrary exception text, source,
+# locals, paths or dynamic class/function names, even in the private receipt.
+_OBSERVER_CODES=('observer_failure','kernel_reader_failure','observer_shutdown','sampler_failure')
+_OBSERVER_TYPES=('AssertionError','OSError','FileNotFoundError','ProcessLookupError','PermissionError',
+                 'TimeoutError','RuntimeError','ValueError','KeyError','JSONDecodeError','UnicodeDecodeError')
+_OBSERVER_REASONS=('worker_identity','cgroup_identity','kernel_counter_size')
+_OBSERVER_FUNCTIONS={
+    'run_resource_failures.py':('observe_fast','sample_failure_cgroup','terminal_reinspection','read','stop_failure_observers','call'),
+    'run_resource_probe.py':('sampler','measure','cgroup_sample','sampling_identity','valid_kernel_readback',
+        'pin_container','cgroup','pids','proc','footprint','call','inspect','_set_remaining','connect','sendall','recv_into','<dictcomp>','<listcomp>'),
+}
+
+
+def observer_error_fields(value):
+    """Re-project untrusted receipt rows using only finite, typed fields."""
+    if not isinstance(value,dict):value={}
+    def enum(item,allowed):return item if isinstance(item,str) and item in allowed else None
+    number=value.get('errno')
+    out={'code':enum(value.get('code'),_OBSERVER_CODES),'type':enum(value.get('type'),_OBSERVER_TYPES),
+         'reason':enum(value.get('reason'),_OBSERVER_REASONS),
+         'errno':number if type(number) is int and 0<=number<=4095 else None,'frames':[]}
+    frames=value.get('frames',[])
+    for frame in frames[-8:] if isinstance(frames,list) else []:
+        if not isinstance(frame,dict):continue
+        file=frame.get('file');function=frame.get('function');line=frame.get('line')
+        known=(isinstance(file,str) and file in _OBSERVER_FUNCTIONS and isinstance(function,str) and function in _OBSERVER_FUNCTIONS[file])
+        out['frames'].append({'file':file if known else None,'function':function if known else None,
+                              'line':line if known and type(line) is int and 0<line<=1000000 else None})
+    return out
+
+
+def observer_exception(code,exc=None):
+    frames=[]
+    if exc is not None:
+        # Match actual known module paths, not an arbitrary basename lookalike.
+        known={str(Path(__file__).with_name(name)):name for name in _OBSERVER_FUNCTIONS}
+        tb=exc.__traceback__
+        while tb is not None:
+            frame=tb.tb_frame
+            frames.append({'file':known.get(frame.f_code.co_filename),'function':frame.f_code.co_name,'line':tb.tb_lineno})
+            del frames[:-8];tb=tb.tb_next
+    args=getattr(exc,'args',())
+    return observer_error_fields({'code':code,'type':type(exc).__name__ if exc is not None else None,
+        'reason':args[0] if type(exc) is AssertionError and args else None,
+        'errno':getattr(exc,'errno',None),'frames':frames})
+
+
+class _ObserverErrors(list):
+    """Retain first 32 errors and total count; truncation never clears failure."""
+    def __init__(self,result,key,code):
+        super().__init__();self.result=result;self.key=key;self.code=code;self.lock=threading.Lock()
+
+    def append(self,value):
+        row=observer_error_fields(value)
+        if row['code'] is None:row['code']=self.code
+        with self.lock:
+            self.result[self.key+'_count']=min(2**63-1,self.result.get(self.key+'_count',0)+1)
+            if len(self)<32:super().append(row)
+
+
 class _ObserverStopped(BaseException):
     """End a sampler pass without turning requested shutdown into corruption."""
 
@@ -64,7 +124,12 @@ def assert_oom_proof(rows,state):
 
 
 class FailureProbe(Probe):
+    def observer_errors(self,key):
+        code='sampler_failure' if key=='sampler_errors' else 'observer_failure'
+        return self.result.setdefault(key,_ObserverErrors(self.result,key,code))
+
     def sampler(self):
+        self.observer_errors('sampler_errors')
         self.e=_SamplerEngine(self.sock,self.stopped)
         try:super().sampler()
         except _ObserverStopped:pass
@@ -89,42 +154,88 @@ class FailureProbe(Probe):
             spec.setdefault('HostConfig',{}).setdefault('Mounts',[]).append({'Type':'volume','Source':self.repo_volume,'Target':'/repository','ReadOnly':False})
         return super().create(suffix,spec,role,start)
 
-    def sample_failure_cgroup(self,worker,owner,*,deadline=None):
+    def sample_failure_cgroup(self,worker,owner,*,deadline=None,_settling=False):
         """Keep the validated kernel directory identity through terminal Pid=0."""
+        def check_deadline():
+            assert deadline is None or time.monotonic()<deadline, 'cgroup_identity'
+        check_deadline()
         assert worker_owned(worker,owner,self.image,self.daemon), 'worker_identity'
         cid=owner['workerContainerID'];pid=worker['State']['Pid']
         cached=self._cgroup_identities.get(cid)
         row={'at':utc(),'container':cid,'observer_pid':pid,'counter_status':'unavailable','memory.events':''}
         def terminal_reinspection():
+            if _settling:return None
             assert cached and pid==cached[3], 'cgroup_identity'
             bound=min(deadline,time.monotonic()+1) if deadline is not None else time.monotonic()+1
-            after=self.e.inspect(cid,missing=True,deadline=bound)
-            assert after and worker_owned(after,owner,self.image,self.daemon), 'worker_identity'
-            assert after['State']['Running'] is False and after['State']['Pid']==0, 'cgroup_identity'
-            return self.sample_failure_cgroup(after,owner)
-        cg=self.cgroup(pid) if pid else (cached[0] if cached else None)
+            # Same finite settle as the shared sampler: at most 20 exact
+            # inspections, one absolute I/O budget, no product deadline change.
+            for index in range(20):
+                if index:time.sleep(min(.05,max(0,bound-time.monotonic())))
+                assert time.monotonic()<bound, 'cgroup_identity'
+                after=self.e.inspect(cid,missing=True,deadline=bound)
+                assert time.monotonic()<bound, 'cgroup_identity'
+                assert after and worker_owned(after,owner,self.image,self.daemon), 'worker_identity'
+                assert after['State'].get('StartedAt')==worker['State'].get('StartedAt'), 'worker_identity'
+                if after['State']['Running'] is False:
+                    assert after['State']['Pid']==0, 'cgroup_identity'
+                    return self.sample_failure_cgroup(after,owner,deadline=bound)
+                assert after['State']['Running'] is True and after['State']['Pid']==pid, 'cgroup_identity'
+                fresh=self.sample_failure_cgroup(after,owner,deadline=bound,_settling=True)
+                if fresh is not None:return fresh
+            raise AssertionError('cgroup_identity')
+        def live_cgroup():
+            check_deadline()
+            try:return self.cgroup(pid,strict=True)
+            except OSError as exc:
+                if exc.errno not in (2,3,19):raise
+                return None
+            finally:check_deadline()
+        cg=live_cgroup() if pid else (cached[0] if cached else None)
         if pid:
             if cg is None:return terminal_reinspection()
             assert cid in str(cg), 'cgroup_identity'
             if cached:assert (cg,pid)==(cached[0],cached[3]), 'cgroup_identity'
         if cg is not None:
+            check_deadline()
             try:
-                stat=cg.stat();identity=(stat.st_dev,stat.st_ino)
+                stat=cg.stat();check_deadline();identity=(stat.st_dev,stat.st_ino)
                 if cached:assert identity==cached[1:3], 'cgroup_identity'
                 elif pid:self._cgroup_identities[cid]=(cg,*identity,pid)
                 for name in ['cpu.max','memory.max','memory.swap.max','memory.current','memory.peak','memory.events']:
+                    check_deadline()
                     try:row[name]=(cg/name).read_text().strip()
                     except OSError as exc:
-                        if exc.errno not in [2,3,13,19]:raise
+                        if exc.errno not in ((2,3,19) if pid else (2,3,13,19)):raise
                         row.setdefault('unavailable_errno',{})[name]=exc.errno
+                    finally:check_deadline()
                 if 'oom_kill' in kv_numbers(row['memory.events']):row['counter_status']='observed'
             except OSError as exc:
-                if exc.errno not in [2,3,13,19]:raise
+                if exc.errno not in ((2,3,19) if pid else (2,3,13,19)):raise
                 row['cgroup_errno']=exc.errno
+            finally:check_deadline()
         if pid and (row['counter_status']!='observed' or any(name not in row for name in ('cpu.max','memory.max','memory.swap.max'))):
             return terminal_reinspection()
+        if _settling:
+            # A live recovery is fresh kernel evidence, never a cached/partial
+            # row; reject replacement paths/inodes even during the file reads.
+            assert cached is not None, 'cgroup_identity'
+            number=lambda value:bool(value) and value.isascii() and value.isdecimal()
+            cpu=row['cpu.max'].split()
+            assert len(cpu)==2 and number(cpu[1]) and int(cpu[1])>0 and (cpu[0]=='max' or number(cpu[0])), 'cgroup_identity'
+            assert all(row[name]=='max' or number(row[name]) for name in ('memory.max','memory.swap.max')), 'cgroup_identity'
+            events=[line.split() for line in row['memory.events'].splitlines()]
+            assert events and all(len(fields)==2 and number(fields[1]) for fields in events), 'cgroup_identity'
+            try:stat=cg.stat()
+            except OSError as exc:
+                if exc.errno not in (2,3,19):raise
+                return None  # Still a gap; the outer bounded exact inspection must resolve it.
+            resolved=live_cgroup()
+            if resolved is None:return None
+            assert resolved==cg and (stat.st_dev,stat.st_ino)==cached[1:3], 'cgroup_identity'
+            assert deadline is not None and time.monotonic()<deadline, 'cgroup_identity'
         # Keep unavailable terminal reads explicitly, outside the verifier's
         # actual CPU-limit sample set; never fill missing fields from old rows.
+        check_deadline()
         if not pid:self.result['terminal_cgroup_sample']=row
         if 'cpu.max' in row:self.result['failure_cgroup_samples'].append(row)
         return row
@@ -179,7 +290,7 @@ class FailureProbe(Probe):
                     poll.poll(2)
                     if row['counter_status']=='unavailable':stop.wait(.002)
             except Exception as exc:
-                self.result.setdefault('fast_observer_errors',[]).append({'code':'kernel_reader_failure','errno':getattr(exc,'errno',None)})
+                self.observer_errors('fast_observer_errors').append(observer_exception('kernel_reader_failure',exc))
             finally:
                 for fd in fds.values():os.close(fd)
                 ready.set()
@@ -197,7 +308,7 @@ class FailureProbe(Probe):
         deadline=time.monotonic()+3
         for stop,thread in observers:thread.join(max(0,deadline-time.monotonic()))
         if any(thread.is_alive() for stop,thread in observers):
-            self.result.setdefault('fast_observer_errors',[]).append({'code':'observer_shutdown','errno':None})
+            self.observer_errors('fast_observer_errors').append(observer_exception('observer_shutdown'))
             raise ValueError('observer_shutdown')
 
     def activate_oom(self,pg,active):
@@ -302,7 +413,7 @@ class FailureProbe(Probe):
                     except (FileNotFoundError,ProcessLookupError,PermissionError):pass
             except (FileNotFoundError,KeyError,json.JSONDecodeError):pass
             except Exception as exc:
-                self.result.setdefault('fast_observer_errors',[]).append({'code':'observer_failure','errno':getattr(exc,'errno',None)})
+                self.observer_errors('fast_observer_errors').append(observer_exception('observer_failure',exc))
 
     def run(self):
         self.result['mode']=self.args.mode
