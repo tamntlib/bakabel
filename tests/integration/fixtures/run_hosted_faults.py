@@ -89,19 +89,31 @@ class FaultProbe(ComposeProbe):
                  'socket': socket_binding_proof(obj['Mounts'], self.sock)}
         if obj['State']['Running']:
             self.pin_container(obj['Id'])
-            cgroup = self.cgroup(obj['State']['Pid'])
-            if cgroup is None or obj['Id'] not in str(cgroup):
-                raise ValueError('exact worker cgroup unavailable')
-            proof['cpu.max'] = (cgroup/'cpu.max').read_text().strip()
-            proof['memory.max'] = (cgroup/'memory.max').read_text().strip()
-            proof['memory.peak'] = int((cgroup/'memory.peak').read_text().strip())
-            if proof['cpu.max'] != '200000 100000' or proof['memory.max'] != '536870912':
+            try:
+                cgroup = self.cgroup(obj['State']['Pid'])
+                if cgroup is None or obj['Id'] not in str(cgroup):
+                    raise FileNotFoundError('exact worker cgroup unavailable')
+                kernel = {'cpu.max': (cgroup/'cpu.max').read_text().strip(),
+                          'memory.max': (cgroup/'memory.max').read_text().strip(),
+                          'memory.peak': int((cgroup/'memory.peak').read_text().strip())}
+            except (FileNotFoundError, ProcessLookupError):
+                # Engine Running/Pid is a snapshot: the exact worker may have
+                # exited before /proc or cgroup readback. Only a second exact
+                # absent/stopped readback resolves that race. Never suppress a
+                # still-live failure, even if an earlier limits proof exists.
+                terminal = self.e.inspect(obj['Id'], missing=True)
+                if terminal is None: return proof
+                if terminal['State']['Running'] is not False:
+                    raise ValueError('exact worker cgroup unavailable') from None
+                return self.worker_proof(terminal, owner)
+            if kernel['cpu.max'] != '200000 100000' or kernel['memory.max'] != '536870912':
                 raise ValueError('kernel worker limits differ from ordinary defaults')
+            proof.update(kernel)
         return proof
 
     def exercise_stream_fault(self):
         controller = self.controller('run')
-        active, session, count = self.await_stream(self.source)
+        active, session, count = self.await_stream(self.source, controller=controller)
         self.result['injection'] = {'stdout_bytes_before_fault': count, 'owner': active, 'session': session}
         if self.case == 'producer-failure-after-output':
             # The producer's exact server session fails after real dump output;
@@ -164,16 +176,21 @@ class FaultProbe(ComposeProbe):
         # Inherited helpers may retain raw logs/specs transiently. Never export
         # them: allow only structured receipts plus bounded ID/metric records.
         result = {k: v for k, v in self.result.items() if k not in ('commands', 'container_specs')}
-        result['commands'] = [{k: v for k, v in c.items() if k in ('container', 'operation', 'exit', 'status')} for c in self.result.get('commands', [])]
+        result['commands'] = [{k: v for k, v in c.items() if k in ('container', 'operation', 'exit', 'status', 'expected_exit', 'complete_rows', 'failed_rows')} for c in self.result.get('commands', [])]
         result['workers'] = self.worker_records
         encoded = json.dumps(result, indent=2)
         if any(secret in encoded for secret in self.values): raise ValueError('synthetic secret in structured evidence')
         (self.root/'receipt.json').write_text(encoded+'\n')
 
-    def await_stream(self, pg):
+    def await_stream(self, pg, controller=None):
         def streaming():
+            if controller is not None:
+                cli = self.e.inspect(controller)
+                if not cli['State']['Running']:
+                    self.result['commands'].append({'container':controller, 'exit':cli['State']['ExitCode']})
+                    raise TimeoutError('CLI exited before live pg_dump after 64KiB stdout')
             active = self.owner()
-            if active.get('phase') != 'exec_started' or not active.get('execID'): return None
+            if not active or active.get('phase') != 'exec_started' or not active.get('execID'): return None
             count = self.relay.snapshot()['execs'].get(active['execID'], {}).get('stdout_bytes', 0)
             execution = self.e.call('GET', '/exec/'+active['execID']+'/json')
             if count < 65536 or execution.get('Running') is not True or execution.get('ContainerID') != pg: return None
@@ -268,7 +285,11 @@ class FaultProbe(ComposeProbe):
         text = self.logs(cid)
         if any(secret in text for secret in self.values): raise ValueError('synthetic secret in CLI logs')
         rows = [json.loads(line) for line in text.splitlines() if line.startswith(('{','['))]
-        self.result['commands'].append({'container':cid, 'exit':obj['State']['ExitCode']})
+        # Public stdout stays transient. Numeric projections distinguish a real
+        # false success from an observation failure without exporting messages.
+        self.result['commands'].append({'container':cid, 'exit':obj['State']['ExitCode'], 'expected_exit':expect,
+                                        'complete_rows':sum(isinstance(row,dict) and row.get('status') == 'complete' for row in rows),
+                                        'failed_rows':sum(isinstance(row,dict) and row.get('status') == 'failed' for row in rows)})
         if obj['State']['ExitCode'] != expect: raise ValueError('unexpected CLI exit')
         return rows
 

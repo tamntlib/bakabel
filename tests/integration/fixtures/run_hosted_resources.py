@@ -113,6 +113,12 @@ def run_case(args,case,engine):
     directory=args.runtime;raw=json.loads((directory/'receipt.json').read_text())
     public=public_receipt(raw);public['case']=case;public['verified']=False
     public['raw_receipt_sha256']=sha(directory/'receipt.json')
+    if case!='scheduler':
+        terminal=raw.get('worker_terminal_before_recovery',raw.get('worker_last_inspect',{}))
+        state=terminal.get('State',{});config=terminal.get('HostConfig',{})
+        samples=raw.get('failure_cgroup_samples',[])
+        counts=[kv_numbers(s.get('memory.events',''))['oom_kill'] for s in samples if 'oom_kill' in kv_numbers(s.get('memory.events',''))]
+        public['failure_observations']={'worker_exit_code':state.get('ExitCode') if type(state.get('ExitCode')) is int else None,'worker_oom_killed':state.get('OOMKilled') if type(state.get('OOMKilled')) is bool else None,'worker_memory_bytes':config.get('Memory') if type(config.get('Memory')) is int else None,'cgroup_samples':len(samples),'sampled_oom_kill_max':max(counts,default=None),'sampled_memory_max_bytes':sorted({int(s['memory.max']) for s in samples if str(s.get('memory.max','')).isdigit()})}
     if row['failed']:
         public['failed']=True
         (directory/'public.json').write_text(json.dumps(public,indent=2)+'\n')

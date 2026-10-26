@@ -251,6 +251,79 @@ class FixtureContracts(unittest.TestCase):
         wrong = json.loads(json.dumps(obj)); wrong['Mounts'][0]['Source'] = '/var/run/docker.sock'
         with self.assertRaises(ValueError): probe.worker_proof(wrong, owner)
 
+    @contextlib.contextmanager
+    def worker_observation_probe(self):
+        # Local files model a disappearing kernel view; not hosted evidence.
+        from unittest.mock import Mock
+        m = self.module()
+        with tempfile.TemporaryDirectory() as directory:
+            probe = m.FaultProbe.__new__(m.FaultProbe)
+            owner = {'runID':'a'*32,'workerContainerID':'b'*64,'workerName':'bakabel-worker-'+'a'*32,'daemonID':'daemon'}
+            probe.image = 'sha256:'+'c'*64; probe.daemon = 'daemon'; probe.sock = '/owned/relay.sock'
+            obj = {'Id':'b'*64,'Name':'/'+owner['workerName'],'Image':probe.image,
+                   'Config':{'Labels':{'bakabel.worker':'1','bakabel.run':owner['runID'],'bakabel.daemon':'daemon'},'Cmd':['_workflow'],'Entrypoint':['/usr/local/bin/bakabel']},
+                   'HostConfig':{'Memory':536870912,'NanoCpus':2000000000},'State':{'Running':True,'Pid':123},
+                   'Mounts':[{'Type':'bind','Source':probe.sock,'Destination':'/run/bakabel/docker.sock','RW':False}]}
+            cgroup = Path(directory)/('b'*64); cgroup.mkdir()
+            for key,value in (('cpu.max','200000 100000'),('memory.max','536870912'),('memory.peak','4096')):
+                (cgroup/key).write_text(value)
+            probe.owner = Mock(return_value=owner); probe.e = Mock(); probe.e.inspect.return_value = obj
+            probe.pin_container = Mock(); probe.cgroup = Mock(return_value=cgroup)
+            probe.worker_records = {}; probe.worker_owners = {}; probe.roles = {}
+            yield probe, obj, owner, cgroup
+
+    def test_worker_cgroup_exit_race_requires_exact_terminal_readback_preserves_cached_limits(self):
+        for terminal_kind in ('stopped','absent'):
+            with self.subTest(terminal=terminal_kind), self.worker_observation_probe() as (probe,obj,owner,_):
+                probe.capture_owned_worker()
+                cached = dict(probe.worker_records[obj['Id']])
+                stopped = json.loads(json.dumps(obj)); stopped['State'] = {'Running':False,'Pid':0}
+                probe.e.inspect.side_effect = [obj, stopped if terminal_kind == 'stopped' else None]
+                probe.cgroup.return_value = None
+                probe.capture_owned_worker()
+                self.assertEqual(probe.worker_records[obj['Id']], cached)
+                self.assertEqual(probe.e.inspect.call_args.kwargs, {'missing':True})
+                self.assertEqual(probe.worker_owners[obj['Id']], owner)
+
+    def test_worker_cgroup_unexplained_live_failure_is_not_hidden_by_cached_proof(self):
+        with self.worker_observation_probe() as (probe,obj,_,__):
+            probe.capture_owned_worker()
+            probe.cgroup.return_value = None
+            with self.assertRaisesRegex(ValueError, 'exact worker cgroup unavailable'):
+                probe.capture_owned_worker()
+
+    def test_worker_disappearing_cgroup_files_do_not_invent_kernel_readback(self):
+        for terminal_kind in ('stopped','absent','live'):
+            with self.subTest(terminal=terminal_kind), self.worker_observation_probe() as (probe,obj,_,cgroup):
+                (cgroup/'memory.max').unlink()
+                stopped = json.loads(json.dumps(obj)); stopped['State'] = {'Running':False,'Pid':0}
+                terminal = {'stopped':stopped,'absent':None,'live':obj}[terminal_kind]
+                probe.e.inspect.side_effect = [obj, terminal]
+                if terminal_kind == 'live':
+                    with self.assertRaisesRegex(ValueError, 'exact worker cgroup unavailable'):
+                        probe.capture_owned_worker()
+                else:
+                    probe.capture_owned_worker()
+                    self.assertFalse(any(key in probe.worker_records[obj['Id']] for key in ('cpu.max','memory.max','memory.peak')))
+
+    def test_worker_terminal_reread_refuses_identity_or_limits_drift(self):
+        for key in ('Id','Image','Name','Memory','NanoCpus','socket'):
+            with self.subTest(drift=key), self.worker_observation_probe() as (probe,obj,_,__):
+                terminal = json.loads(json.dumps(obj)); terminal['State'] = {'Running':False,'Pid':0}
+                if key in ('Id','Image','Name'): terminal[key] = 'wrong'
+                elif key == 'socket': terminal['Mounts'][0]['Source'] = '/var/run/docker.sock'
+                else: terminal['HostConfig'][key] = 0
+                probe.e.inspect.side_effect = [obj, terminal]; probe.cgroup.return_value = None
+                with self.assertRaises(ValueError): probe.capture_owned_worker()
+
+    def test_worker_live_kernel_limit_drift_is_never_an_exit_race(self):
+        for key,value in (('cpu.max','max 100000'),('memory.max','max')):
+            with self.subTest(limit=key), self.worker_observation_probe() as (probe,obj,_,cgroup):
+                probe.capture_owned_worker()
+                (cgroup/key).write_text(value)
+                with self.assertRaisesRegex(ValueError, 'kernel worker limits differ'):
+                    probe.capture_owned_worker()
+
     def test_producer_fault_terminates_exact_observed_backend_only_after_partial_output(self):
         m = self.module()
         self.assertIn('exercise_stream_fault', m.FaultProbe.__dict__, 'real producer failure must use observed streaming export identity')
@@ -259,7 +332,7 @@ class FixtureContracts(unittest.TestCase):
         probe.controller = lambda *args: (events.append(('cli', args)) or 'controller')
         active = {'runID':'a'*32,'execID':'c'*64,'workerContainerID':'d'*64}
         session = {'pid':123,'backend_start':'2026-01-01 00:00:00+00','application_name':'a'*32}
-        probe.await_stream = lambda pg: (events.append(('stream', pg)) or (active, session, 65536))
+        probe.await_stream = lambda pg, **kw: (events.append(('stream', pg)) or (active, session, 65536))
         probe.sql = lambda cid, q: (events.append(('sql', q)) or 't')
         probe.finish_failure = lambda cid, owner: events.append(('terminal', cid, owner))
         probe.result = {}
@@ -278,7 +351,7 @@ class FixtureContracts(unittest.TestCase):
         from unittest.mock import Mock
         probe = m.FaultProbe.__new__(m.FaultProbe); probe.case = 'streaming-worker-SIGKILL'; probe.source = 'b'*64
         active = {'runID':'a'*32,'execID':'c'*64,'workerContainerID':'d'*64}
-        probe.controller = lambda *args: 'controller'; probe.await_stream = lambda pg: (active, {'pid':123}, 65536)
+        probe.controller = lambda *args: 'controller'; probe.await_stream = lambda pg, **kw: (active, {'pid':123}, 65536)
         probe.e = Mock(); probe.result = {}; probe.finish_failure = Mock()
         probe.exercise_stream_fault()
         probe.e.call.assert_called_once_with('POST', '/containers/'+'d'*64+'/kill?signal=KILL')
@@ -358,6 +431,39 @@ class FixtureContracts(unittest.TestCase):
         probe.e.call.return_value = {'Running':False,'ContainerID':'d'*64}
         self.assertIsNone(probe.await_stream('d'*64))
 
+    def test_streaming_observation_waits_through_owner_not_yet_created(self):
+        from unittest.mock import Mock
+        m = self.module(); probe = m.FaultProbe.__new__(m.FaultProbe)
+        active = {'runID':'a'*32,'phase':'exec_started','execID':'b'*64}
+        probe.owner = Mock(side_effect=[None, active]); probe.capture_owned_worker = Mock()
+        probe.relay = Mock(); probe.relay.snapshot.return_value = {'execs':{'b'*64:{'stdout_bytes':65536}}}
+        probe.e = Mock(); probe.e.call.return_value = {'Running':True,'ContainerID':'d'*64}
+        probe.sql = Mock(return_value=json.dumps([{'pid':123,'backend_start':'start','application_name':'a'*32}]))
+        with patch.object(m.time, 'sleep'):
+            self.assertEqual(probe.await_stream('d'*64), (active, {'pid':123,'backend_start':'start','application_name':'a'*32}, 65536))
+        self.assertEqual(probe.owner.call_count, 2)
+
+    def test_streaming_gate_missed_by_terminal_cli_is_blocked_without_injection(self):
+        from unittest.mock import Mock
+        m = self.module()
+        for active in (None, {'runID':'a'*32,'phase':'exec_started','execID':'b'*64}):
+            with self.subTest(owner=active):
+                probe = m.FaultProbe.__new__(m.FaultProbe)
+                probe.case = 'streaming-worker-SIGKILL'; probe.source = 'd'*64
+                probe.result = {'commands':[]}; probe.controller = Mock(return_value='c'*64)
+                probe.owner = Mock(return_value=active); probe.capture_owned_worker = Mock()
+                probe.e = Mock(); probe.e.inspect.return_value = {'Id':'c'*64,'State':{'Running':False,'ExitCode':0}}
+                probe.relay = Mock(); probe.relay.snapshot.return_value = {'execs':{'b'*64:{'stdout_bytes':65535}}}
+                probe.e.call.return_value = {'Running':False,'ContainerID':probe.source}
+                # Exercise exactly one poll; the real path must detect terminal
+                # completion itself, not wait out a wall-clock timeout.
+                probe.wait = lambda fn, *args: fn()
+                with self.assertRaisesRegex(TimeoutError, 'CLI exited before live pg_dump after 64KiB stdout'):
+                    probe.exercise_stream_fault()
+                self.assertEqual(probe.result['commands'], [{'container':'c'*64,'exit':0}])
+                self.assertNotIn('injection', probe.result)
+                self.assertFalse(any(call.args[0] == 'POST' for call in probe.e.call.call_args_list))
+
     def test_prepare_uses_real_cli_plan_on_one_disposable_pg_source(self):
         m = self.module()
         self.assertIn('prepare',m.FaultProbe.__dict__, 'need actual local repository initialization and public discovery')
@@ -412,6 +518,24 @@ class FixtureContracts(unittest.TestCase):
             rows = probe.finish('b'*64, expect=1)
             self.assertEqual(rows[0]['status'],'failed')
             self.assertNotIn('internal diagnostics',json.dumps(probe.result))
+
+    def test_unexpected_cli_success_stays_failed_with_numeric_redacted_diagnostics(self):
+        from unittest.mock import Mock
+        m = self.module()
+        with tempfile.TemporaryDirectory() as directory:
+            probe = m.FaultProbe.__new__(m.FaultProbe); probe.root = Path(directory)
+            probe.values = []; probe.result = {'commands':[]}; probe.worker_records = {}
+            probe.capture_owned_worker = Mock(); probe.e = Mock()
+            probe.e.inspect.return_value = {'State':{'Running':False,'ExitCode':0}}
+            probe.logs = Mock(return_value='{"status":"complete","message":"private-do-not-export","Env":["PRIVATE=value"]}\n')
+            with self.assertRaisesRegex(ValueError, 'unexpected CLI exit'):
+                probe.finish('b'*64, expect=1)
+            probe.save()
+            exported = (probe.root/'receipt.json').read_text()
+            command = json.loads(exported)['commands'][0]
+            self.assertEqual(command, {'container':'b'*64,'exit':0,'expected_exit':1,'complete_rows':1,'failed_rows':0})
+            for secret in ('private-do-not-export','PRIVATE=value','Env','message'):
+                self.assertNotIn(secret, exported)
 
     def test_transport_response_loss_dispatch_uses_public_restore_and_real_fault_record(self):
         m = self.module()

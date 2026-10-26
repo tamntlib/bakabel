@@ -4,6 +4,25 @@ import unittest
 
 
 class HostedResources(unittest.TestCase):
+    def test_failed_case_retains_numeric_observations_without_claiming_oom(self):
+        module=self.module()
+        import json,tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        secret='unit-private-worker-error-not-public'
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);case=root/'oom-active';case.mkdir()
+            raw={'gates':[],'workers':{},'cleanup':{},'worker_terminal_before_recovery':{'State':{'Running':False,'ExitCode':137,'OOMKilled':False,'Error':secret},'HostConfig':{'Memory':16777216}},'failure_cgroup_samples':[{'memory.max':'536870912','memory.events':'oom_kill 0'}],'worker_failure_logs':secret}
+            (case/'receipt.json').write_text(json.dumps(raw))
+            with patch.object(module,'run_platform',return_value={'failed':True}):public=module.run_case(SimpleNamespace(runtime=root),'oom-active',None)
+            self.assertTrue(public['failed']);self.assertFalse(public['verified'])
+            observed=public['failure_observations']
+            self.assertEqual(observed['worker_exit_code'],137)
+            self.assertFalse(observed['worker_oom_killed'])
+            self.assertEqual(observed['sampled_oom_kill_max'],0)
+            self.assertNotIn(secret,json.dumps(public))
+
     def test_failed_probe_cannot_reuse_an_older_successful_receipt(self):
         module=self.module()
         from pathlib import Path
