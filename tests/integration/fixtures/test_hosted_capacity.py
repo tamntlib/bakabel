@@ -352,6 +352,253 @@ class HostedCapacityTests(unittest.TestCase):
             self.assertNotIn('DO-NOT-EXPORT', json.dumps(receipt))
 
 
+    def test_failed_finish_reads_logs_projects_safe_outcome_and_keeps_execute_failed(self):
+        from types import SimpleNamespace
+        import run_hosted_capacity as c
+        cid = 'a'*64
+        calls = []
+        class OfflineFailure(c.CapacityProbe):
+            def __init__(self, args):
+                self.root = args.runtime;self.root.mkdir()
+                self.prefix = 'owned';self.values = [];self.capacity = {
+                    'measurements_complete': False, 'full_plan_acceptance_pass': False}
+                self.containers = {cid: 'owned-run'}
+                self.command_context = {cid: {'operation': 'run', 'phase': 'first'}}
+                self.e = SimpleNamespace(inspect=lambda _: {'Id': cid, 'Name': '/owned-run',
+                    'Config': {'Labels': {'probe.bakabel.owner': 'owned'}},
+                    'State': {'Running': False, 'ExitCode': 1}})
+            def wait(self, predicate, *args): return predicate()
+            def logs(self, exact):
+                calls.append(exact)
+                return json.dumps({'status': 'failed', 'error': 'RAW-SECRET',
+                    'Env': ['RAW-SECRET'], 'argv': ['RAW-SECRET'], 'targets': [
+                        {'targetID': 'RAW-SECRET', 'status': 'unknown', 'error': 'backup failed'},
+                        {'status': 'RAW-SECRET', 'error': 'backup failed: RAW-SECRET'}]})
+            def run(self): self.finish(cid)
+            def cleanup(self): pass
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as root:
+            args = SimpleNamespace(runtime=Path(root)/'capacity')
+            self.assertEqual(c.execute(args, probe_type=OfflineFailure), 1)
+            self.assertEqual(calls, [cid], 'nonzero exit must not skip logs')
+            receipt = json.loads((args.runtime/'capacity-receipt.json').read_text())
+            self.assertEqual(receipt['commands'], [{'container': cid, 'exit': 1, 'expected_exit': 0,
+                'operation': 'run', 'phase': 'first', 'json_status': 'observed', 'outcomes': [
+                    {'status': 'failed', 'error_code': 'unknown', 'targets': [
+                        {'status': 'unknown', 'error_code': 'backup_failed'},
+                        {'status': 'unknown', 'error_code': 'unknown'}]}]}])
+            self.assertFalse(receipt['measurements_complete'])
+            self.assertFalse(receipt['full_plan_acceptance_pass'])
+            self.assertNotIn('RAW-SECRET', json.dumps(receipt))
+
+    def test_controller_context_tracks_static_capacity_phase_without_retaining_argv(self):
+        from unittest.mock import patch
+        import run_hosted_capacity as c
+        cid = 'a'*64
+        observed = []
+        class OfflineSequence(c.CapacityProbe):
+            def __init__(self): self.capacity = {}
+            def save(self): pass
+            def capture(self, operation):
+                self.controller(operation, 'RAW-SECRET')
+                observed.append(dict(getattr(self, 'command_context', {}).get(cid, {})))
+            def prepare(self): self.capture('plan')
+            def backup_capacity(self, phase): self.capture('run');return phase
+            def change_corpus(self): pass
+            def verify_snapshots(self, rounds): pass
+            def readback_capacity(self, rounds): self.capture('RAW-SECRET')
+            def restore_capacity(self, first): self.capture('restore')
+            def verify_sources(self): pass
+        with patch.object(c.Probe, 'controller', return_value=cid):
+            OfflineSequence().run()
+        self.assertEqual(observed, [{'operation': op, 'phase': phase} for op, phase in
+            [('plan', 'prepare'), ('run', 'first'), ('run', 'repeat'), ('run', 'changed'),
+             ('unknown', 'readback'), ('restore', 'restore')]])
+        self.assertNotIn('RAW-SECRET', json.dumps(observed))
+
+    def test_worker_terminal_inspect_is_retained_after_removal_without_oom_inference(self):
+        import copy
+        import run_hosted_capacity as c
+        cid = 'b'*64
+        record = {'Id': cid, 'Image': 'image', 'Name': '/worker-owned', 'runID': 'run',
+            'Config': {'Labels': {'bakabel.worker': '1', 'bakabel.run': 'run', 'bakabel.daemon': 'daemon'}}}
+        for state, expected in [
+                ({'Running': False, 'Status': 'exited', 'ExitCode': 137, 'OOMKilled': True}, (137, True)),
+                ({'Running': False, 'Status': 'exited', 'ExitCode': 137}, (137, None)),
+                ({'Running': True, 'Status': 'running', 'ExitCode': 0, 'OOMKilled': False}, (None, None)),
+                ({'Running': False, 'Status': 'created', 'ExitCode': 0, 'OOMKilled': False}, (None, None))]:
+            with self.subTest(state=state):
+                p = c.CapacityProbe.__new__(c.CapacityProbe)
+                p.capacity = {};p.worker_records = {cid: copy.deepcopy(record)}
+                p.image = 'image';p.daemon = 'daemon'
+                obj = {**record, 'State': {**state, 'Error': 'RAW-SECRET'}, 'Env': ['RAW-SECRET']}
+                class InspectThenAbsent:
+                    def inspect(self, *args, **kwargs): return obj
+                raw = InspectThenAbsent();p.e = raw
+                p.e.inspect(cid, missing=True)
+                raw.inspect = lambda *args, **kwargs: None
+                p.e.inspect(cid, missing=True)
+                terminal = p.capacity.get('worker_terminal', {}).get(cid, {})
+                self.assertEqual((terminal.get('exit'), terminal.get('oom_killed')), expected)
+                if expected[0] is not None:
+                    self.assertEqual(terminal, {'exit': expected[0], 'oom_killed': expected[1]})
+                self.assertNotIn('RAW-SECRET', json.dumps(p.capacity))
+        p.capacity = {};p.e = type('WrongIdentity', (), {'inspect': lambda *_a, **_k:
+            {**record, 'Image': 'other-image', 'State': {'Running': False, 'Status': 'exited', 'ExitCode': 137, 'OOMKilled': True}}})()
+        p.e.inspect(cid)
+        self.assertNotIn(cid, p.capacity.get('worker_terminal', {}))
+
+    def test_cached_worker_events_are_bounded_exact_safe_and_independent_of_oom_inference(self):
+        from urllib.parse import parse_qs, urlsplit
+        from unittest.mock import patch
+        import run_hosted_capacity as c
+        cid = 'b'*64
+        record = {'Id': cid, 'Image': 'image', 'Name': '/worker-owned', 'runID': 'run',
+            'Config': {'Labels': {'bakabel.worker': '1', 'bakabel.run': 'run', 'bakabel.daemon': 'daemon'}},
+            'State_at_first_sample': {'Running': True, 'ExitCode': 0, 'OOMKilled': False}}
+        def event(action, exact=cid, at=2000000000, exit='137'):
+            return {'Type': 'container', 'Action': action, 'timeNano': at,
+                'Actor': {'ID': exact, 'Attributes': {'exitCode': exit, 'image': 'RAW-SECRET'}},
+                'message': 'RAW-SECRET'}
+        for payload, expected_status, expected in [
+                ([event('oom'), event('die'), event('die', exact='c'*64), event('die', at=4000000000),
+                  event('exec_die'), event('die', exit='RAW-SECRET')], 'observed', [
+                    {'type': 'oom', 'container': cid, 'time_ns': 2000000000, 'exit': None},
+                    {'type': 'die', 'container': cid, 'time_ns': 2000000000, 'exit': 137},
+                    {'type': 'die', 'container': cid, 'time_ns': 2000000000, 'exit': None}]),
+                ([], 'observed', []), (PermissionError('RAW-SECRET'), 'unavailable', []),
+                (b'not JSON RAW-SECRET', 'unavailable', []),
+                ([event('die')]*257, 'unavailable', [])]:
+            with self.subTest(status=expected_status, payload_type=type(payload).__name__):
+                p = c.CapacityProbe.__new__(c.CapacityProbe)
+                p.capacity = {};p.worker_records = {cid: record};p.image = 'image';p.daemon = 'daemon'
+                p._events_since_ns = 1000000000
+                calls = []
+                class CachedEvents:
+                    def inspect(self, *args, **kwargs): return None
+                    def call(self, method, path, **kwargs):
+                        calls.append((method, path, kwargs))
+                        if path == '/info': return {'ID': 'daemon'}
+                        if isinstance(payload, Exception): raise payload
+                        return payload if isinstance(payload, bytes) else '\n'.join(json.dumps(e) for e in payload).encode()
+                p.e = CachedEvents()
+                self.assertTrue(hasattr(p, 'collect_worker_diagnostics'), 'missing bounded pre-cleanup event query')
+                with patch.object(c.time, 'time_ns', return_value=3000000000):
+                    p.collect_worker_diagnostics()
+                query = parse_qs(urlsplit(calls[-1][1]).query)
+                self.assertEqual(query['since'], ['1.000000000'])
+                self.assertEqual(query['until'], ['3.000000000'])
+                self.assertEqual(json.loads(query['filters'][0]), {
+                    'type': ['container'], 'container': [cid], 'event': ['oom', 'die']})
+                self.assertEqual(calls[-1][2], {'raw': True})
+                self.assertEqual(p.capacity['worker_events'], {'status': expected_status, 'events': expected})
+                self.assertEqual(p.capacity['worker_terminal'][cid], {'exit': None, 'oom_killed': None})
+                summary = c.capacity_summary(p.capacity, [])
+                self.assertEqual(summary['worker_events'], p.capacity['worker_events'])
+                self.assertNotIn('RAW-SECRET', json.dumps(p.capacity))
+
+    def test_diagnostic_bounds_do_not_change_successful_operator_acceptance(self):
+        from types import SimpleNamespace
+        import run_hosted_capacity as c
+        cid = 'a'*64
+        for text in ['x'*(512*1024)+'\n{"status":"complete"}',
+                     '\n'.join(['{"status":"complete"}']*129),
+                     json.dumps({'targets': [{'status': 'complete'}]*129})]:
+            with self.subTest(bytes=len(text)), tempfile.TemporaryDirectory(dir=SCRATCH) as root:
+                p = c.CapacityProbe.__new__(c.CapacityProbe)
+                p.root = Path(root);p.values = [];p.prefix = 'owned';p.capacity = {}
+                p.containers = {cid: 'owned-operator'}
+                p.command_context = {cid: {'operation': 'restic', 'phase': 'prepare'}}
+                p.e = SimpleNamespace(inspect=lambda _: {'Id': cid, 'Name': '/owned-operator',
+                    'Config': {'Labels': {'probe.bakabel.owner': 'owned'}},
+                    'State': {'Running': False, 'ExitCode': 0}})
+                p.wait = lambda predicate, *args: predicate()
+                p.logs = lambda _: text
+                self.assertEqual(p.finish(cid), c.json_rows(text))
+                self.assertEqual(p.capacity['commands'][0]['operation'], 'restic')
+                self.assertEqual(p.capacity['commands'][0]['json_status'], 'unavailable')
+                self.assertEqual(p.capacity['commands'][0]['outcomes'], [])
+                p.capacity['commands'] = [dict(p.capacity['commands'][0]) for _ in range(128)]
+                self.assertEqual(p.finish(cid), c.json_rows(text))
+                self.assertEqual(len(p.capacity['commands']), 128)
+                self.assertEqual(p.capacity['commands'][-1]['container'], cid)
+
+    def test_nonzero_finish_keeps_exit_when_logs_are_unavailable_malformed_or_secret(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        import run_hosted_capacity as c
+        cid = 'a'*64
+        for payload in [PermissionError('RAW-SECRET'), '{bad RAW-SECRET',
+                        '{"status":"failed","error":"SYNTHETIC-SECRET"}']:
+            with self.subTest(payload_type=type(payload).__name__), tempfile.TemporaryDirectory(dir=SCRATCH) as root:
+                p = c.CapacityProbe.__new__(c.CapacityProbe)
+                p.root = Path(root);p.values = ['SYNTHETIC-SECRET'];p.prefix = 'owned';p.capacity = {}
+                p.containers = {cid: 'owned-run'}
+                p.e = SimpleNamespace(inspect=lambda _: {'Id': cid, 'Name': '/owned-run',
+                    'Config': {'Labels': {'probe.bakabel.owner': 'owned'}},
+                    'State': {'Running': False, 'ExitCode': 137}})
+                p.wait = lambda predicate, *args: predicate()
+                options = {'side_effect': payload} if isinstance(payload, Exception) else {'return_value': payload}
+                with patch.object(c.Probe, 'logs', **options) as logs:
+                    with self.assertRaisesRegex(ValueError, '^capacity command returned unexpected exit status$'):
+                        p.finish(cid)
+                    logs.assert_called_once_with(cid)
+                written = (p.root/'capacity-receipt.json').read_text()
+                command = json.loads(written)['commands'][0]
+                self.assertEqual(command['exit'], 137)
+                self.assertEqual(command['expected_exit'], 0)
+                self.assertEqual(command['json_status'], 'unavailable')
+                self.assertEqual(command['outcomes'], [])
+                self.assertNotIn('RAW-SECRET', written)
+                self.assertNotIn('SYNTHETIC-SECRET', written)
+
+    def test_error_codes_require_exact_known_literals_not_plausible_strings_or_nested_fields(self):
+        import run_hosted_capacity as c
+        rows = [{'status': 'failed', 'targets': [{'status': 'failed', 'error': value,
+                 'errorCode': 'RAW-SECRET', 'message': 'RAW-SECRET'} for value in
+                 ['backup failed', 'restore failed', 'backup failed RAW-SECRET', 'backup_failed',
+                  {'code': 'RAW-SECRET'}, ['RAW-SECRET'], None]]}]
+        out = c.project_outcomes(rows)
+        self.assertEqual([t['error_code'] for t in out[0]['targets']],
+                         ['backup_failed', 'restore_failed']+['unknown']*5)
+        self.assertNotIn('RAW-SECRET', json.dumps(out))
+
+    def test_unverified_cached_workers_or_changed_daemon_never_authorize_events(self):
+        from unittest.mock import patch
+        import run_hosted_capacity as c
+        cid = 'b'*64
+        record = {'Id': cid, 'Image': 'image', 'Name': '/worker-owned', 'runID': 'run',
+            'Config': {'Labels': {'bakabel.worker': '1', 'bakabel.run': 'run', 'bakabel.daemon': 'daemon'}}}
+        for bad_record, daemon in [(dict(record, Image='wrong'), 'daemon'), (record, 'changed')]:
+            p = c.CapacityProbe.__new__(c.CapacityProbe)
+            p.capacity = {};p.worker_records = {cid: bad_record};p.image = 'image';p.daemon = 'daemon'
+            p._events_since_ns = 1000000000
+            calls = []
+            class UnavailableEvents:
+                def inspect(self, *args, **kwargs): raise PermissionError('RAW-SECRET')
+                def call(self, method, path, **kwargs):
+                    calls.append(path)
+                    return {'ID': daemon}
+            p.e = UnavailableEvents()
+            with patch.object(c.time, 'time_ns', return_value=3000000000):
+                p.collect_worker_diagnostics()
+            self.assertFalse(any(path.startswith('/events') for path in calls))
+            self.assertEqual(p.capacity['worker_events'], {'status': 'unavailable', 'events': []})
+            self.assertNotIn('RAW-SECRET', json.dumps(p.capacity))
+
+    def test_operator_context_identifies_restic_without_recording_arguments(self):
+        import run_hosted_capacity as c
+        cid = 'a'*64
+        p = c.CapacityProbe.__new__(c.CapacityProbe)
+        p.capacity_phase = 'prepare'
+        p.restic_spec = lambda argv: {'Cmd': list(argv)}
+        p.create = lambda *args, **kwargs: cid
+        observed = []
+        p.finish = lambda exact: observed.append(getattr(p, 'command_context', {}).get(exact))
+        p.logs = lambda exact: 'transient output'
+        self.assertEqual(p.restic('init', 'RAW-SECRET'), 'transient output')
+        self.assertEqual(observed, [{'operation': 'restic', 'phase': 'prepare'}])
+        self.assertNotIn('RAW-SECRET', json.dumps(p.command_context))
+
     def test_operator_pretty_json_is_parsed_without_json_line_corruption(self):
         import run_hosted_capacity as c
         self.assertTrue(hasattr(c, 'json_rows'), 'missing real CLI JSON decoder')
@@ -622,6 +869,10 @@ class HostedCapacityTests(unittest.TestCase):
             self.assertEqual(p.capacity.get('sampler_diagnostics'), [{'type': 'RuntimeError', 'http_status': 404,
                 'frames': [{'file': 'run_resource_probe.py', 'line': 1, 'function': 'sampler'}]}])
             self.assertNotIn('RAW-ERROR-SECRET', json.dumps(p.capacity))
+            self.assertEqual(p.capacity.get('worker_events'), {'status': 'unavailable', 'events': []},
+                             'collect diagnostics before cleanup can fail or delete exact targets')
+            summary = json.loads((p.root/'capacity-summary.json').read_text())
+            self.assertEqual(summary['worker_events'], p.capacity['worker_events'])
             self.assertEqual((p.root/'private/keep').read_text(), 'keep')
             self.assertTrue((p.root/'capacity-metrics.json').exists())
             self.assertNotIn('private_paths_absent', p.capacity['cleanup'])

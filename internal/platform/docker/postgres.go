@@ -194,7 +194,7 @@ func (c *Client) CreateDump(ctx context.Context, p Postgres, run string, persist
 	if !p.prepared || !validToken(run) || persist == nil {
 		return d, ErrQuarantine
 	}
-	conn, e := p.conninfo()
+	argv, e := dumpCommand(d)
 	if e != nil {
 		return d, ErrQuarantine
 	}
@@ -202,7 +202,7 @@ func (c *Client) CreateDump(ctx context.Context, p Postgres, run string, persist
 	if e != nil || status != SourceRunning {
 		return d, ErrQuarantine
 	}
-	d.ExecID, e = c.CreateExec(ctx, p.Source.ContainerID, ExecConfig{User: "0", Cmd: []string{"/usr/local/bin/pg_dump", "--no-password", "--dbname", conn, "--format=custom", "--compress=gzip:9"}, Env: pgEnv(run)})
+	d.ExecID, e = c.CreateExec(ctx, p.Source.ContainerID, ExecConfig{User: "0", Cmd: argv, Env: pgEnv("")})
 	if e != nil {
 		return d, ErrQuarantine
 	}
@@ -224,10 +224,11 @@ func (c *Client) StreamDump(ctx context.Context, d Dump, stdout io.Writer) (int,
 		return 0, ErrQuarantine
 	}
 	s, e := c.PollExec(ctx, d.ExecID)
-	if e != nil || s.ContainerID != d.Source.ContainerID || s.ProcessConfig.Entrypoint != "/usr/local/bin/pg_dump" {
+	if e != nil || !matchesDumpExec(s, d, false) {
 		return 0, ErrQuarantine
 	}
-	if e = c.StartExec(ctx, d.ExecID, stdout, io.Discard); e != nil {
+	stream := newDumpStream(stdout, d.RunID)
+	if e = c.StartExec(ctx, d.ExecID, stream, io.Discard); e != nil {
 		return 0, ErrQuarantine
 	}
 	code, e := c.WaitExec(ctx, d.ExecID)
@@ -237,5 +238,5 @@ func (c *Client) StreamDump(ctx context.Context, d Dump, stdout io.Writer) (int,
 	if code != 0 {
 		return code, ErrDumpFailed
 	}
-	return 0, nil
+	return 0, stream.Finish()
 }

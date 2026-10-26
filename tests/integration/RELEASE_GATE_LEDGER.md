@@ -2,7 +2,7 @@
 
 **Release: NOT READY.** This ledger maps requirements to evidence; it does not turn implementation, offline tests, or a successful process exit into runtime acceptance.
 
-Production Go/modules/Dockerfile remain bound to Astra R3 core fingerprint `6a592fcf1159d301bbe9acf0ff82e3e681913de4d1fb6f17ccc2d05c9d394ef8`. Every fresh hosted result must additionally bind its exact Git commit, actual image ID and disposable daemon. The previous complete core acceptance was run `40236930603` at commit `f3be77e36d1be73d9f3c8b706ec4f386b96a4a9c`; it does not certify later fixture revisions.
+The historical Astra R3 core fingerprint is `6a592fcf1159d301bbe9acf0ff82e3e681913de4d1fb6f17ccc2d05c9d394ef8`. Production Go is now changing to repair frame-boundary suffix-loss acceptance; see [the completion protocol and limitations](../../docs/streaming.md). R3 review/runtime evidence does not certify this changed candidate. Every fresh hosted result must bind its exact source fingerprint, Git commit, actual image ID and disposable daemon. The previous complete core acceptance was run `40236930603` at commit `f3be77e36d1be73d9f3c8b706ec4f386b96a4a9c`; it does not certify later source or fixture revisions.
 
 ## Evidence already credited within its boundary
 

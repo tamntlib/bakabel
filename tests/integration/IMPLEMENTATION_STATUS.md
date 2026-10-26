@@ -1,4 +1,8 @@
-# Implementation status — verified R3 candidate
+# Implementation status — historical R3 and current repair
+
+## Current repair candidate
+
+Production Go is now being changed to reject unproven export EOF, using a fixed producer-completion protocol and wrapper-aware cancellation. See [the protocol and its explicit trust boundary](../../docs/streaming.md). The R3 fingerprint/image/review and all runtime results below are **historical baseline evidence**, not certification of this changed candidate. Fresh exact-source review/build and hosted acceptance remain required; release is NOT READY.
 
 ## Verdict
 

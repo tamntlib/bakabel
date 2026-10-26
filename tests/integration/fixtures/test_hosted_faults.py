@@ -50,6 +50,26 @@ import tempfile
 from pathlib import Path
 
 
+# Independent literal of the producer contract, not imported from the classifier.
+DUMP_SCRIPT = r'''run=$1
+shift
+BAKABEL_RUN_ID="$run" PGAPPNAME="$run" /usr/local/bin/pg_dump "$@"
+code=$?
+[ "$code" -eq 0 ] || exit "$code"
+printf '\000BAKABEL_EXPORT_COMPLETE_V1:%s\000' "$run"'''
+
+
+def wrapped_dump(run='c'*32):
+    return {'User': '0', 'AttachStdout': True, 'AttachStderr': True,
+            'AttachStdin': False, 'Tty': False,
+            'Cmd': ['/bin/sh', '-c', DUMP_SCRIPT, 'bakabel-export-v1', run,
+                    '--no-password', '--dbname',
+                    "host='/var/run/postgresql' port='5432' user='postgres' dbname='fixture'",
+                    '--format=custom', '--compress=gzip:9'],
+            'Env': ['PGAPPNAME=', 'BAKABEL_RUN_ID=', 'PGHOSTADDR=', 'PGPASSWORD=',
+                    'PGPASSFILE=/dev/null', 'PGSERVICEFILE=/dev/null', 'PGOPTIONS=', 'PGCONNECT_TIMEOUT=10']}
+
+
 class RelayTests(unittest.TestCase):
     def module(self):
         m = importlib.import_module('run_hosted_faults')
@@ -82,6 +102,79 @@ class RelayTests(unittest.TestCase):
         self.addCleanup(server.close); self.addCleanup(thread.join, 5)
         return seen
 
+    def test_wrapper_fixture_tracks_fixed_go_script(self):
+        import re
+        source = Path(__file__).resolve().parents[3]/'internal/platform/docker/dump_command.go'
+        script = re.search(r'const dumpScript = `([^`]*)`', source.read_text())
+        self.assertIsNotNone(script)
+        self.assertEqual(DUMP_SCRIPT, script.group(1))
+
+    def test_exact_wrapper_classifies_valid_positional_run_and_legacy_execs_still_match(self):
+        m = self.module(); relay = m.FaultRelay.__new__(m.FaultRelay)
+        relay.workers = set(); relay.execs = {}
+        path = '/v1.55/containers/'+'b'*64+'/exec'
+        for run in ('a'*16, 'c'*32, 'A0_-'+'x'*59):
+            with self.subTest(run=run):
+                record = relay.classify('POST', path, json.dumps(wrapped_dump(run)).encode())
+                self.assertEqual(record, {'method':'POST', 'boundary':'dump-create', 'forwarded':False, 'container_id':'b'*64})
+        for user, database in (("o'brien", r'back\slash'), ('é'*128, 'x'*256), ('user', 'private $(literal);\nname')):
+            with self.subTest(user=user):
+                quote = lambda name: "'"+name.replace('\\', '\\\\').replace("'", "\\'")+"'"
+                spec = wrapped_dump()
+                spec['Cmd'][7] = "host='/var/run/postgresql' port='5432' user="+quote(user)+' dbname='+quote(database)
+                self.assertEqual(relay.classify('POST', path, json.dumps(spec).encode())['boundary'], 'dump-create')
+        for cmd, kind in ((['/usr/local/bin/pg_dump','--format=custom'], 'dump'),
+                          (['pg_restore','--exit-on-error'], 'restore')):
+            self.assertEqual(relay.classify('POST', path, json.dumps({'Cmd':cmd}).encode())['boundary'], kind+'-create')
+
+    def test_wrapper_lookalikes_fail_closed_without_exporting_request_values(self):
+        m = self.module(); relay = m.FaultRelay.__new__(m.FaultRelay)
+        relay.workers = set(); relay.execs = {}
+        variants = []
+        def changed(label, key, value):
+            spec = wrapped_dump(); spec[key] = value; variants.append((label, spec))
+        for index, values in {
+                0: ['sh', '/usr/bin/sh', '/bin/bash', '/bin/sh-extra'],
+                1: ['-ec', '-c '],
+                2: ['pg_dump --format=custom', DUMP_SCRIPT+'\n', DUMP_SCRIPT+'\n# private-script',
+                    DUMP_SCRIPT.replace('exit "$code"', 'true'), DUMP_SCRIPT.replace('run=$1', 'run=$2')],
+                3: ['bakabel-export', 'bakabel-export-v1-private'],
+                4: ['', 'short', 'a'*15, 'a'*64, 'a'*31+';', 'a'*31+'\n', 'a'*31+'\0', 'a'*31+'é'],
+                5: ['--no-password-private', '--password'],
+                6: ['--dbname=private'],
+                7: ['', '--format=custom', 'postgresql://private',
+                    "host='remote' port='5432' user='postgres' dbname='fixture'",
+                    "host='/var/run/postgresql' port='5432' user='' dbname='fixture'",
+                    wrapped_dump()['Cmd'][7]+' password=private',
+                    wrapped_dump()['Cmd'][7].replace('fixture', 'x'*257),
+                    wrapped_dump()['Cmd'][7].replace('fixture', 'é'*129),
+                    wrapped_dump()['Cmd'][7].replace('fixture', '\ud800'),
+                    wrapped_dump()['Cmd'][7].replace('fixture', '\\q'),
+                    wrapped_dump()['Cmd'][7]+'\0'],
+                8: ['--format=custom-private', '--format=plain'],
+                9: ['--compress=gzip:0', '--compress=gzip:9-private']}.items():
+            for value in values:
+                cmd = wrapped_dump()['Cmd']; cmd[index] = value
+                changed('argv-'+str(index)+'-'+repr(value), 'Cmd', cmd)
+        for cmd in (wrapped_dump()['Cmd'][:-1], wrapped_dump()['Cmd']+['--private'],
+                    ['env']+wrapped_dump()['Cmd'], {'0':'/bin/sh'}, '/bin/sh', [None],
+                    ['/bin/sh', None], ['/bin/sh', '-c', DUMP_SCRIPT, 'bakabel-export-v1', 123]):
+            changed('malformed-argv-'+repr(cmd), 'Cmd', cmd)
+        for env in (None, [], 'PGAPPNAME=', {'PGAPPNAME':''},
+                    wrapped_dump()['Env']+['PRIVATE=do-not-log'],
+                    ['PGAPPNAME='+'c'*32]+wrapped_dump()['Env'][1:],
+                    [e for e in wrapped_dump()['Env'] if not e.startswith('BAKABEL_RUN_ID=')],
+                    ['BAKABEL_RUN_ID='+'c'*32 if e.startswith('BAKABEL_RUN_ID=') else e for e in wrapped_dump()['Env']]):
+            changed('environment-'+repr(env), 'Env', env)
+        for key, value in (('User','postgres'), ('AttachStdout',False), ('AttachStderr',False),
+                           ('AttachStdin',True), ('Tty',True), ('Tty',0)):
+            changed('exec-config-'+key, key, value)
+        variants.extend([('non-object', []), ('null', None)])
+        for label, spec in variants:
+            with self.subTest(variant=label):
+                record = relay.classify('POST', '/containers/'+'b'*64+'/exec', json.dumps(spec).encode())
+                self.assertEqual(record, {'method':'POST', 'boundary':'other', 'forwarded':False, 'container_id':'b'*64})
+
     def test_exec_create_response_loss_keeps_real_forwarded_id_but_sends_no_reply(self):
         m = self.module()
         with tempfile.TemporaryDirectory() as directory:
@@ -94,8 +187,10 @@ class RelayTests(unittest.TestCase):
                 observed = []
                 relay.observer = lambda phase, record: observed.append((phase, record['boundary']))
                 relay.arm('dump-create', 'response-loss')
-                result = self.exchange(relay, '/v1.55/containers/'+'b'*64+'/exec', json.dumps({'Cmd':['/usr/local/bin/pg_dump','--format=custom'], 'Env':['PGAPPNAME='+'c'*32]}).encode())
+                request = json.dumps(wrapped_dump()).encode()
+                result = self.exchange(relay, '/v1.55/containers/'+'b'*64+'/exec', request)
                 self.assertEqual(result, b''); self.assertEqual(len(seen), 1)
+                self.assertEqual(seen[0][1], request)
                 record = relay.snapshot()['records'][-1]
                 self.assertEqual(record['exec_id'], eid); self.assertEqual(record['fault'], 'response-loss')
                 self.assertTrue(record['forwarded']); self.assertEqual(record['status'], 201)
@@ -111,19 +206,47 @@ class RelayTests(unittest.TestCase):
             frame = lambda stream, data: bytes([stream,0,0,0])+struct.pack('>I',len(data))+data
             replies = [b'HTTP/1.1 201 Created\r\nContent-Length: '+str(len(created)).encode()+b'\r\n\r\n'+created,
                        b'HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n'+frame(2,b'ignored-stderr')+frame(1,b'x'*96)]
-            self.scripted(root, replies)
+            seen = self.scripted(root, replies)
             relay = m.FaultRelay(root/'front', root/'back'); relay.start()
             try:
                 self.assertTrue(hasattr(relay, 'arm'), 'need exact stream drop not a generated failed export')
-                self.exchange(relay, '/v1.55/containers/'+cid+'/exec', json.dumps({'Cmd':['/usr/local/bin/pg_dump','--format=custom']}).encode())
+                request = json.dumps(wrapped_dump()).encode()
+                self.exchange(relay, '/v1.55/containers/'+cid+'/exec', request)
                 relay.arm('dump-start', 'stream-drop', after_stdout=32, deny_status=True)
                 result = self.exchange(relay, '/v1.55/exec/'+eid+'/start', b'{"Detach":false,"Tty":false}')
                 self.assertTrue(result.startswith(b'HTTP/1.1 101'))
                 snap = relay.snapshot(); record = snap['records'][-1]
+                self.assertEqual(seen[0][1], request)
+                self.assertEqual(snap['execs'][eid]['kind'], 'dump')
+                self.assertEqual(record['boundary'], 'dump-start'); self.assertEqual(record['container_id'], cid)
+                for private in ('Cmd', 'Env', 'run=$1', 'bakabel-export-v1', "dbname='fixture'", 'ignored-stderr', 'c'*32):
+                    self.assertNotIn(private, json.dumps(snap))
+                self.assertEqual(snap['errors'], [])
                 self.assertGreaterEqual(record['stdout_bytes'], 32); self.assertEqual(record['fault'], 'stream-drop')
                 self.assertEqual(snap['denied_exec'], eid)
                 self.assertFalse(relay.status_allowed(eid)); self.assertTrue(relay.status_allowed('d'*64))
                 relay.recover_transport(); self.assertTrue(relay.status_allowed(eid))
+            finally: relay.close()
+
+    def test_unknown_shell_wrapper_is_forwarded_unchanged_without_consuming_fault(self):
+        m = self.module()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            reply = b'HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\n{}'
+            seen = self.scripted(root, [reply])
+            relay = m.FaultRelay(root/'front', root/'back'); relay.start()
+            try:
+                spec = wrapped_dump(); spec['Cmd'][2] += '\n# private-do-not-log'
+                request = json.dumps(spec).encode()
+                relay.arm('dump-create', 'response-loss')
+                self.assertEqual(self.exchange(relay, '/containers/'+'b'*64+'/exec', request), reply)
+                self.assertEqual(seen[0][1], request)
+                self.assertFalse(relay.hit.is_set()); self.assertIsNotNone(relay.rule)
+                snap = relay.snapshot()
+                self.assertEqual(snap['records'][-1]['boundary'], 'other')
+                self.assertEqual(snap['execs'], {}); self.assertEqual(snap['errors'], [])
+                for private in ('Cmd', 'Env', 'private-do-not-log', 'c'*32):
+                    self.assertNotIn(private, json.dumps(snap))
             finally: relay.close()
 
     def test_chunked_reply_and_keepalive_front_can_issue_a_second_request(self):
@@ -376,6 +499,23 @@ class FixtureContracts(unittest.TestCase):
         try: probe.terminal_proof(active)
         except ValueError as exc: self.fail('real current restore token was rejected: '+str(exc))
         probe.process_count.assert_called_with(probe.source,active['importRunID'],'pg_restore')
+
+    def test_process_proof_still_selects_tagged_pg_dump_child_not_untagged_wrapper(self):
+        from unittest.mock import Mock
+        m = self.module(); probe = m.FaultProbe.__new__(m.FaultProbe)
+        probe.e = Mock(); probe.e.exec.return_value = {'exit':0, 'stdout':'0\n'}
+        token = 'a'*32
+        self.assertEqual(probe.process_count('b'*64, token, 'pg_dump'), 0)
+        cid, argv = probe.e.exec.call_args.args
+        self.assertEqual(cid, 'b'*64); self.assertEqual(argv[:2], ['sh','-c'])
+        self.assertIn('[ "$x" = "/usr/local/bin/pg_dump" ] || continue', argv[2])
+        self.assertIn('grep -Fxq "PGAPPNAME='+token+'"', argv[2])
+        self.assertNotIn('bakabel-export-v1', argv[2])
+        self.assertNotIn('BAKABEL_RUN_ID=', argv[2])
+        # A failed proc read is not evidence of zero activity.
+        probe.e.exec.return_value = {'exit':9, 'stdout':'0\n'}
+        with self.assertRaisesRegex(ValueError, 'process terminal proof unavailable'):
+            probe.process_count('b'*64, token, 'pg_dump')
 
     def test_raw_container_logs_containing_synthetic_secret_are_refused_before_export(self):
         m = self.module()

@@ -603,6 +603,41 @@ class FrameCounter:
             if self.stream == 1: self.stdout += n
 
 
+# Exact internal/platform/docker/dump_command.go contract. Do not parse shell
+# syntax or search for pg_dump/format substrings: unknown wrappers fail closed.
+DUMP_SCRIPT = r'''run=$1
+shift
+BAKABEL_RUN_ID="$run" PGAPPNAME="$run" /usr/local/bin/pg_dump "$@"
+code=$?
+[ "$code" -eq 0 ] || exit "$code"
+printf '\000BAKABEL_EXPORT_COMPLETE_V1:%s\000' "$run"'''
+DUMP_ENV = ['PGAPPNAME=', 'BAKABEL_RUN_ID=', 'PGHOSTADDR=', 'PGPASSWORD=',
+            'PGPASSFILE=/dev/null', 'PGSERVICEFILE=/dev/null', 'PGOPTIONS=', 'PGCONNECT_TIMEOUT=10']
+
+
+def is_dump_conninfo(value):
+    # Only the canonical local-socket conninfo emitted by Postgres.conninfo.
+    quoted = r"'((?:[^'\\\x00]|\\['\\])*)'"
+    match = re.fullmatch(r"host='/var/run/postgresql' port='5432' user="+quoted+r' dbname='+quoted, value)
+    if match is None:
+        return False
+    try:
+        return all(0 < len(re.sub(r"\\(['\\])", r'\1', name).encode('utf-8')) <= 256 for name in match.groups())
+    except UnicodeEncodeError:
+        return False
+
+
+def is_dump_wrapper(value):
+    cmd = value.get('Cmd')
+    return (isinstance(cmd, list) and len(cmd) == 10 and all(isinstance(arg, str) for arg in cmd) and
+            cmd[:4] == ['/bin/sh', '-c', DUMP_SCRIPT, 'bakabel-export-v1'] and
+            re.fullmatch(r'[a-zA-Z0-9_-]{16,63}', cmd[4]) is not None and
+            cmd[5:7] == ['--no-password', '--dbname'] and is_dump_conninfo(cmd[7]) and
+            cmd[8:] == ['--format=custom', '--compress=gzip:9'] and value.get('Env') == DUMP_ENV and
+            value.get('User') == '0' and value.get('AttachStdout') is True and
+            value.get('AttachStderr') is True and value.get('AttachStdin') is False and value.get('Tty') is False)
+
+
 class FaultRelay:
     """Byte-preserving, bounded Unix transport. Never generates HTTP replies.
 
@@ -661,6 +696,7 @@ class FaultRelay:
         path = re.sub(r'^/v[0-9.]+', '', urlsplit(path).path)
         record = {'method': method, 'boundary': 'other', 'forwarded': False}
         value = json.loads(body) if body else {}
+        if not isinstance(value, dict): value = {}
         if method == 'POST' and path == '/containers/create':
             if (value.get('Labels') or {}).get('bakabel.worker') == '1':
                 record['boundary'] = 'worker-create'
@@ -672,8 +708,11 @@ class FaultRelay:
                 record['boundary'] = 'worker-start'
             elif operation == 'exec':
                 cmd = value.get('Cmd') or []
+                if not isinstance(cmd, list) or not all(isinstance(arg, str) for arg in cmd): cmd = []
                 tool = Path(cmd[0]).name if cmd else ''
-                if tool == 'pg_dump' and '--format=custom' in cmd:
+                if is_dump_wrapper(value) or (tool == 'pg_dump' and '--format=custom' in cmd):
+                    # Direct pg_dump recognition is retained for old fixtures;
+                    # it never admits a shell/env wrapper by substring.
                     record['boundary'] = 'dump-create'
                 elif tool == 'pg_restore' and '--exit-on-error' in cmd:
                     record['boundary'] = 'restore-create'

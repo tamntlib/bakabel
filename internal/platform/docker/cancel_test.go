@@ -14,6 +14,11 @@ func TestCancelExactIdentityAndSessionProof(t *testing.T) {
 	scans := 0
 	sessions := false
 	var cfg ExecConfig
+	d := Dump{Source: Source{"daemon", "source", "start"}, ExecID: "dumpexec", RunID: "bakabel_0123456789abcdef0123456789abcdef", Database: "fixture", User: "postgres"}
+	argv, err := legacyDumpCommand(d)
+	if err != nil {
+		t.Fatal(err)
+	}
 	c := server(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1.55/info":
@@ -21,7 +26,7 @@ func TestCancelExactIdentityAndSessionProof(t *testing.T) {
 		case "/v1.55/containers/source/json":
 			w.Write([]byte(`{"Id":"source","State":{"Running":true,"StartedAt":"start"}}`))
 		case "/v1.55/exec/dumpexec/json":
-			json.NewEncoder(w).Encode(map[string]any{"ID": "dumpexec", "ContainerID": "source", "Running": !signaled, "ExitCode": 1, "ProcessConfig": map[string]string{"entrypoint": "/usr/local/bin/pg_dump"}})
+			json.NewEncoder(w).Encode(map[string]any{"ID": "dumpexec", "ContainerID": "source", "Running": !signaled, "ExitCode": 1, "ProcessConfig": map[string]any{"entrypoint": argv[0], "arguments": argv[1:]}})
 		case "/v1.55/containers/source/exec":
 			json.NewDecoder(r.Body).Decode(&cfg)
 			w.Write([]byte(`{"Id":"control"}`))
@@ -52,7 +57,6 @@ func TestCancelExactIdentityAndSessionProof(t *testing.T) {
 			w.WriteHeader(404)
 		}
 	})
-	d := Dump{Source: Source{"daemon", "source", "start"}, ExecID: "dumpexec", RunID: "bakabel_0123456789abcdef0123456789abcdef", Database: "fixture", User: "postgres"}
 	proof, e := c.CancelDump(context.Background(), d)
 	if e != nil || !proof.NoProcesses || !proof.NoSessions || proof.ExecExitCode == nil || *proof.ExecExitCode != 1 || !signaled || scans != 2 || !sessions {
 		t.Fatal(proof, e, scans, sessions)

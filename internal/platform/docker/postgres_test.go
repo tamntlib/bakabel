@@ -72,6 +72,7 @@ func TestDumpPersistBeforeStartAndHelperStatus(t *testing.T) {
 	persisted := false
 	source := Source{ContainerID: "source", DaemonID: "daemon", StartedAt: "start"}
 	run := "bakabel_0123456789abcdef0123456789abcdef"
+	var exportCfg ExecConfig
 	c := server(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/v1.55/info":
@@ -81,7 +82,8 @@ func TestDumpPersistBeforeStartAndHelperStatus(t *testing.T) {
 		case "/v1.55/containers/source/exec":
 			var cfg ExecConfig
 			json.NewDecoder(r.Body).Decode(&cfg)
-			if cfg.Cmd[0] != "/usr/local/bin/pg_dump" || cfg.User != "0" || !strings.Contains(strings.Join(cfg.Env, ";"), "PGAPPNAME="+run) || !strings.Contains(strings.Join(cfg.Cmd, ";"), "dbname='host=evil'") {
+			exportCfg = cfg
+			if cfg.Cmd[0] != "/bin/sh" || cfg.Cmd[2] != dumpScript || cfg.Cmd[4] != run || cfg.User != "0" || strings.Contains(strings.Join(cfg.Env, ";"), "PGAPPNAME="+run) || !strings.Contains(strings.Join(cfg.Cmd, ";"), "dbname='host=evil'") {
 				t.Error(cfg)
 			}
 			w.Write([]byte(`{"Id":"dumpexec"}`))
@@ -92,7 +94,7 @@ func TestDumpPersistBeforeStartAndHelperStatus(t *testing.T) {
 			started = true
 			w.Write(append(frame(1, "PGDMP"), frame(2, "password=SECRET")...))
 		case "/v1.55/exec/dumpexec/json":
-			w.Write([]byte(`{"ID":"dumpexec","ContainerID":"source","Running":false,"ExitCode":9,"ProcessConfig":{"entrypoint":"/usr/local/bin/pg_dump"}}`))
+			json.NewEncoder(w).Encode(map[string]any{"ID": "dumpexec", "ContainerID": "source", "Running": false, "ExitCode": 9, "ProcessConfig": map[string]any{"entrypoint": exportCfg.Cmd[0], "arguments": exportCfg.Cmd[1:]}})
 		default:
 			w.WriteHeader(404)
 		}
@@ -110,7 +112,7 @@ func TestDumpPersistBeforeStartAndHelperStatus(t *testing.T) {
 	}
 	var out bytes.Buffer
 	code, e := c.StreamDump(context.Background(), d, &out)
-	if code != 9 || !errors.Is(e, ErrDumpFailed) || out.String() != "PGDMP" || strings.Contains(e.Error(), "SECRET") {
+	if code != 9 || !errors.Is(e, ErrDumpFailed) || strings.Contains(out.String(), "SECRET") || strings.Contains(e.Error(), "SECRET") {
 		t.Fatal(code, e, out.String())
 	}
 	persisted = false

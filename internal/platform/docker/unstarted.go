@@ -22,7 +22,7 @@ func (c *Client) VerifyUnstartedDump(ctx context.Context, d Dump) (TerminalProof
 		return proof, nil
 	}
 	x, e := c.PollExec(ctx, d.ExecID)
-	if e != nil || x.ContainerID != d.Source.ContainerID || x.ProcessConfig.Entrypoint != "/usr/local/bin/pg_dump" || x.Running || x.Pid != 0 || x.ExitCode != nil {
+	if e != nil || !matchesDumpExec(x, d, true) || x.Running || x.Pid != 0 || x.ExitCode != nil {
 		return proof, ErrQuarantine
 	}
 	ps, e := c.scanDump(ctx, d)

@@ -86,6 +86,54 @@ type TerminalProof struct {
 	NoProcesses, NoSessions bool
 }
 
+// observeDump bounds the shell's pre-child and post-child windows. An empty
+// scan is never terminal proof: the child may not have appeared yet. Only the
+// exact exec becoming terminal or an observed pg_dump identity ends this wait.
+func (c *Client) observeDump(ctx context.Context, d Dump) (ExecStatus, []dumpProcess, error) {
+	observeCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	for {
+		x, e := c.PollExec(observeCtx, d.ExecID)
+		if e != nil || !matchesDumpExec(x, d, true) {
+			return x, nil, ErrQuarantine
+		}
+		processes, e := c.scanDump(observeCtx, d)
+		if e != nil {
+			return x, nil, ErrQuarantine
+		}
+		if !x.Running || len(processes) == 1 {
+			return x, processes, nil
+		}
+		select {
+		case <-observeCtx.Done():
+			return x, nil, ErrQuarantine
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// waitDump keeps command identity attached to every wait observation, including
+// the terminal exit code. Docker stream EOF or an unrelated exec is not proof.
+func (c *Client) waitDump(ctx context.Context, d Dump) (int, error) {
+	for {
+		x, e := c.PollExec(ctx, d.ExecID)
+		if e != nil || !matchesDumpExec(x, d, true) {
+			return 0, ErrQuarantine
+		}
+		if !x.Running {
+			if x.ExitCode == nil || *x.ExitCode < 0 || *x.ExitCode > 255 {
+				return 0, ErrQuarantine
+			}
+			return *x.ExitCode, nil
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ErrQuarantine
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
 func (c *Client) CancelDump(ctx context.Context, d Dump) (TerminalProof, error) {
 	var proof TerminalProof
 	if !validToken(d.RunID) || !validID(d.ExecID) {
@@ -102,12 +150,8 @@ func (c *Client) CancelDump(ctx context.Context, d Dump) (TerminalProof, error) 
 		proof.SourceTerminal = true
 		return proof, nil
 	}
-	x, e := c.PollExec(ctx, d.ExecID)
-	if e != nil || x.ContainerID != d.Source.ContainerID || x.ProcessConfig.Entrypoint != "/usr/local/bin/pg_dump" {
-		return proof, ErrQuarantine
-	}
-	processes, e := c.scanDump(ctx, d)
-	if e != nil || x.Running && len(processes) != 1 {
+	_, processes, e := c.observeDump(ctx, d)
+	if e != nil {
 		return proof, ErrQuarantine
 	}
 	if len(processes) == 1 {
@@ -115,16 +159,21 @@ func (c *Client) CancelDump(ctx context.Context, d Dump) (TerminalProof, error) 
 			return proof, ErrQuarantine
 		}
 		termCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-		_, waitErr := c.WaitExec(termCtx, d.ExecID)
+		_, waitErr := c.waitDump(termCtx, d)
+		graceExpired := termCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil
 		cancel()
 		if waitErr != nil {
-			state, e := c.PollExec(ctx, d.ExecID)
+			// Only an exhausted TERM grace permits escalation. An unavailable or
+			// mismatched inspect cannot establish the child is still ours.
+			if !graceExpired {
+				return proof, ErrQuarantine
+			}
+			state, now, e := c.observeDump(ctx, d)
 			if e != nil {
 				return proof, ErrQuarantine
 			}
 			if state.Running {
-				now, e := c.scanDump(ctx, d)
-				if e != nil || len(now) != 1 || now[0] != processes[0] {
+				if len(now) != 1 || now[0] != processes[0] {
 					return proof, ErrQuarantine
 				}
 				if e = c.signalDump(ctx, d, now[0], "KILL"); e != nil {
@@ -133,7 +182,7 @@ func (c *Client) CancelDump(ctx context.Context, d Dump) (TerminalProof, error) 
 			}
 		}
 	}
-	code, e := c.WaitExec(ctx, d.ExecID)
+	code, e := c.waitDump(ctx, d)
 	if e != nil {
 		return proof, ErrQuarantine
 	}

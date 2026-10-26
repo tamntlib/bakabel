@@ -57,6 +57,31 @@ def json_rows(text):
     return [json.loads(line) for line in text.splitlines() if line.startswith(('{', '['))]
 
 
+def project_outcomes(rows):
+    """Retain enums only; even well-formed unknown error text is never evidence."""
+    statuses = {'complete', 'failed', 'partial', 'unknown', 'restored'}
+    codes = {'backup failed': 'backup_failed', 'restore failed': 'restore_failed'}
+    def status(row):
+        value = row.get('status')
+        return value if isinstance(value, str) and value in statuses else 'unknown'
+    def code(row):
+        value = row.get('error')
+        return codes.get(value, 'unknown') if isinstance(value, str) else 'unknown'
+    if len(rows) > 128:
+        raise ValueError('capacity diagnostic row bound exceeded')
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        targets = row.get('targets', [])
+        if not isinstance(targets, list) or len(targets) > 128:
+            raise ValueError('capacity diagnostic target bound exceeded')
+        out.append({'status': status(row), 'error_code': code(row),
+                    'targets': [{'status': status(t), 'error_code': code(t)}
+                                for t in targets if isinstance(t, dict)]})
+    return out
+
+
 def numeric(value):
     return int(value) if re.fullmatch(r'[0-9]+', str(value)) else None
 
@@ -332,7 +357,8 @@ def consume_readback(process, manifest, *, file_bytes=FILE_BYTES, timeout=600):
 def capacity_summary(receipt, samples):
     out = summarize_samples(samples)
     out.update({key: receipt.get(key) for key in
-                ('sampler_gap_count', 'sampler_gaps', 'sampler_error_count', 'sampler_diagnostics')})
+                ('sampler_gap_count', 'sampler_gaps', 'sampler_error_count', 'sampler_diagnostics',
+                 'commands', 'worker_terminal', 'worker_events')})
     out['source_pg_windows'] = {w['phase']: pg_window_delta(w) for w in receipt.get('source_windows', [])}
     if receipt.get('pg_restore'):
         out['restore_pg_window'] = pg_window_delta(receipt['pg_restore'])
@@ -429,6 +455,14 @@ class CapacityEngine:
         return response
 
 
+class CapacityObservationEngine(CapacityEngine):
+    """Observe the exact real inspect result without changing shared Engine calls."""
+    def inspect(self, cid, missing=False):
+        obj = self.engine.inspect(cid, missing=True) if missing else self.engine.inspect(cid)
+        self.probe.observe_worker_terminal(cid, obj)
+        return obj
+
+
 class CapacityProbe(Probe):
     """Reuse real inventory, source lifecycle, sampler, controller and image audit."""
     @property
@@ -440,9 +474,79 @@ class CapacityProbe(Probe):
         # Probe assigns its Engine before the rest of constructor initialization.
         if not hasattr(self, 'unresolved_creates'):
             self.unresolved_creates = set()
-        self._engine = CapacityEngine(engine, self)
+        self._engine = CapacityObservationEngine(engine, self)
+
+    def observe_worker_terminal(self, cid, obj):
+        record = getattr(self, 'worker_records', {}).get(cid)
+        if (not record or obj is None or not re.fullmatch(r'[0-9a-f]{64}', cid) or
+                not isinstance(record.get('Name'), str) or not isinstance(record.get('runID'), str)):
+            return
+        owner = {'workerContainerID': cid, 'workerName': record['Name'].lstrip('/'),
+                 'runID': record['runID'], 'daemonID': self.daemon}
+        if not worker_owned(obj, owner, self.image, self.daemon):
+            return
+        state = obj.get('State', {})
+        if state.get('Running') is False and state.get('Status') in ('exited', 'dead'):
+            terminal = self.capacity.setdefault('worker_terminal', {}).setdefault(cid, {'exit': None, 'oom_killed': None})
+            # Missing later readback never erases a previously observed field.
+            if type(state.get('ExitCode')) is int:
+                terminal['exit'] = state['ExitCode']
+            if type(state.get('OOMKilled')) is bool:
+                terminal['oom_killed'] = state['OOMKilled']
+
+    def collect_worker_diagnostics(self):
+        """Best effort, before deletion. Cached Engine events are not an OOM census."""
+        observation = {'status': 'unavailable', 'events': []}
+        self.capacity['worker_events'] = observation
+        try:
+            records = getattr(self, 'worker_records', {})
+            if len(records) > 128:
+                return
+            verified = []
+            for cid, record in list(records.items()):
+                owner = {'workerContainerID': cid, 'workerName': record['Name'].lstrip('/'),
+                         'runID': record['runID'], 'daemonID': self.daemon}
+                if not re.fullmatch(r'[0-9a-f]{64}', cid) or not worker_owned(record, owner, self.image, self.daemon):
+                    continue
+                verified.append(cid)
+                self.capacity.setdefault('worker_terminal', {}).setdefault(cid, {'exit': None, 'oom_killed': None})
+                self.observe_worker_terminal(cid, {**record, 'State': record.get('State_at_first_sample', {})})
+                try:
+                    self.e.inspect(cid, missing=True)
+                except Exception:
+                    pass  # No inspect result means unavailable, never false/zero.
+            start = getattr(self, '_events_since_ns', None)
+            end = time.time_ns()
+            if not verified or type(start) is not int or not 0 < start < end:
+                return
+            if self.e.call('GET', '/info')['ID'] != self.daemon:
+                return
+            def seconds(ns): return '%d.%09d' % divmod(ns, 1000000000)
+            filters = {'type': ['container'], 'container': sorted(verified), 'event': ['oom', 'die']}
+            raw = self.e.call('GET', '/events?since='+seconds(start)+'&until='+seconds(end)+
+                              '&filters='+quote(json.dumps(filters), safe=''), raw=True)
+            if len(raw) > 256*1024:
+                return
+            lines = raw.splitlines()
+            if len(lines) > 256:
+                return
+            projected = []
+            for line in lines:
+                row = json.loads(line)
+                actor = row.get('Actor', {})
+                cid, at, action = actor.get('ID'), row.get('timeNano'), row.get('Action')
+                if (row.get('Type') != 'container' or cid not in verified or action not in ('oom', 'die') or
+                        type(at) is not int or not start <= at <= end):
+                    continue
+                code = actor.get('Attributes', {}).get('exitCode')
+                code = int(code) if action == 'die' and isinstance(code, str) and re.fullmatch(r'-?[0-9]{1,10}', code) else None
+                projected.append({'type': action, 'container': cid, 'time_ns': at, 'exit': code})
+            observation.update(status='observed', events=projected)
+        except Exception:
+            pass  # Diagnostics cannot turn the actual failed run into success.
 
     def __init__(self, args):
+        self._events_since_ns = time.time_ns()
         self.capacity = {'schema': 1, 'started_at': utc(), 'gates': [], 'cleanup': {},
                          'measurements_complete': False, 'full_plan_acceptance_pass': False,
                          'source_sha256': args.expected_source_sha256, 'image_id': args.expected_image_id,
@@ -464,6 +568,15 @@ class CapacityProbe(Probe):
             {'Type': 'json-file', 'Config': {'max-size': '1m', 'max-file': '1'}})
         return super().create(suffix, spec, role=role, start=start)
 
+    def controller(self, command, *argv, **kwargs):
+        cid = super().controller(command, *argv, **kwargs)
+        if not hasattr(self, 'command_context'):
+            self.command_context = {}
+        self.command_context[cid] = {
+            'operation': command if command in ('plan', 'run', 'restore') else 'unknown',
+            'phase': getattr(self, 'capacity_phase', 'unknown')}
+        return cid
+
     def logs(self, cid):
         text = super().logs(cid)
         if any(v in text for v in self.values):
@@ -473,9 +586,40 @@ class CapacityProbe(Probe):
     def finish(self, cid, expect=0, timeout=900):
         obj = self.wait(lambda: (lambda v: v if not v['State']['Running'] else None)(self.e.inspect(cid)),
                         timeout, 'capacity command terminal')
-        if obj['State']['ExitCode'] != expect:
+        if (not re.fullmatch(r'[0-9a-f]{64}', cid) or obj.get('Id') != cid or
+                obj.get('Name') != '/'+self.containers.get(cid, '') or
+                (obj.get('Config', {}).get('Labels') or {}).get('probe.bakabel.owner') != self.prefix):
+            raise ValueError('capacity command identity unavailable')
+        actual = obj['State'].get('ExitCode')
+        if type(actual) is not int or type(expect) is not int:
+            raise ValueError('capacity command integer exit unavailable')
+        context = getattr(self, 'command_context', {}).get(cid, {})
+        operation, phase = context.get('operation'), context.get('phase')
+        diagnostic = {'container': cid, 'exit': actual, 'expected_exit': expect,
+            'operation': operation if operation in ('plan', 'run', 'restore', 'restic') else 'unknown',
+            'phase': phase if phase in ('prepare', 'first', 'repeat', 'changed', 'readback', 'restore') else 'unknown',
+            'json_status': 'unavailable', 'outcomes': []}
+        commands = self.capacity.setdefault('commands', [])
+        if len(commands) >= 128:
+            del commands[0]  # Bounded diagnostic history, never an acceptance gate.
+        commands.append(diagnostic)
+        try:
+            text = self.logs(cid)  # Read even on failure; raw text stays transient.
+            rows = json_rows(text)
+        except Exception:
+            self.save()
+            if actual != expect:
+                raise ValueError('capacity command returned unexpected exit status') from None
+            raise
+        try:
+            if len(text.encode()) <= 512*1024:
+                diagnostic.update(outcomes=project_outcomes(rows), json_status='observed')
+        except ValueError:
+            pass  # Oversize diagnostics do not change successful operator parsing.
+        self.save()
+        if actual != expect:
             raise ValueError('capacity command returned unexpected exit status')
-        return json_rows(self.logs(cid))
+        return rows
 
     def sql(self, cid, query):
         row = self.e.exec(cid, ['psql', '-XAt', '-U', 'postgres', '-d', 'fixture',
@@ -486,6 +630,9 @@ class CapacityProbe(Probe):
 
     def restic(self, *argv):
         cid = self.create('operator-'+os.urandom(4).hex(), self.restic_spec(argv), role='operator-restic')
+        if not hasattr(self, 'command_context'):
+            self.command_context = {}
+        self.command_context[cid] = {'operation': 'restic', 'phase': getattr(self, 'capacity_phase', 'unknown')}
         self.finish(cid)
         return self.logs(cid)
 
@@ -718,14 +865,18 @@ class CapacityProbe(Probe):
         self.gate('source-online-identity-unchanged')
 
     def run(self):
+        self.capacity_phase = 'prepare'
         self.prepare()
         rounds = []
         for phase in ('first', 'repeat', 'changed'):
+            self.capacity_phase = phase
             if phase == 'changed':
                 self.change_corpus()
             rounds.append(self.backup_capacity(phase))
         self.verify_snapshots(rounds)
+        self.capacity_phase = 'readback'
         self.readback_capacity(rounds)
+        self.capacity_phase = 'restore'
         self.restore_capacity(rounds[0])
         self.verify_sources()
         self.capacity['measurements_complete'] = True
@@ -756,6 +907,7 @@ class CapacityProbe(Probe):
             self.capacity['sampler_gaps'].append({key: gap[key] for key in ('container', 'at', 'reason')})
             self.capacity['sampler_gaps'][-1]['errno'] = numeric(gap.get('errno'))
         self.capacity['sampler_gap_count'] = len(gaps)
+        self.collect_worker_diagnostics()
         samples = [project_sample(row) for row in getattr(self, 'samples', [])]
         (self.root/'capacity-metrics.json').write_text(json.dumps(samples, indent=2, allow_nan=False)+'\n')
         (self.root/'capacity-summary.json').write_text(json.dumps(capacity_summary(self.capacity, samples), indent=2, allow_nan=False)+'\n')

@@ -219,7 +219,7 @@ func TestRealApplicationResticPipeline(t *testing.T) {
 	if e != nil || status.Running {
 		t.Fatal("dump prematurely started", status, e)
 	}
-	tap, digest := digestTap()
+	tap, digest := digestTap(run)
 	proxy := newRawProxy(t, f.socket, false, tap)
 	args, e := Authorize(o, proxy.socket, d, 60*time.Second)
 	if e != nil {
@@ -289,7 +289,18 @@ func TestRealApplicationResticPipeline(t *testing.T) {
 	if _, e = legacyRecover(f.ctx, o, f.c, func(context.Context, string) (bool, error) { return true, nil }, state.OutcomeSuccess); !errors.Is(e, docker.ErrQuarantine) {
 		t.Fatalf("nonzero source accepted as success: %v", e)
 	}
-	if _, e = legacyRecover(f.ctx, o, f.c, func(context.Context, string) (bool, error) { return true, nil }, state.OutcomeFailed); e != nil {
-		t.Fatal("failed export release", e)
+	// The legacy recovery adapter rediscovers the configured database rather
+	// than this test's deliberately invalid override. Exact argv validation must
+	// retain quarantine, not claim that those two different exports match.
+	if _, e = legacyRecover(f.ctx, o, f.c, func(context.Context, string) (bool, error) { return true, nil }, state.OutcomeFailed); !errors.Is(e, docker.ErrQuarantine) {
+		t.Fatal("mismatched legacy export released", e)
+	}
+	// Even the correct argv cannot use this nonexistent database for SQL
+	// session proof. Retain ownership rather than bypassing that prerequisite.
+	if _, e = f.c.CancelDump(f.ctx, d); !errors.Is(e, docker.ErrQuarantine) {
+		t.Fatal("unavailable failed-database proof released ownership", e)
+	}
+	if got := f.sql("SELECT count(*) FROM pg_stat_activity WHERE application_name='" + badRun + "'"); got != "0\n" {
+		t.Fatal("failed producer session remained", got)
 	}
 }

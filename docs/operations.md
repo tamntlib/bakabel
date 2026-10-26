@@ -4,6 +4,8 @@
 
 Treat command exit status **and** JSON target receipts as evidence. Overall backup success requires all required targets complete, exact repository readback and terminal source-export proof. Earlier complete targets remain valid if a later target fails; the run is not atomic. A target may return both a snapshot ID and an error. Repository snapshots start `unknown` and become `complete` only after verified success; partial/error snapshots are not elevated merely because they exist.
 
+PostgreSQL export additionally requires the run-correlated producer completion trailer, not merely Docker EOF and exec exit zero. See [streaming verification and trust assumptions](streaming.md); this is suffix-loss detection, not arbitrary-corruption authentication.
+
 Useful bounded state under the default `/var/lib/bakabel`:
 
 | Path | Meaning |
