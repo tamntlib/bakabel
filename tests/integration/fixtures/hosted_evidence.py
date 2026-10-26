@@ -11,7 +11,9 @@ def public_receipt(raw):
     out={k:raw[k] for k in fields if k in raw}
     out['failed']=bool(raw.get('error') or raw.get('cleanup_error') or raw.get('sampler_errors'))
     if raw.get('sampler_errors'):
-        out['sampler_diagnostics']=[{'type':e['type'],'frames':[{k:f[k] for k in ('file','line','function')} for f in e.get('frames',[])],**({'http_status':e['http_status']} if e.get('http_status') is not None else {})} for e in raw['sampler_errors']]
+        out['sampler_diagnostics']=[{'type':e['type'],'frames':[{k:f[k] for k in ('file','line','function')} for f in e.get('frames',[])],**{k:e[k] for k in ('http_status','errno') if e.get(k) is not None}} for e in raw['sampler_errors']]
+    if raw.get('sampler_gaps'):
+        out['sampler_gaps']=[{k:g[k] for k in ('container','at','reason','errno') if k in g} for g in raw['sampler_gaps']]
     if 'failure' in raw:
         failure=raw['failure']
         out['failure']={'kind':failure['kind'],'frames':[{k:f[k] for k in ('file','line','function')} for f in failure['frames']]}

@@ -3,7 +3,7 @@
 All runtime paths must be fresh. All mutable targets are exact recorded IDs.
 The ordinary worker configuration is never intercepted or changed.
 """
-import argparse, datetime, gzip, hashlib, http.client, io, json, os
+import argparse, datetime, errno, gzip, hashlib, http.client, io, json, os
 from pathlib import Path
 import secrets, shutil, socket, struct, subprocess, tarfile, threading, time, traceback
 from urllib.parse import quote
@@ -188,6 +188,12 @@ class Probe:
             for f in ['cpu.max','cpu.stat','memory.current','memory.peak','memory.max','memory.events','io.stat','pids.current']:
                 try: out[f]=cg.joinpath(f).read_text().strip()
                 except (FileNotFoundError,PermissionError) as exc: out[f]=type(exc).__name__
+                except OSError as exc:
+                    if exc.errno != errno.ENODEV:raise
+                    after=self.e.inspect(cid,missing=True)
+                    if after and after['State']['Running'] and after['State']['Pid']==pid:raise
+                    self.result.setdefault('sampler_gaps',[]).append({'container':cid,'at':utc(),'reason':'cgroup-removed-after-inspection','errno':exc.errno})
+                    return None
         if role=='worker':
             try:out['tmp_cache_footprint']=footprint(Path('/proc')/str(pid)/'root/tmp')
             except PermissionError:out['tmp_cache_footprint_error']='permission denied'
@@ -221,7 +227,7 @@ class Probe:
                     laststats=time.monotonic()
                 self.samples.extend(rows)
             except Exception as exc:
-                self.result.setdefault('sampler_errors',[]).append({'at':utc(),'type':type(exc).__name__,'message':str(exc)[:200],'http_status':getattr(exc,'http_status',None),'frames':[{'file':Path(frame.filename).name,'line':frame.lineno,'function':frame.name} for frame in traceback.extract_tb(exc.__traceback__)]})
+                self.result.setdefault('sampler_errors',[]).append({'at':utc(),'type':type(exc).__name__,'message':str(exc)[:200],'http_status':getattr(exc,'http_status',None),'errno':getattr(exc,'errno',None),'frames':[{'file':Path(frame.filename).name,'line':frame.lineno,'function':frame.name} for frame in traceback.extract_tb(exc.__traceback__)]})
             self.stopped.wait(.15)
     def sql(self,cid,q):
         r=self.e.exec(cid,['psql','-XAt','-U','postgres','-d','fixture','-v','ON_ERROR_STOP=1','-c',q])

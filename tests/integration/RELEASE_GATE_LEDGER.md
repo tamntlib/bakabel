@@ -1,0 +1,77 @@
+# Remaining release acceptance ledger
+
+**Release: NOT READY.** This ledger maps requirements to evidence; it does not turn implementation, offline tests, or a successful process exit into runtime acceptance.
+
+Production Go/modules/Dockerfile remain bound to Astra R3 core fingerprint `6a592fcf1159d301bbe9acf0ff82e3e681913de4d1fb6f17ccc2d05c9d394ef8`. Every fresh hosted result must additionally bind its exact Git commit, actual image ID and disposable daemon. The previous complete core acceptance was run `40236930603` at commit `f3be77e36d1be73d9f3c8b706ec4f386b96a4a9c`; it does not certify later fixture revisions.
+
+## Evidence already credited within its boundary
+
+| Evidence | Boundary |
+|---|---|
+| Hosted core 44 gates: 21 Compose / 23 Swarm; local/S3 × files/PostgreSQL | Public online backup, exact parent/data readback, source/history-independent PG and file directory/volume restores, owner/ACL and alias refusals. See `HOSTED_ACCEPTANCE_RESULT.md` and the final-head run above. |
+| Actual lock-wait worker kill and S3 outage | Terminal source/session proof before ownership release; **not** proof of a kill after dump bytes have streamed. |
+| Historical R3 lifecycle/resource, active 16MiB OOM, configured early 32MiB OOM and repository ENOSPC | Retain existing evidence; current hosted replay still needs an independent verified result. Early OOM does not prove supported active-export sizing. |
+| Current unit/subprocess tests | Durable phase/concurrency, launch reconciliation, metadata/parser/preflight refusals, result/notification and retention-default semantics. Unit Engine seams are not real daemon fault evidence. |
+| Older real Engine/API failure fixtures | Valid historical evidence, including some source replacement, credential and exit-3 instances; an old `Prepare`/`Authorize` path is not automatically proof of the current public-worker orchestration. |
+
+## Current-workflow fault instances
+
+The first twelve rows are implemented in `fixtures/run_hosted_faults.py`; `fixtures/verify_hosted_faults.py` defines their exact case identities and fail-closed assertions. **No hosted result for this new runner is recorded yet.** Offline tests are not substituted for the runtime column.
+
+| ID | Required instance | PLAN reference | Evidence / remaining action |
+|---|---|---|---|
+| F01 | Producer fails after real partial dump output | §5.2; §10 | Implemented `producer-failure-after-output`; real run pending. |
+| F02 | Worker SIGKILL during active output | §5.2; §10 | Implemented `streaming-worker-SIGKILL`; real run pending. |
+| F03 | Docker exec stream disconnect | §5.2; §10 | Implemented `docker-stream-drop`; real run pending. |
+| F04 | Exact exec status unavailable, quarantine survives fresh scheduler, then real recovery | §5.2; §7 | Implemented `docker-stream-drop-status-unavailable-recovery`; real run pending. |
+| F05 | Scheduled/current worker create response lost after real side effect | §7 | Implemented `worker-create-response-loss`; real run pending. |
+| F06 | Worker start response lost | §7 | Implemented `worker-start-response-loss`; real run pending. |
+| F07 | Dump exec-create response lost before ID persistence | §5.2 | Implemented `dump-create-response-loss`; expected durable quarantine, **not** ownership recovery. Real run pending. |
+| F08 | Dump exec-start response lost after persisted ID | §5.2 | Implemented `dump-start-response-loss`; real run pending. |
+| F09 | Independent restore-import create response lost | §6; §7 | Implemented `restore-create-response-loss`; expected durable quarantine, not recovery. Real run pending. |
+| F10 | Restore-import start response lost | §6; §7 | Implemented `restore-start-response-loss`; real run pending. |
+| F11 | Backup versus public restore / retention-configured run | §7; §10 | Implemented `backup-vs-restore-and-retention`; real run pending. No standalone maintenance CLI is invented. |
+| F12 | Controller kill and two scheduler restarts preserve original deadline/worker/job and last success | §7; §10 | Implemented `scheduler-restart-original-deadline`; real run pending. |
+| F13 | Kill exactly after persisted exec ID but before start forwarding | §5.2 | Separate experiment still missing; response-loss cases bracket but do not replace this instance. |
+| F14 | Restore reader failure with otherwise valid import | §6; §10 | Current reader/import exit-status unit/API coverage retained; current public fault experiment still missing. |
+| F15 | Worker dies during observable active import; independent import-token terminal recovery | §6; §10 | Current orchestration experiment still missing; retain existing API cancellation evidence. |
+| F16 | Genuine Restic exit 3: snapshot ID **and** error, partial/unknown refusal | §5.4; §10 | Historical real exit-3 and current status tests retained; current-workflow generated partial receipt still missing. Operator retagging is not this case. |
+| F17 | Crash after unknown commit, before finalization | §5.4; §10 | Fresh-state repository classification and exact snapshot IDs required; wrapper/tag failure is not a process crash. |
+| F18 | Crash after finalization, before report | §5.4; §10 | Fresh-state complete classification and old/new ID mapping required; not yet exercised as a current-workflow crash. |
+| F19 | Actual temp/buffer storage ENOSPC | §7; §10 | Repository ENOSPC is separate; exercise bounded disposable temp storage. Persistent Restic cache is not applicable (`--no-cache`). |
+| F20 | Actual restore-output ENOSPC | §10 | Bounded disposable output filesystem required; preserve partial target and failure result. |
+| F21 | File changes/truncates while being read | §10 | Mount/unreadable tests are not this literal instance. Record actual Restic disposition; do not promise application consistency. |
+| F22 | Snapshot requires unavailable target extension binaries, then correct prerequisites | §6; §10 | Missing-role and preexisting-nonempty-extension tests are separate; missing-binary prerequisite experiment still needed. |
+
+Source-task replacement, wrong credentials, wrong repository password, missing repository, unsupported replicas and unsupported nodes have older real API evidence (`fixtures/README.md`; `swarm_s3_test.go`). Keep each boundary explicit when mapping these to the final current CLI: historical evidence must not be discarded, but no current CLI execution is claimed here. No-target, path traversal, corrupt/stale state, unsupported metadata/client versions and conninfo input also retain their focused source/unit proofs; they are not multiplied into another full hosted Cartesian product merely to inflate gate counts.
+
+## Resource and capacity instances
+
+| ID | Requirement | Current implementation / acceptance boundary |
+|---|---|---|
+| R01 | Real scheduling, restart/adoption, original deadline, readonly failed/overdue health | `run_hosted_resources.py --case scheduler`, eight named verifier gates; hosted replay pending. |
+| R02 | Active-export OOM failure safety | `--case oom-active`, actual 16MiB injection; hosted replay pending. |
+| R03 | Configured small-cap early OOM | `--case oom`, actual 32MiB before-source failure safety only; hosted replay pending. |
+| R04 | Actual repository ENOSPC | `--case enospc`, 8MiB bounded repository; hosted replay pending. Does not close F19/F20. |
+| C01 | Larger mixed repository and distinct index entries | `run_hosted_capacity.py`: declared 1GiB/8192-file corpus plus 400000 PG rows; actual decoded index/stats and repository check. Hosted run pending. |
+| C02 | Unchanged backup selects exact parent, zero new file data | Independent second worker, full identity/summary assertions; hosted run pending. |
+| C03 | Changed backup adds actual distinct data/index growth | Third worker, 1024 replaced files / 128MiB changed payload; hosted run pending. |
+| C04 | Entire original and changed file versions read back | Both full checksum sets streamed without local archive staging; hosted run pending. |
+| C05 | Fresh-target PG readback and source/restore CPU, logical I/O and WAL | Full ordered payload/owner/ACL checks and bounded before/after windows; hosted run pending. |
+| C06 | Source remains online and identity unchanged | Read/write during lock wait and unchanged StartedAt/RestartCount; hosted run pending. |
+
+Capacity reports must retain worker/scheduler/source/restore scope separately, actual image/binary/helper-image overhead, sampled tmp/state/log footprints, persistent S3/source/target storage and exact cleanup. Missing counters and exit-race observations are not zero measurements. Host physical-device attribution, continuous process-birth affinity, arbitrary repository size, universal 512MiB sufficiency, scheduler-128MiB sufficiency and universal RTO are **not** requirements or promises established by these fixtures. PLAN §8 explicitly forbids invented premeasurement RAM thresholds.
+
+## Preserved new failed attempts
+
+| Run | Actual boundary |
+|---|---|
+| `40263772226` | Core CLI step succeeded; independent verifier rejected unclassified sampler errors. Resource cases skipped. |
+| `40264921665` | Safe diagnostics identified `FileNotFoundError` in footprint `is_file` → `stat` observation. Resource cases skipped. |
+| `40265884540` | Footprint fix applied; verifier instead retained `OSError` while reading a cgroup control file. Recorded diagnostics lacked errno, so this historical exception is **not** asserted to have a proven errno. Resource cases skipped. |
+
+The unlink race has a deterministic RED→GREEN regression and explicit missing-observation counters. Cgroup handling is narrowed to ENODEV **only after a second exact-container inspection proves disappearance/exit/PID change**; unexplained live errors still fail. Numeric errno diagnostics preserve the next unknown failure without exporting messages or locals.
+
+## Completion rule
+
+Manual acceptance now separates `core-resources`, `capacity` and `faults` onto independent fresh hosted VMs with `fail-fast: false`, preserving per-VM image/daemon bindings and uniquely named allowlisted artifacts. Implementation and local tests do not close the runtime rows above. Before declaring release-ready, verify the exact final remote HEAD and every required receipt/artifact, retain failed attempts, close or explicitly resolve each remaining contract instance, and complete independent review on the final revision. No registry publication, release, retention activation or production deployment is authorized by this ledger.

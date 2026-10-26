@@ -11,6 +11,50 @@ import tempfile
 ROOT=Path(__file__).resolve().parents[3]
 
 class WorkflowContract(unittest.TestCase):
+    def test_real_export_shell_accepts_each_suite_and_excludes_private_trees(self):
+        import json
+        import textwrap
+        from verify_hosted_faults import CASES
+        text=(ROOT/'.github/workflows/acceptance.yaml').read_text()
+        block=text.split('      - name: Export only allowlisted evidence even on failure',1)[1].split('      - uses:',1)[0]
+        script=textwrap.dedent(block.split('        run: |\n',1)[1])
+        secret='unit-only-private-export-marker'
+        for suite in ('core-resources','capacity','faults'):
+            with self.subTest(suite=suite),tempfile.TemporaryDirectory() as directory:
+                root=Path(directory);tools=root/'tools';tools.mkdir()
+                sudo=tools/'sudo'
+                sudo.write_text('#!/bin/sh\ncase "$1" in --preserve-env=*) shift;; esac\nif [ "$1" = chown ]; then exit 0; fi\nexec "$@"\n');sudo.chmod(0o700)
+                (root/'bakabel-candidate.json').write_text(json.dumps({'suite':suite}))
+                if suite=='core-resources':
+                    receipt=root/'bakabel-acceptance/compose/receipt.json';receipt.parent.mkdir(parents=True)
+                    receipt.write_text(json.dumps({'platform':'compose','commands':[{'Env':[secret]}]}))
+                elif suite=='capacity':
+                    receipt=root/'bakabel-capacity/capacity-receipt.json';receipt.parent.mkdir()
+                    receipt.write_text(json.dumps({'offline_unit_fixture':True}))
+                else:
+                    receipt=root/'bakabel-faults'/CASES[0]/'receipt.json';receipt.parent.mkdir(parents=True)
+                    receipt.write_text(json.dumps({'offline_unit_fixture':True}))
+                private=root/'bakabel-capacity/private/receipt.json';private.parent.mkdir(parents=True,exist_ok=True);private.write_text(secret)
+                cp=subprocess.run(['bash','-eu','-c',script],cwd=ROOT,env={**os.environ,'RUNNER_TEMP':str(root),'PATH':str(tools)+os.pathsep+os.environ['PATH']},capture_output=True,text=True)
+                self.assertEqual(cp.returncode,0,cp.stderr)
+                self.assertNotIn(secret,''.join(p.read_text() for p in (root/'bakabel-public').iterdir()))
+                self.assertEqual(json.loads((root/'bakabel-public/candidate.json').read_text())['suite'],suite)
+
+    def test_capacity_and_faults_run_on_independent_fresh_vms(self):
+        text=(ROOT/'.github/workflows/acceptance.yaml').read_text()
+        self.assertIn('suite: [core-resources, capacity, faults]',text)
+        self.assertIn('fail-fast: false',text)
+        for suite,runner in (('capacity','run_hosted_capacity.py'),('faults','run_hosted_faults.py')):
+            step=next(block for block in text.split('      - name: ') if runner in block)
+            self.assertIn("if: matrix.suite == '"+suite+"'",step)
+            self.assertIn('--image "$image_id"',step)
+            self.assertNotIn('continue-on-error',step)
+        self.assertIn('name: acceptance-${{ matrix.suite }}-${{ github.sha }}-${{ github.run_attempt }}',text)
+        for name in ('capacity-receipt.json','capacity-metrics.json','capacity-summary.json','capacity-verified.json','hosted-faults.json'):
+            self.assertIn(name,text)
+        self.assertIn('from verify_hosted_faults import CASES',text)
+        self.assertNotIn('sudo -E ',text)
+
     def test_extended_resource_replay_is_mandatory_and_public_report_only(self):
         text=(ROOT/'.github/workflows/acceptance.yaml').read_text()
         self.assertIn('run_hosted_resources.py',text)

@@ -3,6 +3,21 @@ from pathlib import Path
 import unittest
 
 class ProbeSafety(unittest.TestCase):
+    def test_removed_cgroup_requires_exact_container_exit_readback(self):
+        import errno
+        from unittest.mock import Mock,patch
+        probe=self.p.Probe.__new__(self.p.Probe)
+        live={'State':{'Running':True,'Pid':12345}}
+        probe.e=Mock();probe.e.inspect.side_effect=[live,{'State':{'Running':False,'Pid':0}}]
+        probe.result={};probe.pin_container=Mock();probe.cgroup=Mock(return_value=Path('/unit-owned-cgroup'))
+        probe.pids=Mock(return_value=[])
+        with patch.object(Path,'read_text',side_effect=OSError(errno.ENODEV,'unit-only deleted cgroup')):
+            self.assertIsNone(probe.measure('unit-owned-container','worker'))
+        self.assertEqual(probe.result['sampler_gaps'][0]['errno'],errno.ENODEV)
+        probe.e.inspect.side_effect=[live,live]
+        with patch.object(Path,'read_text',side_effect=OSError(errno.ENODEV,'unit-only unexplained device error')),self.assertRaises(OSError):
+            probe.measure('unit-owned-container','worker')
+
     def test_disappearing_state_file_is_an_explicit_footprint_gap(self):
         from unittest.mock import Mock,patch
         import tempfile
