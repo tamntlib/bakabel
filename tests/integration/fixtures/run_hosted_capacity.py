@@ -606,7 +606,7 @@ class CapacityProbe(Probe):
             raise ValueError('synthetic credential in fixture command output')
         return text
 
-    def finish(self, cid, expect=0, timeout=900):
+    def finish(self, cid, expect=0, timeout=900, *, json_output=True):
         obj = self.wait(lambda: (lambda v: v if not v['State']['Running'] else None)(self.e.inspect(cid)),
                         timeout, 'capacity command terminal')
         if (not re.fullmatch(r'[0-9a-f]{64}', cid) or obj.get('Id') != cid or
@@ -628,14 +628,14 @@ class CapacityProbe(Probe):
         commands.append(diagnostic)
         try:
             text = self.logs(cid)  # Read even on failure; raw text stays transient.
-            rows = json_rows(text)
+            rows = json_rows(text) if json_output else []
         except Exception:
             self.save()
             if actual != expect:
                 raise ValueError('capacity command returned unexpected exit status') from None
             raise
         try:
-            if len(text.encode()) <= 512*1024:
+            if json_output and len(text.encode()) <= 512*1024:
                 diagnostic.update(outcomes=project_outcomes(rows), json_status='observed')
         except ValueError:
             pass  # Oversize diagnostics do not change successful operator parsing.
@@ -656,7 +656,10 @@ class CapacityProbe(Probe):
         if not hasattr(self, 'command_context'):
             self.command_context = {}
         self.command_context[cid] = {'operation': 'restic', 'phase': getattr(self, 'capacity_phase', 'unknown')}
-        self.finish(cid)
+        if argv[0] == 'check':
+            self.finish(cid, json_output=False)
+        else:
+            self.finish(cid)
         return self.logs(cid)
 
     def measure(self, cid, role):

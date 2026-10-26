@@ -120,6 +120,27 @@ def public_scheduler_diagnostics(raw):
     return out
 
 
+def public_failure_diagnostics(raw):
+    """Small typed fault/readback receipt; no paths, errors, logs or Env."""
+    value=raw.get('failure_diagnostics',{})
+    if not isinstance(value,dict):value={}
+    out={}
+    for key in ('warning_count','requested_memory_bytes','requested_swap_total_bytes','host_memory_bytes','host_swap_total_bytes',
+                'effective_memory_bytes','effective_swap_bytes','terminal_pid','terminal_exit_code','terminal_oom_kill'):
+        item=value.get(key);maximum=255 if key=='terminal_exit_code' else 2**63-1
+        out[key]=item if type(item) is int and 0<=item<=maximum else None
+    for key in ('source_unlocked','terminal_oom_killed'):
+        item=value.get(key);out[key]=item if type(item) is bool else None
+    status=value.get('update_http_status')
+    out['update_http_status']=status if type(status) is int and 100<=status<=599 else None
+    for key,allowed in (('failure_code',('memory_update','effective_limits','worker_terminal','recovery','oom_proof','final_readback')),
+                        ('update_status',('accepted','rejected','unavailable')),('terminal_counter_status',('observed','unavailable'))):
+        item=value.get(key);out[key]=item if isinstance(item,str) and item in allowed else None
+    fields=scheduler_completion_fields({'targets':value.get('targets',[])})
+    out['targets']=[] if fields is None else [{k:row[k] for k in ('failureCode','resticExitCode','resticReason')} for row in fields['targets']]
+    return out
+
+
 def verify_early_oom(raw,image):
     assert raw['mode']=='oom' and raw['early_oom_phase']=='intent-before-source-exec'
     proof=raw['failure_terminal_proof'];last=proof['last_result']
@@ -332,6 +353,7 @@ def run_case(args,case,engine):
     public=public_receipt(raw);public['case']=case;public['verified']=False
     public['raw_receipt_sha256']=sha(directory/'receipt.json')
     if case!='scheduler':
+        public['failure_diagnostics']=public_failure_diagnostics(raw)
         terminal=raw.get('worker_terminal_before_recovery',raw.get('worker_last_inspect',{}))
         state=terminal.get('State',{});config=terminal.get('HostConfig',{})
         samples=raw.get('failure_cgroup_samples',[])

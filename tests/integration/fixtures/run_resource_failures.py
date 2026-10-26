@@ -1,8 +1,23 @@
 #!/usr/bin/env python3
 """Actual candidate PG-stream OOM/ENOSPC, exact owned rootless fixtures only."""
-import argparse, datetime, json, math, os, secrets, threading, time, traceback
+import argparse, datetime, json, math, os, secrets, select, threading, time, traceback
 from pathlib import Path
-from run_resource_probe import Probe, PG, worker_owned, sha, utc, kv_numbers
+from run_resource_probe import Engine, Probe, PG, worker_owned, sha, utc, kv_numbers
+
+
+class _ObserverStopped(BaseException):
+    """End a sampler pass without turning requested shutdown into corruption."""
+
+
+class _SamplerEngine(Engine):
+    def __init__(self,sock,stop):
+        super().__init__(sock);self.observer=threading.get_ident();self.stop=stop
+
+    def call(self,*args,deadline=None,**kwargs):
+        if threading.get_ident()==self.observer:
+            if self.stop.is_set():raise _ObserverStopped()
+            deadline=min(deadline,time.monotonic()+1) if deadline is not None else time.monotonic()+1
+        return super().call(*args,deadline=deadline,**kwargs)
 
 
 def event_bounds(start,end):
@@ -40,15 +55,221 @@ def assert_failure_proof(p):
         assert p['guard_blocked']
 
 
+def assert_oom_proof(rows,state):
+    counts=[kv_numbers(row.get('memory.events','')).get('oom_kill') for row in rows]
+    observed=[count for count in counts if count is not None]
+    assert observed and max(observed)>0, 'No observed real cgroup oom_kill event'
+    assert state.get('OOMKilled') is True, 'No terminal OOMKilled proof'
+    return max(observed)
+
+
 class FailureProbe(Probe):
+    def sampler(self):
+        self.e=_SamplerEngine(self.sock,self.stopped)
+        try:super().sampler()
+        except _ObserverStopped:pass
+
+    def save(self):
+        observers=list(getattr(self,'_failure_observers',[]))
+        if hasattr(self,'thread'):observers.append((self.stopped,self.thread))
+        if any(thread.is_alive() for stop,thread in observers):raise ValueError('observer_not_quiescent')
+        super().save()
+
+    def cleanup(self):
+        self.stop_failure_observers()
+        super().cleanup()
+
+    def gate(self,name,**kwargs):
+        self.stop_failure_observers()
+        assert not self.result.get('fast_observer_errors') and not self.result.get('sampler_errors'), 'observer_failure'
+        super().gate(name,**kwargs)
+
     def create(self,suffix,spec,role=None,start=True):
         if getattr(self,'repo_volume',None) and spec.get('Image')==self.image and role in ['controller','scheduler']:
             spec.setdefault('HostConfig',{}).setdefault('Mounts',[]).append({'Type':'volume','Source':self.repo_volume,'Target':'/repository','ReadOnly':False})
         return super().create(suffix,spec,role,start)
 
+    def sample_failure_cgroup(self,worker,owner,*,deadline=None):
+        """Keep the validated kernel directory identity through terminal Pid=0."""
+        assert worker_owned(worker,owner,self.image,self.daemon), 'worker_identity'
+        cid=owner['workerContainerID'];pid=worker['State']['Pid']
+        cached=self._cgroup_identities.get(cid)
+        row={'at':utc(),'container':cid,'observer_pid':pid,'counter_status':'unavailable','memory.events':''}
+        def terminal_reinspection():
+            assert cached and pid==cached[3], 'cgroup_identity'
+            bound=min(deadline,time.monotonic()+1) if deadline is not None else time.monotonic()+1
+            after=self.e.inspect(cid,missing=True,deadline=bound)
+            assert after and worker_owned(after,owner,self.image,self.daemon), 'worker_identity'
+            assert after['State']['Running'] is False and after['State']['Pid']==0, 'cgroup_identity'
+            return self.sample_failure_cgroup(after,owner)
+        cg=self.cgroup(pid) if pid else (cached[0] if cached else None)
+        if pid:
+            if cg is None:return terminal_reinspection()
+            assert cid in str(cg), 'cgroup_identity'
+            if cached:assert (cg,pid)==(cached[0],cached[3]), 'cgroup_identity'
+        if cg is not None:
+            try:
+                stat=cg.stat();identity=(stat.st_dev,stat.st_ino)
+                if cached:assert identity==cached[1:3], 'cgroup_identity'
+                elif pid:self._cgroup_identities[cid]=(cg,*identity,pid)
+                for name in ['cpu.max','memory.max','memory.swap.max','memory.current','memory.peak','memory.events']:
+                    try:row[name]=(cg/name).read_text().strip()
+                    except OSError as exc:
+                        if exc.errno not in [2,3,13,19]:raise
+                        row.setdefault('unavailable_errno',{})[name]=exc.errno
+                if 'oom_kill' in kv_numbers(row['memory.events']):row['counter_status']='observed'
+            except OSError as exc:
+                if exc.errno not in [2,3,13,19]:raise
+                row['cgroup_errno']=exc.errno
+        if pid and (row['counter_status']!='observed' or any(name not in row for name in ('cpu.max','memory.max','memory.swap.max'))):
+            return terminal_reinspection()
+        # Keep unavailable terminal reads explicitly, outside the verifier's
+        # actual CPU-limit sample set; never fill missing fields from old rows.
+        if not pid:self.result['terminal_cgroup_sample']=row
+        if 'cpu.max' in row:self.result['failure_cgroup_samples'].append(row)
+        return row
+
+    def arm_kernel_counter(self,worker,owner):
+        """Open only the exact validated cgroup files, before the destructive POST.
+
+        The reader never calls Engine, resolves /proc, or reopens a pathname.
+        Each limit attached to a counter is an actual FD read, not a cached limit.
+        """
+        cid=owner['workerContainerID'];cached=self._cgroup_identities.get(cid)
+        assert worker_owned(worker,owner,self.image,self.daemon) and cached, 'worker_identity'
+        cg,dev,ino,pid=cached
+        assert worker['State']['Running'] is True and worker['State']['Pid']==pid, 'cgroup_identity'
+        assert not getattr(self,'_kernel_counter_thread',None), 'kernel_reader_already_armed'
+        directory=None;fds={}
+        try:
+            directory=os.open(cg,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+            stat=os.fstat(directory);assert (stat.st_dev,stat.st_ino)==(dev,ino), 'cgroup_identity'
+            for name in ('cpu.max','memory.max','memory.swap.max','memory.events'):
+                fd=os.open(name,os.O_RDONLY|os.O_NONBLOCK|os.O_NOFOLLOW,dir_fd=directory);fds[name]=fd
+                opened=os.fstat(fd);linked=os.stat(name,dir_fd=directory,follow_symlinks=False)
+                assert (opened.st_dev,opened.st_ino)==(linked.st_dev,linked.st_ino), 'cgroup_identity'
+            stat=cg.stat();assert (stat.st_dev,stat.st_ino)==(dev,ino), 'cgroup_identity'
+        except BaseException:
+            for fd in fds.values():os.close(fd)
+            raise
+        finally:
+            if directory is not None:os.close(directory)
+        stop=threading.Event();ready=threading.Event()
+        def read():
+            previous=None
+            try:
+                poll=select.poll();poll.register(fds['memory.events'],select.POLLPRI|select.POLLERR)
+                while True:
+                    row={'container':cid,'observer_pid':pid,'counter_status':'unavailable','memory.events':''}
+                    for name,fd in fds.items():
+                        try:
+                            data=os.pread(fd,4097,0)
+                            assert len(data)<=4096, 'kernel_counter_size'
+                            row[name]=data.decode().strip()
+                        except OSError as exc:
+                            if exc.errno not in (2,3,13,19):raise
+                            row.setdefault('unavailable_errno',{})[name]=exc.errno
+                    if 'oom_kill' in kv_numbers(row['memory.events']):row['counter_status']='observed'
+                    if row!=previous:
+                        previous=row.copy();row['at']=utc()
+                        self.result['kernel_counter_sample']=row
+                        if 'cpu.max' in row:self.result['failure_cgroup_samples'].append(row)
+                    ready.set()
+                    if stop.is_set():break
+                    poll.poll(2)
+                    if row['counter_status']=='unavailable':stop.wait(.002)
+            except Exception as exc:
+                self.result.setdefault('fast_observer_errors',[]).append({'code':'kernel_reader_failure','errno':getattr(exc,'errno',None)})
+            finally:
+                for fd in fds.values():os.close(fd)
+                ready.set()
+        thread=threading.Thread(target=read,name='failure-kernel-counter',daemon=True)
+        self._kernel_counter_thread=thread
+        self._failure_observers=getattr(self,'_failure_observers',[])+[(stop,thread)]
+        thread.start()
+        assert ready.wait(1) and thread.is_alive() and self.result.get('kernel_counter_sample',{}).get('counter_status')=='observed', 'kernel_reader_unavailable'
+        self.result['kernel_counter_armed']=True
+
+    def stop_failure_observers(self):
+        observers=list(getattr(self,'_failure_observers',[]))
+        if hasattr(self,'thread'):observers.append((self.stopped,self.thread))
+        for stop,thread in observers:stop.set()
+        deadline=time.monotonic()+3
+        for stop,thread in observers:thread.join(max(0,deadline-time.monotonic()))
+        if any(thread.is_alive() for stop,thread in observers):
+            self.result.setdefault('fast_observer_errors',[]).append({'code':'observer_shutdown','errno':None})
+            raise ValueError('observer_shutdown')
+
+    def activate_oom(self,pg,active):
+        """Reduce only the proven lock-waiting worker, then permit real dump flow."""
+        assert self.args.memory_mib==16
+        assert self.blocked(pg)==active, 'active_identity'
+        cid=active['workerContainerID'];before=self.e.inspect(cid)
+        assert worker_owned(before,active,self.image,self.daemon), 'worker_identity'
+        self.sample_failure_cgroup(before,active)
+        self.arm_kernel_counter(before,active)
+        update={'Memory':16777216,'MemorySwap':16777216}
+        diagnostic=self.result.setdefault('failure_diagnostics',{})
+        diagnostic.update(failure_code='memory_update',requested_memory_bytes=update['Memory'],requested_swap_total_bytes=update['MemorySwap'],update_status='unavailable')
+        try:reply=self.e.call('POST','/containers/'+cid+'/update',update)
+        except Exception as exc:
+            status=getattr(exc,'http_status',None)
+            diagnostic.update(update_status='rejected',update_http_status=status if type(status) is int and 100<=status<=599 else None)
+            # A limit update may kill the worker before Engine returns an error.
+            # Observe it now, without recovery or treating it as a successful fault.
+            try:
+                terminal=self.e.inspect(cid,missing=True)
+                if terminal and terminal['State']['Running'] is False:self.wait_failure_terminal(active,terminal)
+            except Exception:diagnostic['terminal_counter_status']='unavailable'
+            raise
+        diagnostic.update(update_status='accepted',warning_count=len(reply.get('Warnings') or []),failure_code='effective_limits')
+        self.result['injected_memory_update']={'exact_worker':cid,'request':update,'at':utc()}
+        after=self.e.inspect(cid)
+        assert worker_owned(after,active,self.image,self.daemon), 'worker_identity'
+        config=after['HostConfig'];self.result['updated_worker_hostconfig']=config
+        row=self.sample_failure_cgroup(after,active)
+        def number(key):
+            value=row.get(key,'')
+            return int(value) if value.isdecimal() else None
+        diagnostic.update(host_memory_bytes=config.get('Memory'),host_swap_total_bytes=config.get('MemorySwap'),
+                          effective_memory_bytes=number('memory.max'),effective_swap_bytes=number('memory.swap.max'))
+        assert config['Memory']==update['Memory'] and config['MemorySwap']==update['MemorySwap'], 'effective_limits'
+        assert diagnostic['effective_memory_bytes']==update['Memory'] and diagnostic['effective_swap_bytes']==0, 'effective_limits'
+        self.unlock(pg)
+        diagnostic.update(source_unlocked=True,failure_code='worker_terminal')
+
+    def wait_failure_terminal(self,active,terminal=None):
+        if terminal is None:terminal=self.wait(lambda:(lambda v:v if not v['State']['Running'] else None)(self.e.inspect(active['workerContainerID'])),65,'worker actual terminal')
+        row=self.sample_failure_cgroup(terminal,active)
+        self.result['worker_terminal_before_recovery']={k:terminal[k] for k in ['Id','Image','Name','HostConfig','Mounts']}
+        state=terminal['State']
+        self.result['worker_terminal_before_recovery']['State']={k:state[k] for k in ['Status','Running','Pid','ExitCode','OOMKilled','StartedAt','FinishedAt'] if k in state}
+        diagnostic=self.result.setdefault('failure_diagnostics',{})
+        diagnostic.update(terminal_pid=state.get('Pid'),terminal_exit_code=state.get('ExitCode'),terminal_oom_killed=state.get('OOMKilled'),
+                          terminal_counter_status=row['counter_status'],terminal_oom_kill=kv_numbers(row['memory.events']).get('oom_kill'),targets=[])
+        path=self.root/'state/workflow/output/result.json'
+        try:
+            if path.stat().st_size<=262144:
+                value=json.loads(path.read_text())
+                if isinstance(value,dict) and value.get('runID')==active['runID']:
+                    targets=value.get('targets',[])
+                    if isinstance(targets,list) and len(targets)<=128:
+                        for target in targets:
+                            if not isinstance(target,dict):continue
+                            def enum(key,allowed):
+                                item=target.get(key)
+                                return item if isinstance(item,str) and item in allowed else None
+                            code=target.get('resticExitCode')
+                            diagnostic['targets'].append({'failureCode':enum('failureCode',('file_preflight','list_before','backup','list_after','source_verification','tag','final_readback','metadata_readback')),
+                                'resticExitCode':code if type(code) is int and 0<=code<=255 else None,
+                                'resticReason':enum('resticReason',('enospc','permission','backend','unknown'))})
+        except (OSError,ValueError):pass
+        return terminal
+
     def observe_fast(self,stop):
         seen={}
         while not stop.wait(.005):
+            deadline=time.monotonic()+1
             try:
                 if self.args.mode=='enospc' and getattr(self,'repository_probe_path',None):
                     self.result['repository_space_samples'].append(minimal_space_probe(self.repository_probe_path))
@@ -59,20 +280,16 @@ class FailureProbe(Probe):
                 self.last_owner=owner
                 if not cid:continue
                 if cid not in seen:
-                    w=self.e.inspect(cid,missing=True)
+                    w=self.e.inspect(cid,missing=True,deadline=deadline)
                     if not w or not worker_owned(w,owner,self.image,self.daemon):continue
                     seen[cid]=True
-                w=self.e.inspect(cid,missing=True)
+                w=self.e.inspect(cid,missing=True,deadline=deadline)
                 if not w:continue
-                self.result['worker_last_inspect']={k:w[k] for k in ['Id','Image','Name','State','HostConfig','Mounts']}
+                self.result['worker_last_inspect']={k:w[k] for k in ['Id','Image','Name','HostConfig','Mounts']}
+                self.result['worker_last_inspect']['State']={k:w['State'][k] for k in ['Status','Running','Pid','ExitCode','OOMKilled','StartedAt','FinishedAt'] if k in w['State']}
+                row=self.sample_failure_cgroup(w,owner,deadline=deadline)
                 pid=w['State']['Pid'];cg=self.cgroup(pid) if pid else None
-                if not cg or cid not in str(cg):continue
-                row={'at':utc(),'container':cid}
-                for f in ['cpu.max','memory.max','memory.current','memory.peak','memory.events']:
-                    try:row[f]=(cg/f).read_text().strip()
-                    except OSError as exc:
-                        if exc.errno not in [2,3,19]:raise
-                self.result['failure_cgroup_samples'].append(row)
+                if not cg:continue
                 for p in self.pids(pid):
                     if self.cgroup(p)!=cg:continue
                     try:
@@ -85,10 +302,11 @@ class FailureProbe(Probe):
                     except (FileNotFoundError,ProcessLookupError,PermissionError):pass
             except (FileNotFoundError,KeyError,json.JSONDecodeError):pass
             except Exception as exc:
-                self.result.setdefault('fast_observer_errors',[]).append(repr(exc))
+                self.result.setdefault('fast_observer_errors',[]).append({'code':'observer_failure','errno':getattr(exc,'errno',None)})
 
     def run(self):
         self.result['mode']=self.args.mode
+        self._cgroup_identities={}
         frozen=self.root/'executed_failure_probe.py';frozen.write_bytes(Path(__file__).read_bytes())
         self.result['failure_probe_sha256']=sha(frozen)
         self.result['repository_space_samples']=[]
@@ -118,7 +336,8 @@ class FailureProbe(Probe):
         cp=self.root/'config.yaml'
         cp.write_text(cp.read_text()+('worker_resources:\n  cpus: 2\n  memory_mib: '+str(self.args.memory_mib)+'\n' if self.args.mode=='oom' else 'worker_resources:\n  cpus: 0\n  memory_mib: 0\n'))
         self.lock(pg)
-        observer_stop=threading.Event();observer=threading.Thread(target=self.observe_fast,args=(observer_stop,),daemon=True);observer.start()
+        observer_stop=threading.Event();observer=threading.Thread(target=self.observe_fast,args=(observer_stop,),daemon=True)
+        self._failure_observers=[(observer_stop,observer)];observer.start()
         try:
             controller=self.controller('run')
             if self.args.mode=='oom':
@@ -155,10 +374,7 @@ class FailureProbe(Probe):
             self.result['frozen_job_before_failure']=json.loads((self.root/'state/workflow/job.json').read_text())
             released=time.monotonic()
             if self.args.mode=='oom-active':
-                update={'Memory':self.args.memory_mib*1048576,'MemorySwap':self.args.memory_mib*2097152}
-                reply=self.e.call('POST','/containers/'+active['workerContainerID']+'/update',update)
-                self.result['injected_memory_update']={'exact_worker':active['workerContainerID'],'request':update,'reply':reply,'at':utc()}
-                self.result['updated_worker_hostconfig']=self.e.inspect(active['workerContainerID'])['HostConfig']
+                self.activate_oom(pg,active)
             else:
                 # Controlled ENOSPC fault on ONLY the exact inspected 8MiB tmpfs.
                 # Start after real source exec/Restic pipeline lock-wait is proven.
@@ -176,9 +392,7 @@ class FailureProbe(Probe):
                 assert direct['errno']==28 and direct['capacity_bytes']==size and direct['available_bytes']==0
                 self.result['enospc_direct_write_before_release']=direct
                 self.unlock(pg)
-            terminal=self.wait(lambda:(lambda v:v if not v['State']['Running'] else None)(self.e.inspect(active['workerContainerID'])),65,'worker actual terminal')
-            self.result['worker_terminal_before_recovery']={k:terminal[k] for k in ['Id','Image','Name','State','HostConfig','Mounts']}
-            self.result['worker_failure_logs']=self.logs(active['workerContainerID'])
+            terminal=self.wait_failure_terminal(active)
             assert terminal['State']['ExitCode']!=0
             recover=self.controller('serve')
             self.wait(lambda:(self.root/'state/last-result.json').exists() and self.last()['runID']==active['runID'] and self.last()['status']=='failed' and not (self.root/'state/owner.json').exists(),35,'ordinary serve bounded recovery')
@@ -197,25 +411,26 @@ class FailureProbe(Probe):
             rows=self.result['failure_cgroup_samples'];assert rows and all(r.get('cpu.max')=='200000 100000' for r in rows)
             assert expected in {r.get('memory.max') for r in rows}
             if self.args.mode.startswith('oom'):
-                oom=max(kv_numbers(r.get('memory.events','')).get('oom_kill',0) for r in rows)
-                assert oom>0, 'No observed real cgroup oom_kill event'
+                self.result['failure_diagnostics']['failure_code']='oom_proof'
+                oom=assert_oom_proof(rows,terminal['State'])
                 self.result['oom_kill_max']=oom
             else:
                 full=[r for r in self.result['repository_space_samples'] if r['errno']==28]
                 assert full and all(r['capacity_bytes']==size and r['available_bytes']==0 for r in full), 'No real same-repository ENOSPC observed in backup window'
                 self.result['enospc_proof']={'observations':len(full),'first':full[0],'last':full[-1],'worker_repository_source':next(m['Source'] for m in terminal['Mounts'] if m['Destination']=='/repository'),'repository_mountpoint':mount['Source']}
                 assert self.result['enospc_proof']['worker_repository_source']==mount['Source']
-            if self.args.mode=='oom-active':self.unlock(pg)
-            else:
+            if self.args.mode!='oom-active':
                 self.result['repository_full_after_exact_terminal_proof']=minimal_space_probe(self.repository_probe_path)
                 assert self.result['repository_full_after_exact_terminal_proof']['errno']==28
                 (self.repository_probe_path/'.owned-enospc-filler').unlink()
                 self.result['pressure_released_after_exact_terminal_proof_at']=utc()
             self.final_readback(keeper,pg,identity)
+            self.stop_failure_observers()
             self.checkpoint('after-real-'+self.args.mode)
             self.gate('B5-real-'+self.args.mode+'-failed-not-complete-exact-source-terminal-bounded-recovery')
+            self.result['failure_diagnostics']['failure_code']=None
         finally:
-            observer_stop.set();observer.join(10)
+            self.stop_failure_observers()
 
     def final_readback(self,keeper,pg,identity):
             self.result['bounded_repository']['filesystem_after']=self.e.exec(keeper,['sh','-c','stat -f -c "%T %S %b %a" /repository; df -k /repository; du -sk /repository'])
@@ -234,13 +449,17 @@ def main():
     a.add_argument('--source',type=Path,required=True);a.add_argument('--runtime',type=Path,required=True)
     a.add_argument('--minio-binary',type=Path,required=True,help='Fingerprint only; not launched')
     a.add_argument('--image',required=True);a.add_argument('--socket',type=Path)
-    a.add_argument('--mode',choices=['oom','oom-active','enospc'],required=True);a.add_argument('--memory-mib',type=int,default=32)
-    args=a.parse_args();assert 16<=args.memory_mib<=128;os.sched_setaffinity(0,{0,1});p=FailureProbe(args);code=1
+    a.add_argument('--mode',choices=['oom','oom-active','enospc'],required=True);a.add_argument('--memory-mib',type=int)
+    args=a.parse_args()
+    if args.memory_mib is None:args.memory_mib=16 if args.mode=='oom-active' else 32
+    assert 16<=args.memory_mib<=128
+    if args.mode=='oom-active':assert args.memory_mib==16
+    os.sched_setaffinity(0,{0,1});p=FailureProbe(args);code=1
     try:p.run();code=0
-    except Exception:p.result['error']=traceback.format_exc();print(p.result['error'],flush=True)
+    except Exception as exc:p.result['error']=type(exc).__name__;print(p.result['error'],flush=True)
     finally:
         try:p.cleanup()
-        except Exception:print('CLEANUP ERROR',traceback.format_exc(),flush=True);code=1
+        except Exception as exc:print('CLEANUP ERROR',type(exc).__name__,flush=True);code=1
     return code
 
 if __name__=='__main__':raise SystemExit(main())

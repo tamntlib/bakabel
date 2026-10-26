@@ -64,6 +64,15 @@ Capacity reports must retain worker/scheduler/source/restore scope separately, a
 
 ## Preserved new failed attempts
 
+Run `40314807189` at `b90d768bea7a32df9c8560935bc0ebb369cd4e33`
+passed core 44, faults 12/12 and all eight independently verified scheduler
+gates. Capacity completed all three mixed backup rounds (every worker exit 0),
+but its fixture parsed human-readable `restic check` progress as JSON, before
+full readback/restore. The active-OOM fixture remained failed: terminal exit 1,
+OOMKilled false and no observed positive cgroup oom_kill. Repository ENOSPC and
+configured early OOM were not reached. The check-parser regression is corrected
+locally; historical OOM is not relabeled as success and its assertions remain.
+
 Run `40292564391` at `c50cf16` passed core 44 and faults 12/12, but remains failed:
 scheduler did not reach its first scheduled success, and capacity's third
 (changed-data) file backup returned stage `backup`, Restic exit 1, reason `enospc`.

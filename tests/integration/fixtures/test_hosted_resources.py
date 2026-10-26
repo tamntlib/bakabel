@@ -23,6 +23,39 @@ class HostedResources(unittest.TestCase):
             self.assertEqual(observed['sampled_oom_kill_max'],0)
             self.assertNotIn(secret,json.dumps(public))
 
+    def test_failure_diagnostic_projection_is_numeric_finite_and_canary_safe(self):
+        module=self.module()
+        import json,tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        diagnostic={'failure_code':'oom_proof','update_status':'rejected','update_http_status':500,'warning_count':1,
+                    'requested_memory_bytes':16777216,'requested_swap_total_bytes':16777216,
+                    'host_memory_bytes':16777216,'host_swap_total_bytes':16777216,
+                    'effective_memory_bytes':16777216,'effective_swap_bytes':0,'source_unlocked':True,
+                    'terminal_pid':0,'terminal_exit_code':1,'terminal_oom_killed':False,
+                    'terminal_counter_status':'unavailable','terminal_oom_kill':None,
+                    'targets':[{'failureCode':'backup','resticExitCode':1,'resticReason':'unknown','error':'PRIVATE-CANARY'}],
+                    'path':'PRIVATE-CANARY','Env':['PRIVATE-CANARY'],'error':'PRIVATE-CANARY','logs':'PRIVATE-CANARY'}
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);case=root/'oom-active';case.mkdir()
+            (case/'receipt.json').write_text(json.dumps({'failure_diagnostics':diagnostic}))
+            with patch.object(module,'run_platform',return_value={'failed':True}):public=module.run_case(SimpleNamespace(runtime=root),'oom-active',None)
+            self.assertIn('failure_diagnostics',public)
+            projected=public['failure_diagnostics']
+            self.assertEqual(projected['effective_swap_bytes'],0);self.assertEqual(projected['terminal_exit_code'],1)
+            self.assertEqual(projected['failure_code'],'oom_proof');self.assertIsNone(projected['terminal_oom_kill'])
+            self.assertEqual(projected['update_status'],'rejected');self.assertEqual(projected['update_http_status'],500)
+            self.assertFalse(public['verified']);self.assertNotIn('PRIVATE-CANARY',json.dumps(public))
+        for bad in (True,-1,1.5,float('nan'),float('inf'),'PRIVATE-CANARY',[],{}):
+            with self.subTest(bad=bad):
+                raw={'failure_diagnostics':{key:bad for key in diagnostic if key!='targets'}}
+                self.assertTrue(hasattr(module,'public_failure_diagnostics'))
+                value=module.public_failure_diagnostics(raw)
+                for key in ('warning_count','effective_swap_bytes','terminal_oom_kill','terminal_exit_code','update_http_status'):self.assertIsNone(value[key])
+                self.assertIsNone(value['failure_code']);self.assertIsNone(value['update_status'])
+                self.assertNotIn('PRIVATE-CANARY',json.dumps(value))
+
     def test_failed_probe_cannot_reuse_an_older_successful_receipt(self):
         module=self.module()
         from pathlib import Path
