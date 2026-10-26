@@ -4,9 +4,13 @@ import argparse
 import copy
 import json
 import os
+import re
+import stat
 from pathlib import Path
 import subprocess
 import sys
+import time
+from urllib.parse import quote
 
 from run_compose_pg_acceptance import fingerprint
 from run_hosted_acceptance import require_hosted_daemon,run_platform
@@ -50,6 +54,45 @@ def public_measurements(summary):
     return result
 
 
+def public_scheduler_diagnostics(raw):
+    """Re-project even our private diagnostic receipt; never copy free text."""
+    value=raw.get('scheduler_diagnostics',{})
+    out={'workers':[],'durable':[],'events':{'status':'unavailable','items':[]}}
+    if not isinstance(value,dict):return out
+    def identifier(item,length):return isinstance(item,str) and re.fullmatch(r'[0-9a-f]{'+str(length)+'}',item)
+    def enum(item,allowed):return item if item in allowed else None
+    def code(item):return item if type(item) is int and 0<=item<=255 else None
+    rows=value.get('workers',[])
+    for row in rows[:130] if isinstance(rows,list) else []:
+        if (not isinstance(row,dict) or not identifier(row.get('container'),64) or not identifier(row.get('run_id'),32) or
+            row.get('state_directory') not in ('state','fresh-state')):continue
+        out['workers'].append({'container':row['container'],'run_id':row['run_id'],'state_directory':row['state_directory'],
+            'inspect_status':enum(row.get('inspect_status'),('observed','missing','unavailable')),
+            'state':enum(row.get('state'),('created','running','paused','restarting','removing','exited','dead')),
+            'running':row.get('running') if type(row.get('running')) is bool else None,
+            'exit_code':code(row.get('exit_code')),'oom_killed':row.get('oom_killed') if type(row.get('oom_killed')) is bool else None})
+    owned={(r['state_directory'],r['run_id']) for r in out['workers']}
+    statuses={'owner':('active','blocked'),'last_result':('success','failed','canceled','unknown'),'workflow_output':('complete','restored','failed')}
+    rows=value.get('durable',[])
+    for row in rows[:6] if isinstance(rows,list) else []:
+        if (not isinstance(row,dict) or not identifier(row.get('run_id'),32) or
+            row.get('state_directory') not in ('state','fresh-state') or not isinstance(row.get('record'),str) or
+            row['record'] not in statuses or (row['state_directory'],row['run_id']) not in owned):continue
+        out['durable'].append({'state_directory':row['state_directory'],'record':row['record'],'run_id':row['run_id'],
+            'status':enum(row.get('status'),statuses[row['record']]),
+            'phase':enum(row.get('phase'),('intent','creating_exec','exec_created','exec_started','quarantine')) if row['record']=='owner' else None})
+    events=value.get('events',{})
+    if not isinstance(events,dict) or events.get('status')!='observed':return out
+    out['events']['status']='observed'
+    rows=events.get('items',[]);containers={r['container'] for r in out['workers']}
+    for row in rows[:256] if isinstance(rows,list) else []:
+        if (not isinstance(row,dict) or not identifier(row.get('container'),64) or row['container'] not in containers or
+            row.get('event') not in ('oom','die') or type(row.get('time_ns')) is not int or not 0<row['time_ns']<2**63):continue
+        out['events']['items'].append({'container':row['container'],'event':row['event'],'time_ns':row['time_ns'],
+                                      'exit_code':code(row.get('exit_code')) if row['event']=='die' else None})
+    return out
+
+
 def verify_early_oom(raw,image):
     assert raw['mode']=='oom' and raw['early_oom_phase']=='intent-before-source-exec'
     proof=raw['failure_terminal_proof'];last=proof['last_result']
@@ -83,7 +126,107 @@ class BoundEvidence:
 
 
 class HostedResourceProbe(BoundEvidence,Probe):
-    pass
+    def __init__(self,args):
+        self._events_since_ns=time.time_ns()
+        super().__init__(args)
+
+    def diagnostic_json(self,relative):
+        """Fixed owned paths only; bounded regular files, no symlink traversal."""
+        directory=None
+        try:
+            directory=os.open(self.root,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+            parts=relative.split('/')
+            for part in parts[:-1]:
+                child=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=directory)
+                os.close(directory);directory=child
+            fd=os.open(parts[-1],os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=directory)
+            with os.fdopen(fd,'rb') as stream:
+                if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):return {}
+                data=stream.read(256*1024+1)
+            if len(data)>256*1024:return {}
+            value=json.loads(data)
+            return value if isinstance(value,dict) else {}
+        except (OSError,ValueError):return {}
+        finally:
+            if directory is not None:os.close(directory)
+
+    def collect_scheduler_diagnostics(self):
+        """Best effort only; never replace the lifecycle or sampler's errors."""
+        from run_resource_probe import worker_owned
+        diagnostics={'workers':[],'durable':[],'events':{'status':'unavailable','items':[]}}
+        self.result['scheduler_diagnostics']=diagnostics
+        if len(self.worker_records)>128:return
+        if self.e.call('GET','/info')['ID']!=self.daemon:return
+        records=dict(self.worker_records);owners={};verified={}
+        for state in ('state','fresh-state'):
+            owner=self.diagnostic_json(state+'/owner.json');owners[state]=owner
+            cid=owner.get('workerContainerID');run=owner.get('runID')
+            if (not isinstance(cid,str) or not re.fullmatch(r'[0-9a-f]{64}',cid) or
+                not isinstance(run,str) or not re.fullmatch(r'[0-9a-f]{32}',run) or
+                not isinstance(owner.get('workerName'),str) or owner.get('daemonID')!=self.daemon or cid in records):continue
+            try:
+                obj=self.e.inspect(cid,missing=True)
+                if obj and worker_owned(obj,owner,self.image,self.daemon):records[cid]={**obj,'runID':run,'state':state}
+            except Exception:pass
+        for cid,record in list(records.items()):
+            if (not isinstance(cid,str) or not re.fullmatch(r'[0-9a-f]{64}',cid) or
+                not isinstance(record.get('runID'),str) or not re.fullmatch(r'[0-9a-f]{32}',record['runID']) or
+                not isinstance(record.get('Name'),str) or not record['Name'].startswith('/') or
+                record.get('state') not in ('state','fresh-state')):continue
+            owner={'workerContainerID':cid,'workerName':record['Name'].lstrip('/'),
+                   'runID':record['runID'],'daemonID':self.daemon}
+            if not worker_owned(record,owner,self.image,self.daemon):continue
+            verified[cid]=record
+            row={'container':cid,'run_id':record['runID'],'state_directory':record['state'],
+                 'inspect_status':'unavailable','state':None,'running':None,'exit_code':None,'oom_killed':None}
+            diagnostics['workers'].append(row)
+            try:
+                obj=self.e.inspect(cid,missing=True)
+                if obj is None:row['inspect_status']='missing'
+                elif worker_owned(obj,owner,self.image,self.daemon):
+                    state=obj.get('State',{})
+                    row.update(inspect_status='observed',
+                               state=state.get('Status') if state.get('Status') in ('created','running','paused','restarting','removing','exited','dead') else None,
+                               running=state.get('Running') if type(state.get('Running')) is bool else None,
+                               exit_code=state.get('ExitCode') if type(state.get('ExitCode')) is int and 0<=state['ExitCode']<=255 else None,
+                               oom_killed=state.get('OOMKilled') if type(state.get('OOMKilled')) is bool else None)
+            except Exception:pass  # Unavailable is not zero/false or a terminal proof.
+        phases=('intent','creating_exec','exec_created','exec_started','quarantine')
+        for state,owner in owners.items():
+            for kind,path,statuses in (('owner','owner.json',('active','blocked')),
+                                       ('last_result','last-result.json',('success','failed','canceled','unknown')),
+                                       ('workflow_output','workflow/output/result.json',('complete','restored','failed'))):
+                value=owner if kind=='owner' else self.diagnostic_json(state+'/'+path)
+                if not any(r['state']==state and r['runID']==value.get('runID') and
+                           (kind!='owner' or worker_owned(r,owner,self.image,self.daemon)) for r in verified.values()):continue
+                diagnostics['durable'].append({'state_directory':state,'record':kind,'run_id':value['runID'],
+                    'status':value.get('status') if value.get('status') in statuses else None,
+                    'phase':value.get('phase') if kind=='owner' and value.get('phase') in phases else None})
+        # Engine history is bounded/cache-limited; no event is not proof of no OOM.
+        start=getattr(self,'_events_since_ns',None);end=time.time_ns()
+        if not verified or type(start) is not int or not 0<start<end:return
+        def seconds(ns):return '%d.%09d'%divmod(ns,1000000000)
+        filters={'type':['container'],'container':sorted(verified),'event':['oom','die']}
+        raw=self.e.call('GET','/events?since='+seconds(start)+'&until='+seconds(end)+
+                        '&filters='+quote(json.dumps(filters),safe=''),raw=True)
+        if not isinstance(raw,bytes) or len(raw)>256*1024:return
+        lines=raw.splitlines()
+        if len(lines)>256:return
+        items=[]
+        for line in lines:
+            event=json.loads(line);actor=event.get('Actor',{})
+            cid=actor.get('ID');at=event.get('timeNano');action=event.get('Action')
+            if (event.get('Type')!='container' or cid not in verified or action not in ('oom','die') or
+                type(at) is not int or not start<=at<=end):continue
+            code=actor.get('Attributes',{}).get('exitCode')
+            code=int(code) if action=='die' and isinstance(code,str) and re.fullmatch(r'[0-9]{1,3}',code) and int(code)<=255 else None
+            items.append({'container':cid,'event':action,'time_ns':at,'exit_code':code})
+        diagnostics['events'].update(status='observed',items=items)
+
+    def cleanup(self):
+        try:self.collect_scheduler_diagnostics()
+        except Exception:pass  # Only this diagnostic read is best effort.
+        super().cleanup()
 
 
 class HostedFailureProbe(BoundEvidence,FailureProbe):
@@ -121,6 +264,7 @@ def run_case(args,case,engine):
         public['failure_observations']={'worker_exit_code':state.get('ExitCode') if type(state.get('ExitCode')) is int else None,'worker_oom_killed':state.get('OOMKilled') if type(state.get('OOMKilled')) is bool else None,'worker_memory_bytes':config.get('Memory') if type(config.get('Memory')) is int else None,'cgroup_samples':len(samples),'sampled_oom_kill_max':max(counts,default=None),'sampled_memory_max_bytes':sorted({int(s['memory.max']) for s in samples if str(s.get('memory.max','')).isdigit()})}
     if row['failed']:
         public['failed']=True
+        if case=='scheduler':public['scheduler_diagnostics']=public_scheduler_diagnostics(raw)
         (directory/'public.json').write_text(json.dumps(public,indent=2)+'\n')
         return public
     try:
@@ -150,6 +294,7 @@ def run_case(args,case,engine):
     except Exception as error:
         from run_hosted_acceptance import failure_location
         public['failed']=True;public['failure']=failure_location(error)
+        if case=='scheduler':public['scheduler_diagnostics']=public_scheduler_diagnostics(raw)
     (directory/'public.json').write_text(json.dumps(public,indent=2)+'\n')
     return public
 
