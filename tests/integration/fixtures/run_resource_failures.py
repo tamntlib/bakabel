@@ -213,6 +213,10 @@ class FailureProbe(Probe):
                 if exc.errno not in ((2,3,19) if pid else (2,3,13,19)):raise
                 row['cgroup_errno']=exc.errno
             finally:check_deadline()
+        check_deadline()
+        if not pid:self.result['terminal_cgroup_sample']=row
+        # Validate every actual limit before any gap/reinspection can discard it.
+        self.validate_failure_cgroup_limits(row)
         if pid and (row['counter_status']!='observed' or any(name not in row for name in ('cpu.max','memory.max','memory.swap.max'))):
             return terminal_reinspection()
         if _settling:
@@ -233,12 +237,24 @@ class FailureProbe(Probe):
             if resolved is None:return None
             assert resolved==cg and (stat.st_dev,stat.st_ino)==cached[1:3], 'cgroup_identity'
             assert deadline is not None and time.monotonic()<deadline, 'cgroup_identity'
-        # Keep unavailable terminal reads explicitly, outside the verifier's
-        # actual CPU-limit sample set; never fill missing fields from old rows.
         check_deadline()
-        if not pid:self.result['terminal_cgroup_sample']=row
-        if 'cpu.max' in row:self.result['failure_cgroup_samples'].append(row)
+        self.record_failure_cgroup_sample(row)
         return row
+
+    def record_failure_cgroup_sample(self,row):
+        self.validate_failure_cgroup_limits(row)
+        if all(name in row for name in ('cpu.max','memory.max')):
+            self.result['failure_cgroup_samples'].append(row)
+
+    def validate_failure_cgroup_limits(self,row):
+        # Unknown is not enforcement proof, but cannot mask contrary evidence.
+        # Use the fixture's known mode, never a cached row or worker HostConfig.
+        # Complete rows must also fail here: downstream verification is not a
+        # substitute for rejecting an unfavorable observation at the producer.
+        if 'cpu.max' in row:assert row['cpu.max']=='200000 100000', 'cgroup_identity'
+        if 'memory.max' in row:
+            expected={'oom':('33554432',),'oom-active':('536870912','16777216'),'enospc':('536870912',)}[self.result['mode']]
+            assert row['memory.max'] in expected, 'cgroup_identity'
 
     def arm_kernel_counter(self,worker,owner):
         """Open only the exact validated cgroup files, before the destructive POST.
@@ -284,7 +300,7 @@ class FailureProbe(Probe):
                     if row!=previous:
                         previous=row.copy();row['at']=utc()
                         self.result['kernel_counter_sample']=row
-                        if 'cpu.max' in row:self.result['failure_cgroup_samples'].append(row)
+                        self.record_failure_cgroup_sample(row)
                     ready.set()
                     if stop.is_set():break
                     poll.poll(2)

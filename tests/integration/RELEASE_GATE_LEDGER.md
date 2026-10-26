@@ -64,6 +64,22 @@ Capacity reports must retain worker/scheduler/source/restore scope separately, a
 
 ## Preserved new failed attempts
 
+Run `40343287948` at `a81622e3e17dda0abb830614dadf320f3aa2b2b1`
+retains independent core 44, capacity six, faults 12, scheduler eight,
+active-OOM and repository-ENOSPC PASS evidence. The ENOSPC public receipt
+records 7,281 real errno-28 observations and terminal source/worker recovery;
+the hosted verifier recorded exact cleanup of eight containers and three
+volumes. Capacity validates 2,870 samples, both full 8,192-file/1 GiB readbacks,
+and a matching 400,000-row PostgreSQL restore.
+The run remains failed: configured early-OOM verification raised `KeyError`
+at the owner-history expression on exact-source line 159, not the cap lookup
+on line 161. Its worker OOM and positive sampled counter do not bypass that
+failure. The missing key/private owner rows were not uploaded. A source-grounded
+regression reproduces missing `workerContainerID` for legitimate initial intent
+saved before worker creation; this is a proven mechanism, not identification
+of the unavailable historical key. A separate regression reproduces partial
+terminal limit rows; neither correction relabels the retained failed run.
+
 Run `40331046893` at `88d41bc73dbd77607439b92acfc46d3b4159b2c8`
 remains failed overall, but now has independent core 44 and capacity C01–C06
 PASS receipts, plus successful hosted scheduler eight-gate and active-OOM

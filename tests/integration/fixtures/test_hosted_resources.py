@@ -760,11 +760,137 @@ class HostedResources(unittest.TestCase):
         self.assertEqual(public['source_pg_first_dump_window']['wal_bytes'],12)
         self.assertEqual(public['target_pg_restore_window']['wal_bytes'],100)
 
+    def early_oom_receipt(self,prebinding=False):
+        """Offline input matching Record JSON and observe_fast's inspect projection.
+
+        workflow.go saves active intent before CreateWorker, then the exact ID,
+        then start authorization. Record's omitempty omits both zero values.
+        These are source-derived fixtures, not recovered historical owner rows.
+        """
+        run='b'*32;cid='a'*64;name='bakabel-worker-'+run;daemon='unit-daemon'
+        intent={'runID':run,'daemonID':daemon,'workerName':name,'phase':'intent','status':'active'}
+        bound={**intent,'workerContainerID':cid}
+        owners=[intent,bound,{**bound,'workerStartAuthorized':True}] if prebinding else [bound]
+        return {'mode':'oom','daemon':daemon,'early_oom_phase':'intent-before-source-exec',
+            'failure_terminal_proof':{'status':'failed','complete':False,'owner_released':True,'worker_terminal':True,
+                'source_never_started':True,'session_count':0,'last_result':{'runID':run,'status':'failed'}},
+            'worker_last_inspect':{'Id':cid,'Name':'/'+name,'Image':'candidate',
+                'State':{'Status':'exited','Running':False,'Pid':0,'ExitCode':137,'OOMKilled':True},
+                'HostConfig':{'Memory':33554432,'NanoCpus':2000000000}},
+            'owner_history':[{'owner':owner} for owner in owners],
+            'failure_cgroup_samples':[{'cpu.max':'200000 100000','memory.max':'33554432','memory.events':'oom_kill 1'}],
+            'source_exec_events':[],'source_after':{'identity_unchanged':True,'read_write_ok':True},'snapshots_after_failure':[]}
+
+    def test_early_oom_accepts_serialized_intent_before_worker_create(self):
+        module=self.module()
+        control=self.early_oom_receipt()
+        raw=self.early_oom_receipt(prebinding=True)
+        self.assertNotIn('workerContainerID',raw['owner_history'][0]['owner'])
+        self.assertNotIn('workerStartAuthorized',raw['owner_history'][0]['owner'])
+        # Only the observed history differs: same exact terminal OOM and limits.
+        self.assertEqual({k:v for k,v in raw.items() if k!='owner_history'},
+                         {k:v for k,v in control.items() if k!='owner_history'})
+        self.assertTrue(module.verify_early_oom(control,'candidate')['verified'])
+        self.assertTrue(module.verify_early_oom(raw,'candidate')['verified'])
+        # Sampling may miss intermediate saves or retain repeated checkpoints;
+        # neither a prebinding sample nor the intermediate ID save is mandatory.
+        for indices in ((0,2),(1,2),(2,),(0,0,1,1,2)):
+            sampled={**raw,'owner_history':[raw['owner_history'][i] for i in indices]}
+            with self.subTest(indices=indices):self.assertTrue(module.verify_early_oom(sampled,'candidate')['verified'])
+
+    def test_early_oom_owner_history_requires_an_exact_bound_record(self):
+        import copy
+        module=self.module();raw=self.early_oom_receipt(prebinding=True)
+        for history in ([],raw['owner_history'][:1],[raw['owner_history'][0]]*2):
+            with self.subTest(history=history),self.assertRaises(AssertionError):
+                module.verify_early_oom({**raw,'owner_history':copy.deepcopy(history)},'candidate')
+
+    def test_early_oom_owner_history_rejects_foreign_identities_in_every_state(self):
+        module=self.module()
+        for index in range(3):
+            for key in ('runID','daemonID','workerName','workerContainerID'):
+                raw=self.early_oom_receipt(prebinding=True)
+                raw['owner_history'][index]['owner'][key]='foreign'
+                with self.subTest(index=index,key=key),self.assertRaises(AssertionError):module.verify_early_oom(raw,'candidate')
+        # Agreement between owner rows alone is not independent daemon/name proof.
+        for key in ('daemonID','workerName'):
+            raw=self.early_oom_receipt(prebinding=True)
+            for row in raw['owner_history']:row['owner'][key]='foreign'
+            with self.subTest(all_rows=key),self.assertRaises(AssertionError):module.verify_early_oom(raw,'candidate')
+
+    def test_early_oom_owner_required_fields_fail_closed_without_key_errors(self):
+        module=self.module()
+        for index in range(3):
+            for key in ('runID','daemonID','workerName','phase','status'):
+                for value in ('missing',None,'',[],False):
+                    raw=self.early_oom_receipt(prebinding=True);owner=raw['owner_history'][index]['owner']
+                    if value=='missing':del owner[key]
+                    else:owner[key]=value
+                    with self.subTest(index=index,key=key,value=value),self.assertRaises(AssertionError):module.verify_early_oom(raw,'candidate')
+        for key,value in (('Phase','intent'),('workercontainerid','foreign'),('unexpected','value')):
+            raw=self.early_oom_receipt(prebinding=True);raw['owner_history'][0]['owner'][key]=value
+            with self.subTest(unsupported=key),self.assertRaises(AssertionError):module.verify_early_oom(raw,'candidate')
+        for history in (None,{},[None],[{}],[{'owner':None}],[{'owner':[]}]):
+            raw=self.early_oom_receipt(prebinding=True);raw['owner_history']=history
+            with self.subTest(history=history),self.assertRaises(AssertionError):module.verify_early_oom(raw,'candidate')
+
+    def test_early_oom_owner_history_rejects_any_source_exec_or_phase_gap(self):
+        module=self.module()
+        for index in range(3):
+            for key,value in (('execID','exec'),('sourceContainerID','source'),('sourceStartedAt','2026-01-01T00:00:00Z'),
+                              ('targetID','target'),('execKind','dump'),('execKind','restore'),('importRunID','import'),
+                              ('phase','creating_exec'),('phase','exec_created'),('phase','exec_started'),
+                              ('phase','quarantine'),('status','blocked')):
+                raw=self.early_oom_receipt(prebinding=True);raw['owner_history'][index]['owner'][key]=value
+                with self.subTest(index=index,key=key,value=value),self.assertRaises(AssertionError):module.verify_early_oom(raw,'candidate')
+            for key in ('execID','sourceContainerID','sourceStartedAt','targetID','execKind','importRunID'):
+                for value in (None,False,0,[]):
+                    raw=self.early_oom_receipt(prebinding=True);raw['owner_history'][index]['owner'][key]=value
+                    with self.subTest(index=index,key=key,value=value),self.assertRaises(AssertionError):module.verify_early_oom(raw,'candidate')
+
+    def test_early_oom_owner_history_rejects_authorization_and_identity_reversion(self):
+        import copy
+        module=self.module()
+        for value in (True,None,1,'true',[]):
+            raw=self.early_oom_receipt(prebinding=True)
+            raw['owner_history'][0]['owner']['workerStartAuthorized']=value
+            with self.subTest(prebinding_start=value),self.assertRaises(AssertionError):module.verify_early_oom(raw,'candidate')
+        for index in (1,2):
+            for key,value in (('workerContainerID',None),('workerContainerID',0),('workerContainerID',[]),
+                              ('workerStartAuthorized',None),('workerStartAuthorized',1),('workerStartAuthorized','false')):
+                raw=self.early_oom_receipt(prebinding=True);raw['owner_history'][index]['owner'][key]=value
+                with self.subTest(index=index,key=key,value=value),self.assertRaises(AssertionError):module.verify_early_oom(raw,'candidate')
+        for indices in ((1,0),(0,1,0),(0,1,2,1),(0,1,2,0,2)):
+            raw=self.early_oom_receipt(prebinding=True)
+            raw['owner_history']=[copy.deepcopy(raw['owner_history'][i]) for i in indices]
+            with self.subTest(indices=indices),self.assertRaises(AssertionError):module.verify_early_oom(raw,'candidate')
+        raw=self.early_oom_receipt(prebinding=True)
+        raw['owner_history'].insert(2,{'owner':{**raw['owner_history'][1]['owner'],'workerContainerID':'different-worker'}})
+        with self.assertRaises(AssertionError):module.verify_early_oom(raw,'candidate')
+
+    def test_early_oom_missing_or_nonterminal_worker_proof_cannot_be_accepted(self):
+        module=self.module()
+        for key in ('worker_last_inspect','daemon'):
+            raw=self.early_oom_receipt(prebinding=True);del raw[key]
+            with self.subTest(missing=key),self.assertRaises(AssertionError):module.verify_early_oom(raw,'candidate')
+        for key in ('Id','Name','State'):
+            raw=self.early_oom_receipt(prebinding=True);del raw['worker_last_inspect'][key]
+            with self.subTest(missing_worker=key),self.assertRaises(AssertionError):module.verify_early_oom(raw,'candidate')
+        for key,value in (('Running',True),('Running',None),('Pid',12),('Pid',None),('OOMKilled',False),('OOMKilled',1)):
+            raw=self.early_oom_receipt(prebinding=True);raw['worker_last_inspect']['State'][key]=value
+            with self.subTest(key=key,value=value),self.assertRaises(AssertionError):module.verify_early_oom(raw,'candidate')
+        for key in ('Running','Pid','OOMKilled'):
+            raw=self.early_oom_receipt(prebinding=True);del raw['worker_last_inspect']['State'][key]
+            with self.subTest(missing_state=key),self.assertRaises(AssertionError):module.verify_early_oom(raw,'candidate')
+        for key in ('worker_terminal','owner_released','source_never_started'):
+            raw=self.early_oom_receipt(prebinding=True);raw['failure_terminal_proof'][key]=False
+            with self.subTest(proof=key),self.assertRaises(AssertionError):module.verify_early_oom(raw,'candidate')
+
     def test_early_oom_is_failure_safety_not_active_export_support(self):
         module=self.module()
         self.assertTrue(hasattr(module,'verify_early_oom'),'configured OOM requires its own exact before-source proof')
         import copy
-        raw={'mode':'oom','early_oom_phase':'intent-before-source-exec','failure_terminal_proof':{'status':'failed','complete':False,'owner_released':True,'worker_terminal':True,'source_never_started':True,'session_count':0,'last_result':{'runID':'owned','status':'failed'}},'worker_last_inspect':{'Id':'worker','Image':'candidate','State':{'OOMKilled':True},'HostConfig':{'Memory':33554432,'NanoCpus':2000000000}},'owner_history':[{'owner':{'runID':'owned','phase':'intent','workerContainerID':'worker'}}],'failure_cgroup_samples':[{'cpu.max':'200000 100000','memory.max':'33554432','memory.events':'oom_kill 1'}],'source_exec_events':[],'source_after':{'identity_unchanged':True,'read_write_ok':True},'snapshots_after_failure':[]}
+        raw=self.early_oom_receipt()
         self.assertTrue(module.verify_early_oom(raw,'candidate')['before_source_only'])
         for key,value in (('early_oom_phase','exec_started'),('source_exec_events',[{'action':'exec_start: pg_dump -Fc'}]),('snapshots_after_failure',[{'id':'not-empty'}])):
             with self.subTest(key=key),self.assertRaises(AssertionError):module.verify_early_oom({**raw,key:value},'candidate')

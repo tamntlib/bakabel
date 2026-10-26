@@ -146,17 +146,60 @@ def public_failure_diagnostics(raw):
     return out
 
 
+def verify_early_oom_owners(raw,last,worker):
+    """Allow only intent-before-create -> exact bound intent, never a reversion.
+
+    startWorkflow (workflow.go) saves NewRun before CreateWorker, then saves
+    the ID and start authorization separately. Record's omitempty legitimately
+    omits the initial ID/false authorization; observe_fast retains that row.
+    This validates that history, not a claim about an unavailable past receipt.
+    """
+    def token(value):return isinstance(value,str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}',value)
+    assert isinstance(last,dict) and token(last.get('runID')), 'early_oom_run_identity'
+    assert isinstance(worker,dict) and token(worker.get('Id')), 'early_oom_worker_identity'
+    assert token(raw.get('daemon')), 'early_oom_daemon_identity'
+    name=worker.get('Name')
+    assert isinstance(name,str) and name.startswith('/') and token(name[1:]), 'early_oom_worker_name'
+    history=raw.get('owner_history')
+    assert isinstance(history,list) and history, 'early_oom_owner_history'
+    bound=False;authorized=False
+    required={'runID','daemonID','workerName','phase','status'}
+    optional={'workerContainerID','workerStartAuthorized','execID','sourceContainerID','sourceStartedAt','targetID','execKind','importRunID'}
+    for row in history:
+        assert isinstance(row,dict) and isinstance(row.get('owner'),dict), 'early_oom_owner_record'
+        owner=row['owner']
+        # Match Record/decodeRecord's closed flat schema, not just truthiness.
+        assert required<=owner.keys()<=required|optional, 'early_oom_owner_required_fields'
+        assert owner['runID']==last['runID'] and owner['daemonID']==raw['daemon'] and owner['workerName']==name[1:], 'early_oom_owner_identity'
+        assert owner['phase']=='intent' and owner['status']=='active', 'early_oom_owner_phase'
+        for key in ('execID','sourceContainerID','sourceStartedAt','targetID','execKind','importRunID'):
+            assert key not in owner or owner[key]=='', 'early_oom_source_or_exec_identity'
+        start=owner.get('workerStartAuthorized',False)
+        assert type(start) is bool and (not authorized or start), 'early_oom_start_authorization'
+        cid=owner.get('workerContainerID','')
+        assert isinstance(cid,str), 'early_oom_owner_worker_identity'
+        if cid:
+            assert cid==worker['Id'], 'early_oom_owner_worker_identity'
+            bound=True
+        else:
+            assert not bound and not start, 'early_oom_prebinding_intent'
+        authorized=start
+    assert bound, 'early_oom_missing_bound_worker'
+
+
 def verify_early_oom(raw,image):
     assert raw['mode']=='oom' and raw['early_oom_phase']=='intent-before-source-exec'
     proof=raw['failure_terminal_proof'];last=proof['last_result']
     assert proof['status']=='failed' and not proof['complete'] and proof['owner_released']
     assert proof['worker_terminal'] and proof['source_never_started'] and proof['session_count']==0
     assert last['status']=='failed' and raw['snapshots_after_failure']==[]
-    worker=raw['worker_last_inspect']
-    assert worker['Image']==image and worker['State']['OOMKilled']
+    worker=raw.get('worker_last_inspect')
+    assert isinstance(worker,dict) and worker.get('Image')==image, 'early_oom_worker_inspect'
+    state=worker.get('State')
+    assert isinstance(state,dict) and state.get('OOMKilled') is True, 'early_oom_worker_oom'
+    assert state.get('Running') is False and type(state.get('Pid')) is int and state['Pid']==0, 'early_oom_worker_terminal'
     assert worker['HostConfig']['Memory']==33554432 and worker['HostConfig']['NanoCpus']==2000000000
-    owners=[row['owner'] for row in raw['owner_history']]
-    assert owners and all(o['phase']=='intent' and not o.get('execID') and not o.get('sourceContainerID') and o['runID']==last['runID'] and o['workerContainerID']==worker['Id'] for o in owners)
+    verify_early_oom_owners(raw,last,worker)
     rows=raw['failure_cgroup_samples']
     assert rows and all(r['cpu.max']=='200000 100000' and r['memory.max']=='33554432' for r in rows)
     assert max(kv_numbers(row['memory.events']).get('oom_kill',0) for row in rows)>0

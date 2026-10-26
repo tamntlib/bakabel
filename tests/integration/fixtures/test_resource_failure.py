@@ -6,13 +6,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 class FailureProof(unittest.TestCase):
-    def cgroup_probe(self, directory):
+    def cgroup_probe(self, directory, *, mode='oom-active'):
         from run_resource_failures import FailureProbe
         from types import SimpleNamespace
         from unittest.mock import Mock
         cid='a'*64;run='b'*32
         probe=FailureProbe.__new__(FailureProbe);probe.image='candidate';probe.daemon='unit-daemon'
-        probe.result={'failure_cgroup_samples':[]};probe._cgroup_identities={};probe.root=Path(directory)
+        probe.result={'mode':mode,'failure_cgroup_samples':[]};probe._cgroup_identities={};probe.root=Path(directory)
         owner={'workerContainerID':cid,'workerName':'unit-worker','runID':run,'daemonID':probe.daemon}
         worker={'Id':cid,'Name':'/unit-worker','Image':probe.image,'Config':{'Labels':{'bakabel.worker':'1','bakabel.run':run,'bakabel.daemon':probe.daemon}},'State':{'Pid':123,'Running':True},'HostConfig':{},'Mounts':[]}
         cg=Path(directory)/cid;cg.mkdir()
@@ -21,6 +21,430 @@ class FailureProof(unittest.TestCase):
         probe.e=SimpleNamespace(inspect=Mock(return_value=worker))
         self.addCleanup(probe.stop_failure_observers)
         return probe,owner,worker,cg
+
+    def early_oom_receipt(self,probe,owner,worker):
+        """Synthetic offline verifier input, never a historical hosted receipt."""
+        return {**probe.result,'mode':'oom','daemon':probe.daemon,'early_oom_phase':'intent-before-source-exec',
+            'failure_terminal_proof':{'status':'failed','complete':False,'owner_released':True,
+                'worker_terminal':True,'source_never_started':True,'session_count':0,
+                'last_result':{'runID':owner['runID'],'status':'failed'}},
+            'worker_last_inspect':worker,'owner_history':[{'owner':{**owner,'phase':'intent','status':'active'}}],
+            'snapshots_after_failure':[],'source_exec_events':[],
+            'source_after':{'identity_unchanged':True,'read_write_ok':True}}
+
+    def test_terminal_cpu_only_is_diagnostic_not_an_early_oom_limit_sample(self):
+        from run_hosted_resources import verify_early_oom
+        with tempfile.TemporaryDirectory() as directory:
+            probe,owner,worker,cg=self.cgroup_probe(directory,mode='oom')
+            (cg/'memory.max').write_text('33554432');(cg/'memory.events').write_text('oom_kill 1')
+            worker['HostConfig']={'Memory':33554432,'NanoCpus':2000000000}
+            complete=probe.sample_failure_cgroup(worker,owner)
+            (cg/'memory.max').unlink()
+            worker['State']={'Pid':0,'Running':False,'OOMKilled':True}
+            partial=probe.sample_failure_cgroup(worker,owner)
+            self.assertTrue(verify_early_oom(self.early_oom_receipt(probe,owner,worker),'candidate')['verified'])
+            self.assertEqual(probe.result['failure_cgroup_samples'],[complete])
+            self.assertEqual(probe.result['terminal_cgroup_sample'],partial)
+            self.assertNotIn('memory.max',partial)
+            self.assertEqual(partial['unavailable_errno']['memory.max'],2)
+            self.assertEqual(partial['memory.events'],'oom_kill 1')
+            self.assertEqual(partial['counter_status'],'observed')
+
+    def test_partial_contradictory_limit_cannot_hide_behind_complete_positive_proof(self):
+        import json
+        from run_hosted_resources import verify_early_oom
+        from run_resource_probe import Probe
+        for route in ('terminal','fd'):
+            for remaining,missing,wrong in (('cpu.max','memory.max','100000 100000'),
+                                            ('memory.max','cpu.max','16777216')):
+                for value in (wrong,'','PRIVATE-CANARY'):
+                    with self.subTest(route=route,remaining=remaining,value=value),tempfile.TemporaryDirectory() as directory:
+                        probe,owner,worker,cg=self.cgroup_probe(directory,mode='oom')
+                        (cg/'memory.max').write_text('33554432');(cg/'memory.events').write_text('oom_kill 1')
+                        worker['HostConfig']={'Memory':33554432,'NanoCpus':2000000000}
+                        complete=probe.sample_failure_cgroup(worker,owner)
+                        rejected=False
+                        if route=='terminal':
+                            (cg/missing).unlink();(cg/remaining).write_text(value)
+                            worker['State']={'Pid':0,'Running':False,'OOMKilled':True}
+                            try:probe.sample_failure_cgroup(worker,owner)
+                            except AssertionError as exc:
+                                self.assertEqual(exc.args,('cgroup_identity',));rejected=True
+                            partial=probe.result['terminal_cgroup_sample']
+                        else:
+                            partial=self.kernel_fd_unavailable(probe,owner,worker,cg,missing,remaining=(remaining,value))
+                            errors=probe.result.get('fast_observer_errors',[])
+                            rejected=bool(errors)
+                            if rejected:
+                                self.assertEqual(errors[0]['code'],'kernel_reader_failure')
+                                self.assertEqual(errors[0]['type'],'AssertionError')
+                                self.assertEqual(errors[0]['reason'],'cgroup_identity')
+                                self.assertNotIn('PRIVATE-CANARY',json.dumps(errors))
+                                with patch.object(Probe,'gate') as gate:
+                                    with self.assertRaisesRegex(AssertionError,'observer_failure'):probe.gate('partial-limit')
+                                    gate.assert_not_called()
+                        self.assertIn(complete,probe.result['failure_cgroup_samples'])
+                        self.assertTrue(all(r['cpu.max']=='200000 100000' and r['memory.max']=='33554432'
+                                            for r in probe.result['failure_cgroup_samples']))
+                        self.assertNotIn(partial,probe.result['failure_cgroup_samples'])
+                        self.assertNotIn(missing,partial);self.assertEqual(partial[remaining],value)
+                        self.assertEqual(partial['memory.events'],'oom_kill 1')
+                        self.assertEqual(partial['counter_status'],'observed')
+                        if not rejected:
+                            worker['State']={'Pid':0,'Running':False,'OOMKilled':True}
+                            self.assertTrue(verify_early_oom(self.early_oom_receipt(probe,owner,worker),'candidate')['verified'])
+                        self.assertTrue(rejected,'contradictory partial row was discarded and prior positive proof still accepted')
+
+    def test_partial_available_limits_use_known_mode_without_cached_or_hostconfig_substitution(self):
+        from run_resource_failures import assert_oom_proof
+        modes={'oom':('33554432',),'oom-active':('536870912','16777216'),'enospc':('536870912',)}
+        for route in ('terminal','fd'):
+            for mode,memories in modes.items():
+                for remaining,missing,allowed,values in (
+                    ('cpu.max','memory.max',('200000 100000',),
+                     ('200000 100000','100000 100000','300000 100000','200000 0','max 100000','','invalid','-1 100000','0 100000','9223372036854775808 100000')),
+                    ('memory.max','cpu.max',memories,
+                     ('16777216','33554432','536870912','max','','invalid','-1','0','9223372036854775808'))):
+                    for value in values:
+                        with self.subTest(route=route,mode=mode,remaining=remaining,value=value),tempfile.TemporaryDirectory() as directory:
+                            probe,owner,worker,cg=self.cgroup_probe(directory,mode=mode)
+                            (cg/'memory.max').write_text(memories[0]);(cg/'memory.events').write_text('oom_kill 1')
+                            # Neither host configuration nor an old full row may
+                            # replace a missing limit or excuse a contrary read.
+                            worker['HostConfig']={'Memory':999,'NanoCpus':999}
+                            complete=probe.sample_failure_cgroup(worker,owner)
+                            rejected=False
+                            if route=='terminal':
+                                (cg/missing).unlink();(cg/remaining).write_text(value)
+                                worker['State']={'Pid':0,'Running':False,'OOMKilled':True}
+                                try:probe.sample_failure_cgroup(worker,owner)
+                                except AssertionError as exc:
+                                    self.assertEqual(exc.args,('cgroup_identity',));rejected=True
+                                partial=probe.result['terminal_cgroup_sample']
+                            else:
+                                partial=self.kernel_fd_unavailable(probe,owner,worker,cg,missing,remaining=(remaining,value))
+                                rejected=bool(probe.result.get('fast_observer_errors'))
+                            self.assertEqual(rejected,value not in allowed)
+                            self.assertIn(complete,probe.result['failure_cgroup_samples'])
+                            self.assertNotIn(partial,probe.result['failure_cgroup_samples'])
+                            self.assertNotIn(missing,partial);self.assertEqual(partial[remaining],value)
+                            self.assertEqual(partial['memory.events'],'oom_kill 1')
+                            self.assertEqual(partial['counter_status'],'observed')
+                            self.assertEqual(assert_oom_proof(probe.result['failure_cgroup_samples'],{'OOMKilled':True}),1)
+
+    def kernel_fd_unavailable(self,probe,owner,worker,cg,missing,*,counter=None,remaining=None):
+        import os,threading,time
+        unavailable=threading.Event();pread=os.pread;partial=False
+        def read(fd,size,offset):
+            nonlocal partial
+            # Real pinned FDs; switch the injected teardown at a row boundary.
+            path=os.readlink(f'/proc/self/fd/{fd}')
+            if path==str(cg/'cpu.max'):partial=unavailable.is_set()
+            if partial:
+                if missing is not None and path==str(cg/missing):raise OSError(19,'synthetic terminal FD unavailable')
+                if remaining is not None and path==str(cg/remaining[0]):return remaining[1].encode()
+            return pread(fd,size,offset)
+        def wait_for(predicate):
+            deadline=time.monotonic()+.5
+            while time.monotonic()<deadline and not predicate():time.sleep(.001)
+            self.assertTrue(predicate(),'kernel reader did not retain the transition')
+        with patch('run_resource_failures.os.pread',side_effect=read):
+            try:
+                probe.arm_kernel_counter(worker,owner);unavailable.set()
+                def transitioned():
+                    row=probe.result['kernel_counter_sample']
+                    if missing is not None:return missing in row.get('unavailable_errno',{})
+                    assert remaining is not None
+                    return row.get(remaining[0])==remaining[1]
+                wait_for(transitioned)
+                if counter is not None:
+                    # Wait until limits are unavailable BEFORE publishing a positive
+                    # counter: never accidentally create a complete positive row.
+                    (cg/'memory.events').write_text(counter)
+                    wait_for(lambda:probe.result['kernel_counter_sample']['memory.events']==counter)
+            finally:probe.stop_failure_observers()
+        return probe.result['kernel_counter_sample']
+
+    def test_kernel_fd_partial_limits_stay_diagnostic_with_genuine_counter(self):
+        from run_hosted_resources import verify_early_oom
+        for missing in ('cpu.max','memory.max'):
+            with self.subTest(missing=missing),tempfile.TemporaryDirectory() as directory:
+                probe,owner,worker,cg=self.cgroup_probe(directory,mode='oom')
+                (cg/'memory.max').write_text('33554432');(cg/'memory.events').write_text('oom_kill 1')
+                worker['HostConfig']={'Memory':33554432,'NanoCpus':2000000000}
+                probe.sample_failure_cgroup(worker,owner)
+                partial=self.kernel_fd_unavailable(probe,owner,worker,cg,missing,counter='oom_kill 2')
+                worker['State']={'Pid':0,'Running':False,'OOMKilled':True}
+                self.assertTrue(verify_early_oom(self.early_oom_receipt(probe,owner,worker),'candidate')['verified'])
+                self.assertNotIn(partial,probe.result['failure_cgroup_samples'])
+                self.assertNotIn(missing,partial)
+                self.assertEqual(partial['memory.events'],'oom_kill 2')
+                self.assertEqual(partial['counter_status'],'observed')
+                self.assertFalse(probe.result.get('fast_observer_errors'))
+
+    def test_terminal_memory_only_retains_counter_without_inventing_cpu(self):
+        from run_hosted_resources import verify_early_oom
+        with tempfile.TemporaryDirectory() as directory:
+            probe,owner,worker,cg=self.cgroup_probe(directory,mode='oom')
+            (cg/'memory.max').write_text('33554432');(cg/'memory.events').write_text('oom_kill 1')
+            worker['HostConfig']={'Memory':33554432,'NanoCpus':2000000000}
+            complete=probe.sample_failure_cgroup(worker,owner)
+            (cg/'cpu.max').unlink();worker['State']={'Pid':0,'Running':False,'OOMKilled':True}
+            partial=probe.sample_failure_cgroup(worker,owner)
+            self.assertEqual(probe.result['failure_cgroup_samples'],[complete])
+            self.assertEqual(probe.result['terminal_cgroup_sample'],partial)
+            self.assertNotIn('cpu.max',partial);self.assertEqual(partial['memory.max'],'33554432')
+            self.assertEqual(partial['memory.events'],'oom_kill 1')
+            self.assertEqual(partial['unavailable_errno']['cpu.max'],2)
+            self.assertTrue(verify_early_oom(self.early_oom_receipt(probe,owner,worker),'candidate')['verified'])
+
+    def test_only_positive_counter_with_unknown_limit_cannot_prove_oom_acceptance(self):
+        from run_hosted_resources import verify_early_oom
+        from run_resource_failures import assert_oom_proof
+        for route in ('terminal','fd'):
+            for missing in ('cpu.max','memory.max'):
+                with self.subTest(route=route,missing=missing),tempfile.TemporaryDirectory() as directory:
+                    probe,owner,worker,cg=self.cgroup_probe(directory,mode='oom')
+                    (cg/'memory.max').write_text('33554432')
+                    worker['HostConfig']={'Memory':33554432,'NanoCpus':2000000000}
+                    probe.sample_failure_cgroup(worker,owner)
+                    if route=='fd':
+                        partial=self.kernel_fd_unavailable(probe,owner,worker,cg,missing,counter='oom_kill 1')
+                    else:
+                        (cg/missing).unlink();(cg/'memory.events').write_text('oom_kill 1')
+                        worker['State']={'Pid':0,'Running':False,'OOMKilled':True}
+                        probe.wait_failure_terminal(owner,worker)
+                        partial=probe.result['terminal_cgroup_sample']
+                        self.assertEqual(probe.result['failure_diagnostics']['terminal_oom_kill'],1)
+                    worker['State']={'Pid':0,'Running':False,'OOMKilled':True}
+                    rows=probe.result['failure_cgroup_samples']
+                    self.assertNotIn(partial,rows);self.assertNotIn(missing,partial)
+                    self.assertEqual(partial['counter_status'],'observed')
+                    self.assertEqual(partial['memory.events'],'oom_kill 1')
+                    self.assertTrue(all(r['memory.events']=='oom_kill 0' for r in rows))
+                    with self.assertRaisesRegex(AssertionError,'No observed real cgroup'):assert_oom_proof(rows,worker['State'])
+                    with self.assertRaises(AssertionError):verify_early_oom(self.early_oom_receipt(probe,owner,worker),'candidate')
+
+    def test_missing_counter_is_unknown_but_complete_limits_remain_visible(self):
+        from run_hosted_resources import verify_early_oom
+        from run_resource_failures import assert_oom_proof
+        for route in ('terminal','fd'):
+            for prior_positive in (False,True):
+                with self.subTest(route=route,prior_positive=prior_positive),tempfile.TemporaryDirectory() as directory:
+                    probe,owner,worker,cg=self.cgroup_probe(directory,mode='oom')
+                    (cg/'memory.max').write_text('33554432')
+                    (cg/'memory.events').write_text('oom_kill '+str(int(prior_positive)))
+                    worker['HostConfig']={'Memory':33554432,'NanoCpus':2000000000}
+                    complete=probe.sample_failure_cgroup(worker,owner)
+                    if route=='fd':unknown=self.kernel_fd_unavailable(probe,owner,worker,cg,'memory.events')
+                    else:
+                        (cg/'memory.events').unlink();worker['State']={'Pid':0,'Running':False,'OOMKilled':True}
+                        unknown=probe.sample_failure_cgroup(worker,owner)
+                    worker['State']={'Pid':0,'Running':False,'OOMKilled':True}
+                    rows=probe.result['failure_cgroup_samples']
+                    self.assertIn(complete,rows);self.assertIn(unknown,rows)
+                    self.assertEqual(unknown['counter_status'],'unavailable');self.assertEqual(unknown['memory.events'],'')
+                    self.assertIn('memory.events',unknown['unavailable_errno'])
+                    self.assertEqual(unknown['cpu.max'],'200000 100000');self.assertEqual(unknown['memory.max'],'33554432')
+                    raw=self.early_oom_receipt(probe,owner,worker)
+                    if prior_positive:
+                        self.assertTrue(verify_early_oom(raw,'candidate')['verified'])
+                        self.assertEqual(assert_oom_proof(rows,worker['State']),1)
+                    else:
+                        with self.assertRaises(AssertionError):verify_early_oom(raw,'candidate')
+                        with self.assertRaises(AssertionError):assert_oom_proof(rows,worker['State'])
+                    worker['State']['OOMKilled']=False
+                    with self.assertRaises(AssertionError):verify_early_oom(raw,'candidate')
+                    with self.assertRaises(AssertionError):assert_oom_proof(rows,worker['State'])
+
+    def assert_observer_limit_failure(self,probe,code):
+        import json
+        from run_resource_probe import Probe
+        errors=probe.result.get('fast_observer_errors',[])
+        self.assertEqual(len(errors),1,'an observed contradiction must become fatal, not be discarded')
+        self.assertEqual(errors[0]['code'],code)
+        self.assertEqual(errors[0]['type'],'AssertionError')
+        self.assertEqual(errors[0]['reason'],'cgroup_identity')
+        self.assertNotIn('PRIVATE-CANARY',json.dumps(errors))
+        with patch.object(Probe,'gate') as gate:
+            with self.assertRaisesRegex(AssertionError,'observer_failure'):probe.gate('contradictory-limit')
+            gate.assert_not_called()
+        self.assertFalse(any(thread.is_alive() for _,thread in getattr(probe,'_failure_observers',[])))
+
+    def test_any_available_contradictory_limit_is_fatal_across_readers_and_modes(self):
+        import copy,json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        modes={'oom':'33554432','oom-active':'536870912','enospc':'536870912'}
+        for route in ('live','terminal','fd','fast-live','fast-terminal','settling','fast-settling'):
+            for mode,memory in modes.items():
+                for name,wrong in (('cpu.max','100000 100000'),('memory.max','999')):
+                    other='memory.max' if name=='cpu.max' else 'cpu.max'
+                    for missing in (None,other,'memory.events','memory.swap.max'):
+                        for value in (wrong,'','PRIVATE-CANARY'):
+                            with self.subTest(route=route,mode=mode,name=name,missing=missing,value=value),tempfile.TemporaryDirectory() as directory:
+                                probe,owner,worker,cg=self.cgroup_probe(directory,mode=mode)
+                                (cg/'memory.max').write_text(memory);(cg/'memory.events').write_text('oom_kill 1')
+                                # Prior proof and even misleading HostConfig cannot
+                                # excuse a later contrary actual kernel observation.
+                                worker['HostConfig']={'Memory':999,'NanoCpus':999}
+                                probe.sample_failure_cgroup(worker,owner)
+                                if mode=='oom-active':
+                                    (cg/'memory.max').write_text('16777216');probe.sample_failure_cgroup(worker,owner)
+                                prior=list(probe.result['failure_cgroup_samples'])
+                                terminal=copy.deepcopy(worker);terminal['State'].update(Running=False,Pid=0,OOMKilled=True)
+                                if route=='fd':
+                                    row=self.kernel_fd_unavailable(probe,owner,worker,cg,missing,remaining=(name,value))
+                                    self.assertEqual(row[name],value)
+                                    self.assert_observer_limit_failure(probe,'kernel_reader_failure')
+                                else:
+                                    (cg/name).write_text(value)
+                                    if missing is not None:(cg/missing).unlink()
+                                    def erase_before_terminal(*args,**kwargs):
+                                        for file in cg.iterdir():file.unlink()
+                                        return terminal
+                                    probe.e.inspect=Mock(side_effect=erase_before_terminal)
+                                    observed=terminal if route.endswith('terminal') else worker
+                                    settling=route.endswith('settling')
+                                    if settling:
+                                        resolutions=iter([None,cg])
+                                        probe.cgroup=Mock(side_effect=lambda *args,**kwargs:next(resolutions,cg))
+                                        replies=iter([worker])
+                                        def settle_inspect(*args,**kwargs):
+                                            try:return next(replies)
+                                            except StopIteration:return erase_before_terminal(*args,**kwargs)
+                                        probe.e.inspect=Mock(side_effect=settle_inspect)
+                                    if route.startswith('fast-'):
+                                        (probe.root/'state').mkdir();(probe.root/'state/owner.json').write_text(json.dumps(owner))
+                                        probe.args=SimpleNamespace(mode=mode);probe.result.update(owner_history=[],restic_effective_env=[])
+                                        probe.pids=Mock(return_value=[])
+                                        replies=iter([observed,observed]+([worker] if settling else []))
+                                        def inspect(*args,**kwargs):
+                                            try:return next(replies)
+                                            except StopIteration:return erase_before_terminal(*args,**kwargs)
+                                        probe.e.inspect=Mock(side_effect=inspect)
+                                        waits=iter([False,True]);probe.observe_fast(SimpleNamespace(wait=lambda _:next(waits)))
+                                        self.assert_observer_limit_failure(probe,'observer_failure')
+                                        self.assertEqual(probe.e.inspect.call_count,3 if settling else 2,'contradiction must fail before any further gap reinspection')
+                                    else:
+                                        with self.assertRaisesRegex(AssertionError,'^cgroup_identity$'):probe.sample_failure_cgroup(observed,owner)
+                                        self.assertEqual(probe.e.inspect.call_count,1 if settling else 0)
+                                rows=probe.result['failure_cgroup_samples']
+                                self.assertEqual(rows[:len(prior)],prior)
+                                if route=='fd':
+                                    # Arming makes one additional genuine complete
+                                    # read before the injected FD transition.
+                                    self.assertEqual(len(rows),len(prior)+1)
+                                    self.assertEqual(rows[-1]['cpu.max'],'200000 100000')
+                                    self.assertEqual(rows[-1]['memory.max'],'16777216' if mode=='oom-active' else memory)
+                                else:self.assertEqual(rows,prior)
+                                self.assertTrue(all(row[name]!=value for row in rows),'invalid rows must not be admitted even alongside fatal errors')
+
+    def test_settling_contradiction_is_fatal_before_post_read_gap_exits(self):
+        from unittest.mock import Mock
+        for mode,memory in (('oom','33554432'),('oom-active','536870912'),('enospc','536870912')):
+            for name,wrong in (('cpu.max','100000 100000'),('memory.max','999')):
+                for value in (wrong,'','PRIVATE-CANARY'):
+                    for exit in ('directory-disappears','proc-disappears'):
+                        with self.subTest(mode=mode,name=name,value=value,exit=exit),tempfile.TemporaryDirectory() as directory:
+                            probe,owner,worker,cg=self.cgroup_probe(directory,mode=mode)
+                            (cg/'memory.max').write_text(memory);probe.sample_failure_cgroup(worker,owner)
+                            prior=list(probe.result['failure_cgroup_samples']);(cg/name).write_text(value)
+                            # Enter real bounded settling from an initial missing
+                            # /proc path, then lose identity AFTER reading a bad row.
+                            probe.e.inspect=Mock(return_value=worker)
+                            resolutions=[]
+                            def cgroup(*args,**kwargs):
+                                resolutions.append(args)
+                                if len(resolutions)==1:return None
+                                if exit=='proc-disappears' and len(resolutions)==3:
+                                    (cg/name).write_text('200000 100000' if name=='cpu.max' else memory)
+                                    return None
+                                return cg
+                            probe.cgroup=Mock(side_effect=cgroup)
+                            stat=Path.stat;stats=[]
+                            def directory_stat(path,*args,**kwargs):
+                                if path==cg:
+                                    stats.append(path)
+                                    if exit=='directory-disappears' and len(stats)==2:
+                                        (cg/name).write_text('200000 100000' if name=='cpu.max' else memory)
+                                        raise FileNotFoundError(2,'synthetic gap')
+                                return stat(path,*args,**kwargs)
+                            with patch.object(Path,'stat',directory_stat):
+                                with self.assertRaisesRegex(AssertionError,'^cgroup_identity$'):probe.sample_failure_cgroup(worker,owner)
+                            self.assertEqual(probe.e.inspect.call_count,1,'a contrary settling row must not reach another inspection')
+                            self.assertEqual(probe.cgroup.call_count,2,'reject before post-read /proc gap')
+                            self.assertEqual(len(stats),1,'reject before post-read directory gap')
+                            self.assertEqual(probe.result['failure_cgroup_samples'],prior)
+
+    def test_valid_available_limits_and_unknown_fields_remain_nonfatal_across_readers(self):
+        import copy,json
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from run_resource_failures import assert_oom_proof
+        for route in ('live','terminal','fd','fast-live','fast-terminal','settling','fast-settling'):
+            for mode,memories in (('oom',('33554432',)),('oom-active',('536870912','16777216')),('enospc',('536870912',))):
+                for memory in memories:
+                    for missing in ('cpu.max','memory.max','memory.events','memory.swap.max'):
+                        with self.subTest(route=route,mode=mode,memory=memory,missing=missing),tempfile.TemporaryDirectory() as directory:
+                            probe,owner,worker,cg=self.cgroup_probe(directory,mode=mode)
+                            (cg/'memory.max').write_text(memory);probe.sample_failure_cgroup(worker,owner)
+                            terminal=copy.deepcopy(worker);terminal['State'].update(Running=False,Pid=0,OOMKilled=True)
+                            if route=='fd':
+                                row=self.kernel_fd_unavailable(probe,owner,worker,cg,missing,
+                                    counter='oom_kill 1' if missing in ('cpu.max','memory.max') else None)
+                            else:
+                                (cg/missing).unlink()
+                                if missing in ('cpu.max','memory.max'):(cg/'memory.events').write_text('oom_kill 1')
+                                probe.e.inspect=Mock(return_value=terminal)
+                                observed=terminal if route.endswith('terminal') else worker
+                                settling=route.endswith('settling')
+                                if settling:
+                                    resolutions=iter([None,cg])
+                                    probe.cgroup=Mock(side_effect=lambda *args,**kwargs:next(resolutions,cg))
+                                    probe.e.inspect=Mock(side_effect=[worker,terminal])
+                                if route.startswith('fast-'):
+                                    (probe.root/'state').mkdir();(probe.root/'state/owner.json').write_text(json.dumps(owner))
+                                    probe.args=SimpleNamespace(mode=mode);probe.result.update(owner_history=[],restic_effective_env=[])
+                                    probe.pids=Mock(return_value=[])
+                                    probe.e.inspect=Mock(side_effect=[observed,observed]+([worker] if settling else [])+[terminal])
+                                    waits=iter([False,True]);probe.observe_fast(SimpleNamespace(wait=lambda _:next(waits)))
+                                    row=probe.result['terminal_cgroup_sample']
+                                else:row=probe.sample_failure_cgroup(observed,owner)
+                            probe.stop_failure_observers()
+                            self.assertFalse(probe.result.get('fast_observer_errors'))
+                            if missing=='memory.events':
+                                self.assertEqual(row['counter_status'],'unavailable');self.assertEqual(row['memory.events'],'')
+                            else:self.assertNotIn(missing,row)
+                            self.assertIn(missing,row['unavailable_errno'])
+                            if missing in ('cpu.max','memory.max'):
+                                self.assertNotIn(row,probe.result['failure_cgroup_samples'])
+                                self.assertEqual(row['memory.events'],'oom_kill 1')
+                            else:self.assertIn(row,probe.result['failure_cgroup_samples'])
+                            # A genuinely positive partial diagnostic cannot borrow
+                            # an old complete zero counter to establish acceptance.
+                            with self.assertRaisesRegex(AssertionError,'No observed real cgroup'):
+                                assert_oom_proof(probe.result['failure_cgroup_samples'],terminal['State'])
+
+    def test_last_complete_terminal_positive_survives_later_unavailable_read(self):
+        from run_hosted_resources import verify_early_oom
+        from run_resource_failures import assert_oom_proof
+        with tempfile.TemporaryDirectory() as directory:
+            probe,owner,worker,cg=self.cgroup_probe(directory,mode='oom')
+            (cg/'memory.max').write_text('33554432')
+            worker['HostConfig']={'Memory':33554432,'NanoCpus':2000000000}
+            probe.sample_failure_cgroup(worker,owner)
+            worker['State']={'Pid':0,'Running':False,'OOMKilled':True}
+            (cg/'memory.events').write_text('oom_kill 1')
+            positive=probe.sample_failure_cgroup(worker,owner)
+            for name in ('cpu.max','memory.max','memory.events'):(cg/name).unlink()
+            unknown=probe.sample_failure_cgroup(worker,owner)
+            self.assertEqual(probe.result['terminal_cgroup_sample'],unknown)
+            self.assertEqual(unknown['counter_status'],'unavailable');self.assertEqual(unknown['memory.events'],'')
+            self.assertIs(probe.result['failure_cgroup_samples'][-1],positive)
+            self.assertEqual(positive['observer_pid'],0);self.assertEqual(positive['memory.events'],'oom_kill 1')
+            self.assertEqual(assert_oom_proof(probe.result['failure_cgroup_samples'],worker['State']),1)
+            self.assertTrue(verify_early_oom(self.early_oom_receipt(probe,owner,worker),'candidate')['verified'])
 
     def test_observer_diagnostics_are_bounded_typed_private_and_fatal(self):
         import json,threading
@@ -345,7 +769,9 @@ class FailureProof(unittest.TestCase):
             with self.subTest(mode=mode),tempfile.TemporaryDirectory() as directory:
                 probe,owner,worker,cg=self.cgroup_probe(directory)
                 probe.sample_failure_cgroup(worker,owner)
-                (cg/'memory.max').write_text('33554432')
+                # Both 16 and 512 MiB are legitimate active-OOM stages; 32 MiB
+                # belongs only to early OOM and is now a producer contradiction.
+                (cg/'memory.max').write_text('536870912')
                 if mode in ('cpu.max','memory.max','memory.swap.max','memory.events'):(cg/mode).write_text('PRIVATE-CANARY')
                 probe.cgroup=Mock(side_effect=[None,cg]+[cg/'foreign' if mode=='path-during-read' else cg]*30)
                 read=Path.read_text
@@ -357,7 +783,7 @@ class FailureProof(unittest.TestCase):
                 with patch.object(Path,'read_text',read_text):
                     if mode=='fresh':
                         row=probe.sample_failure_cgroup(worker,owner)
-                        self.assertEqual(row['memory.max'],'33554432')
+                        self.assertEqual(row['memory.max'],'536870912')
                         self.assertEqual(row['counter_status'],'observed')
                         self.assertEqual(len(probe.result['failure_cgroup_samples']),2)
                     else:
