@@ -64,6 +64,20 @@ Capacity reports must retain worker/scheduler/source/restore scope separately, a
 
 ## Preserved new failed attempts
 
+Run `40324792653` at `db1c946ee9924d422ebaa3292ce533f9d859602c`
+remains failed. The faults job passed; the core runner completed its 44 runtime
+checks, but its independent verifier rejected a Compose sampler `OSError`
+with errno 19 (`ENODEV`) at the shared cgroup read. Capacity completed all six
+runtime checks, including full original/changed file readback and fresh-target
+PostgreSQL restore, but its independent verifier rejected another errno-19
+sampler error at the same shared read. No `capacity-verified.json` was produced.
+These completed runtime checks are not independent acceptance PASS. Resource
+cases were skipped after core verification failed, so this run supplies no new
+scheduled-lifecycle, active-OOM, repository-ENOSPC or early-OOM certification.
+The artifacts identify the failing observation path, not the historical timing
+or cause of the cgroup disappearance; genuine live observation errors must not
+be suppressed or rewritten as zero measurements.
+
 Run `40314807189` at `b90d768bea7a32df9c8560935bc0ebb369cd4e33`
 passed core 44, faults 12/12 and all eight independently verified scheduler
 gates. Capacity completed all three mixed backup rounds (every worker exit 0),

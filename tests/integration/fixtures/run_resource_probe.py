@@ -167,11 +167,13 @@ class Probe:
                     except (ProcessLookupError,PermissionError): pass
             except OSError as exc:
                 if exc.errno not in [2,3,19]:raise
-    def cgroup(self,pid):
+    def cgroup(self,pid,*,strict=False):
         try:
             line=Path(f'/proc/{pid}/cgroup').read_text().strip()
             if line.startswith('0::'): return Path('/sys/fs/cgroup')/line[3:].lstrip('/')
-        except (FileNotFoundError,ProcessLookupError,PermissionError): pass
+        except (FileNotFoundError,ProcessLookupError,PermissionError):
+            if strict:raise
+        if strict:raise ValueError('exact sampling cgroup unavailable')
         return None
     def pids(self,pid):
         cg=self.cgroup(pid)
@@ -200,21 +202,114 @@ class Probe:
         except (FileNotFoundError,ProcessLookupError): out['exited_during_sample']=True
         except PermissionError: out['error']='permission denied'
         return out
+    def sampling_identity(self, cid, obj):
+        state=obj.get('State',{}) if isinstance(obj,dict) else {}
+        if (not isinstance(obj,dict) or obj.get('Id')!=cid or
+                not isinstance(obj.get('Image'),str) or not obj['Image'] or
+                not isinstance(state.get('StartedAt'),str) or not state['StartedAt'] or
+                type(state.get('Running')) is not bool or
+                (state['Running'] and (type(state.get('Pid')) is not int or state['Pid']<=0))):
+            raise ValueError('exact sampling identity unavailable')
+        record=self.worker_records.get(cid)
+        if record is not None:
+            owner={'workerContainerID':cid,'workerName':record['Name'].lstrip('/'),
+                   'runID':record['runID'],'daemonID':self.daemon}
+            owned=worker_owned(obj,owner,self.image,self.daemon)
+        else:
+            owned=(cid in self.containers and obj.get('Name')=='/'+self.containers[cid] and
+                   (obj.get('Config',{}).get('Labels') or {}).get('probe.bakabel.owner')==self.prefix)
+        if not owned:raise ValueError('exact sampling ownership changed')
+        return (obj['Id'],obj['Image'],obj['Name'],state['StartedAt'],dict(obj['Config']['Labels']))
+
+    @staticmethod
+    def valid_kernel_readback(kernel):
+        number=lambda value:bool(value) and value.isascii() and value.isdecimal()
+        cpu=kernel['cpu.max'].split()
+        if len(cpu)!=2 or not number(cpu[1]) or int(cpu[1])<=0 or not (cpu[0]=='max' or number(cpu[0])):return False
+        for key in ['memory.current','memory.peak','memory.max','pids.current']:
+            if key=='memory.max' and kernel[key]=='max':continue
+            if not number(kernel[key]):return False
+        for key,required in [('cpu.stat','usage_usec'),('memory.events','oom_kill')]:
+            rows=[line.split() for line in kernel[key].splitlines()]
+            if not rows or any(len(row)!=2 or not number(row[1]) for row in rows):return False
+            if required not in {row[0] for row in rows}:return False
+        for line in kernel['io.stat'].splitlines():
+            row=line.split();device=row[0].split(':')
+            if len(device)!=2 or not all(number(part) for part in device) or len(row)<2:return False
+            for field in row[1:]:
+                pair=field.split('=')
+                if len(pair)!=2 or not pair[0] or not number(pair[1]):return False
+        return True
+
+    def cgroup_sample(self, cid, initial, cg):
+        """Settle only a missing kernel observation, never a product deadline."""
+        files=['cpu.max','cpu.stat','memory.current','memory.peak','memory.max','memory.events','io.stat','pids.current']
+        gap=None;started=0.0;deadline=0.0;inspections=0;identity=None;cg_identity=None
+        try:
+            while True:
+                try:
+                    if gap is None:
+                        stat=cg.stat();cg_identity=(stat.st_dev,stat.st_ino)
+                    else:
+                        current=self.cgroup(initial['State']['Pid'],strict=True)
+                        if current is None:raise ProcessLookupError(errno.ESRCH,'sampling cgroup missing')
+                        if current!=cg:raise ValueError('exact sampling cgroup changed')
+                        stat=cg.stat()
+                        if (stat.st_dev,stat.st_ino)!=cg_identity:raise ValueError('exact sampling cgroup changed')
+                    # Rebuild every field, including limits, after a gap. No
+                    # cached/partially read row is evidence of fresh enforcement.
+                    kernel={f:cg.joinpath(f).read_text().strip() for f in files}
+                    if gap is not None:
+                        stat=cg.stat();current=self.cgroup(initial['State']['Pid'],strict=True)
+                        if current is None:raise ProcessLookupError(errno.ESRCH,'sampling cgroup missing')
+                        if current!=cg or (stat.st_dev,stat.st_ino)!=cg_identity:
+                            raise ValueError('exact sampling cgroup changed')
+                        if not self.valid_kernel_readback(kernel):raise ValueError('invalid fresh sampling readback')
+                        if time.monotonic()>=deadline:raise TimeoutError('sampling observation deadline exceeded')
+                        gap['resolution']='fresh-kernel-read'
+                    return kernel
+                except OSError as exc:
+                    if exc.errno not in (errno.ENODEV,errno.ENOENT,errno.ESRCH):raise
+                    if gap is None:
+                        started=time.monotonic();deadline=started+1.0
+                        gap={'container':cid,'at':utc(),'reason':'cgroup-removed-after-inspection',
+                             'errno':exc.errno,'resolution':'failed'}
+                        gaps=self.result.setdefault('sampler_gaps',[])
+                        gaps.append(gap);del gaps[:-64]
+                        identity=self.sampling_identity(cid,initial)
+                        if cid not in str(cg):raise ValueError('exact sampling cgroup unavailable')
+                    remaining=deadline-time.monotonic()
+                    if inspections>=20 or remaining<=0:raise
+                    if inspections:time.sleep(min(.05,remaining))
+                    if time.monotonic()>=deadline:raise
+                    inspections+=1
+                    # The shared call boundary also works through wrappers whose
+                    # ordinary inspect method has no deadline keyword.
+                    after=self.e.call('GET','/containers/'+cid+'/json',missing=True,deadline=deadline)
+                    if time.monotonic()>=deadline:raise
+                    if after is None:
+                        gap['resolution']='terminal_absent'
+                        return None
+                    if self.sampling_identity(cid,after)!=identity:
+                        raise ValueError('exact sampling identity changed')
+                    if after['State']['Running'] is False:
+                        gap['resolution']='terminal_stopped'
+                        return None
+                    if after['State']['Pid']!=initial['State']['Pid']:
+                        raise ValueError('exact sampling PID changed')
+        finally:
+            if gap is not None:
+                gap.update(inspections=inspections,elapsed_ms=max(0,int((time.monotonic()-started)*1000)))
+
     def measure(self,cid, role):
         v=self.e.inspect(cid,missing=True)
         if not v or not v['State']['Running']: return None
         pid=v['State']['Pid'];self.pin_container(cid);cg=self.cgroup(pid)
         out={'at':utc(),'monotonic':time.monotonic(),'role':role,'container':cid,'main_pid':pid,'cgroup_path':str(cg),'processes':[self.proc(p) for p in self.pids(pid)]}
         if cg:
-            for f in ['cpu.max','cpu.stat','memory.current','memory.peak','memory.max','memory.events','io.stat','pids.current']:
-                try: out[f]=cg.joinpath(f).read_text().strip()
-                except (FileNotFoundError,PermissionError) as exc: out[f]=type(exc).__name__
-                except OSError as exc:
-                    if exc.errno != errno.ENODEV:raise
-                    after=self.e.inspect(cid,missing=True)
-                    if after and after['State']['Running'] and after['State']['Pid']==pid:raise
-                    self.result.setdefault('sampler_gaps',[]).append({'container':cid,'at':utc(),'reason':'cgroup-removed-after-inspection','errno':exc.errno})
-                    return None
+            kernel=self.cgroup_sample(cid,v,cg)
+            if kernel is None:return None
+            out.update(kernel)
         if role=='worker':
             try:out['tmp_cache_footprint']=footprint(Path('/proc')/str(pid)/'root/tmp')
             except PermissionError:out['tmp_cache_footprint_error']='permission denied'
