@@ -4,6 +4,174 @@ import unittest
 
 
 class HostedResources(unittest.TestCase):
+    def captured_failure_raw(self):
+        """Synthetic raw states, NOT recovered raw evidence from hosted 133.
+
+        Reproduces that failed attempt's public exit=0/OOM=false/32MiB shape;
+        the running state and owner are explicit offline counterexamples only.
+        """
+        run='b'*32;cid='a'*64;name='bakabel-worker-'+run;daemon='unit-daemon'
+        worker={'Id':cid,'Name':'/'+name,'Image':'candidate',
+                'State':{'Status':'running','Running':True,'Pid':123,'ExitCode':0,'OOMKilled':False},
+                'HostConfig':{'Memory':33554432,'NanoCpus':2000000000}}
+        owner={'runID':run,'daemonID':daemon,'workerName':name,'workerContainerID':cid,
+               'phase':'intent','status':'active','workerStartAuthorized':True}
+        return {'mode':'oom','daemon':daemon,'image_id':'candidate','gates':[],
+                'worker_last_inspect':worker,
+                'workers':{cid:{**worker,'runID':run,'state':'state','Config':{'Labels':{
+                    'bakabel.worker':'1','bakabel.run':run,'bakabel.daemon':daemon}}}},
+                'owner_history':[{'owner':owner}],
+                'failure_cgroup_samples':[{'cpu.max':'200000 100000','memory.max':'33554432','memory.events':'oom_kill 0'}]}
+
+    def test_133_timeout_exit_zero_is_not_terminal_and_failure_is_preserved(self):
+        import ast,contextlib,io,json,tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import Mock,patch
+        import run_resource_probe as probe
+        module=self.module();raw=self.captured_failure_raw()
+        # Exercise the actual 133 controller wait/exception boundary with virtual
+        # time, not a fresh Engine/PG/process query or a hosted runtime assertion.
+        tree=ast.parse(Path(module.__file__).with_name('run_resource_failures.py').read_text())
+        run=next(n for n in tree.body if isinstance(n,ast.ClassDef) and n.name=='FailureProbe')
+        run=next(n for n in run.body if isinstance(n,ast.FunctionDef) and n.name=='run')
+        early=next(n for n in ast.walk(run) if isinstance(n,ast.If) and ast.unparse(n.test)=="self.args.mode == 'oom'" and
+                   any(isinstance(x,ast.Expr) and isinstance(x.value,ast.Call) and ast.unparse(x.value.func)=='self.finish' for x in n.body))
+        keywords={k.arg:ast.literal_eval(k.value) for k in early.body[0].value.keywords}
+        self.assertEqual(keywords,{'expect':1,'timeout':20})
+        clock=[0.0]
+        def sleep(seconds):clock[0]+=seconds
+        class OfflineProbe(probe.Probe):
+            def __init__(self,args):
+                self.root=args.runtime;self.root.mkdir();self.result=raw
+                self.e=SimpleNamespace(inspect=Mock(return_value={'State':{'Running':True}}))
+            def run(self):self.finish('offline-controller',**keywords)
+            def logs(self,cid):raise AssertionError('running controller is not terminal')
+            def cleanup(self):(self.root/'receipt.json').write_text(json.dumps(self.result))
+        with tempfile.TemporaryDirectory() as directory:
+            args=SimpleNamespace(runtime=Path(directory),expected_image_id='candidate',expected_source_sha256='offline-not-build-evidence')
+            with patch.object(module,'HostedFailureProbe',OfflineProbe),patch.object(probe,'time',SimpleNamespace(monotonic=lambda:clock[0],sleep=sleep)),patch.object(module,'verify_early_oom') as verifier,contextlib.redirect_stdout(io.StringIO()):
+                public=module.run_case(args,'oom',None)
+            self.assertTrue(public['failed']);self.assertFalse(public['verified']);self.assertEqual(public['gates'],[])
+            self.assertEqual(public['failure']['kind'],'RuntimeError')
+            self.assertEqual([f['function'] for f in public['failure']['frames']][-2:],['finish','wait'])
+            verifier.assert_not_called();self.assertNotIn('failure_safety',public)
+            self.assertEqual(json.loads((Path(directory)/'oom/receipt.json').read_text())['worker_last_inspect'],raw['worker_last_inspect'])
+            self.assertEqual(json.loads((Path(directory)/'oom/public.json').read_text()),public)
+            observed=public['failure_observations']
+            self.assertEqual(observed['worker_exit_code'],0);self.assertIs(observed['worker_oom_killed'],False)
+            self.assertEqual(observed['sampled_oom_kill_max'],0)
+            self.assertIn('last_captured_state',observed,'exit=0 alone cannot establish terminality')
+            self.assertEqual(observed['last_captured_state'],{
+                'basis':'historical_not_current','worker_running':True,'worker_pid':123,'worker_status':'running',
+                'owner_phase':'intent','worker_start_authorized':True,'source_present':False,'exec_present':False})
+
+    def test_captured_owner_projection_rejects_malformed_and_foreign_rows(self):
+        import copy,json,tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        module=self.module();base=self.captured_failure_raw();canary='PRIVATE-CANARY'
+        owner=base['owner_history'][0]['owner']
+        unknown={'owner_phase':None,'worker_start_authorized':None,'source_present':None,'exec_present':None}
+        bad_rows=[None,True,[],canary,{'owner':None}]
+        for key in ('runID','daemonID','workerName','workerContainerID'):
+            bad_rows.append({'owner':{**owner,key:'foreign'}})
+        for key,values in (('phase',(True,[],{},canary)),('status',(True,[],{},'unknown')),
+                           ('workerStartAuthorized',(1,0,[],{},canary)),
+                           ('sourceContainerID',(True,[],{},'bad/value')),('execID',(True,[],{},'bad/value')),
+                           ('sourceStartedAt',(True,[],{},canary)),('targetID',(True,[],{},'bad/value')),
+                           ('execKind',(True,[],{},canary)),('importRunID',(True,[],{},'bad/value'))):
+            bad_rows.extend({'owner':{**owner,key:value}} for value in values)
+        bad_rows.extend({'owner':{**owner,key:canary}} for key in ('Env','command','error'))
+        bad_rows.extend({'owner':{**owner,**change}} for change in (
+            {'phase':'exec_started'}, {'phase':'creating_exec'}, {'status':'blocked'},
+            {'sourceContainerID':'c'*64}, {'sourceStartedAt':'2026-10-26T16:50:30Z'},
+            {'execID':'d'*64}, {'phase':'quarantine'}, {'importRunID':'e'*32}))
+        for bad in bad_rows:
+            with self.subTest(row=bad),tempfile.TemporaryDirectory() as directory:
+                raw=copy.deepcopy(base);raw['owner_history']=[bad]*40
+                raw['worker_last_inspect'].update(Env=[canary],command=canary,error=canary)
+                raw['worker_last_inspect']['State'].update(Error=canary,StartedAt=canary,FinishedAt=canary)
+                target=Path(directory)/'oom';target.mkdir();receipt=target/'receipt.json'
+                receipt.write_text(json.dumps(raw));before=receipt.read_bytes()
+                with patch.object(module,'run_platform',return_value={'failed':True}),patch.object(module,'verify_early_oom') as verifier:
+                    public=module.run_case(SimpleNamespace(runtime=Path(directory),expected_image_id='candidate'),'oom',None)
+                state=public['failure_observations']['last_captured_state']
+                self.assertEqual({k:state[k] for k in unknown},unknown)
+                self.assertIs(state['worker_running'],True)
+                self.assertEqual(len(state),8);self.assertNotIn(canary,(target/'public.json').read_text())
+                self.assertEqual(receipt.read_bytes(),before);verifier.assert_not_called()
+                self.assertTrue(public['failed']);self.assertFalse(public['verified'])
+
+    def test_captured_state_uses_last_matched_owner_not_trailing_foreign_history(self):
+        import copy,json
+        module=self.module();base=self.captured_failure_raw();owner=base['owner_history'][0]['owner']
+        source={'sourceContainerID':'c'*64,'sourceStartedAt':'2026-10-26T16:50:30.123456789Z','targetID':'payload','execKind':'dump'}
+        for phase in ('intent','creating_exec','exec_created','exec_started','quarantine'):
+            with self.subTest(phase=phase):
+                raw=copy.deepcopy(base)
+                last={**owner,'phase':phase,'status':'blocked' if phase=='quarantine' else 'active','workerStartAuthorized':False}
+                if phase in ('creating_exec','exec_created','exec_started'):last.update(source)
+                if phase in ('exec_created','exec_started'):last['execID']='d'*64
+                # observe_fast saves owners before the CID check. Prebinding and
+                # later foreign rows are not evidence for this exact worker/run.
+                prebinding={k:v for k,v in owner.items() if k not in ('workerContainerID','workerStartAuthorized')}
+                raw['owner_history']=[{'owner':prebinding},{'owner':owner},{'owner':last}]+[
+                    {'at':'PRIVATE-CANARY','owner':{**last,'runID':'foreign','Env':['PRIVATE-CANARY']}}]*40
+                before=copy.deepcopy(raw);state=module.public_captured_failure_state(raw,'candidate')
+                self.assertEqual(state['owner_phase'],phase);self.assertIs(state['worker_start_authorized'],False)
+                self.assertEqual(state['source_present'],phase in ('creating_exec','exec_created','exec_started'))
+                self.assertEqual(state['exec_present'],phase in ('exec_created','exec_started'))
+                self.assertEqual(state['basis'],'historical_not_current');self.assertEqual(raw,before)
+                for private in ('PRIVATE-CANARY',owner['runID'],owner['workerContainerID'],source['sourceContainerID'],'d'*64):
+                    self.assertNotIn(private,json.dumps(state))
+        raw=copy.deepcopy(base);del raw['owner_history'][0]['owner']['workerStartAuthorized']
+        self.assertIsNone(module.public_captured_failure_state(raw,'candidate')['worker_start_authorized'])
+        # The prebinding row cannot provide a phase for an exact matched worker.
+        raw['owner_history']=[{'owner':prebinding}]
+        self.assertIsNone(module.public_captured_failure_state(raw,'candidate')['owner_phase'])
+
+    def test_captured_worker_types_binding_and_absence_remain_unknown_not_zero(self):
+        import copy
+        module=self.module();base=self.captured_failure_raw();cid=base['worker_last_inspect']['Id']
+        unknown=module.public_captured_failure_state({},'candidate')
+        self.assertEqual(unknown,{'basis':'historical_not_current',**{key:None for key in (
+            'worker_running','worker_pid','worker_status','owner_phase','worker_start_authorized','source_present','exec_present')}})
+        # Historical public 133 receipt dropped all these raw states. Its exit0,
+        # OOM=false and numeric memory observations cannot fill in the unknowns.
+        self.assertEqual(module.public_captured_failure_state({'failure_observations':{
+            'worker_exit_code':0,'worker_oom_killed':False,'worker_memory_bytes':33554432}},'candidate'),unknown)
+        for bad in (None,True,1,0,-1,1.5,float('nan'),float('inf'),'PRIVATE-CANARY',[],{}):
+            raw=copy.deepcopy(base);raw['worker_last_inspect']['State'].update(Running=bad,Pid=bad,Status=bad)
+            with self.subTest(bad=bad):
+                state=module.public_captured_failure_state(raw,'candidate')
+                self.assertIs(state['worker_running'],bad if type(bad) is bool else None)
+                self.assertEqual(state['worker_pid'],bad if type(bad) is int and 0<=bad<2**31 else None)
+                self.assertIsNone(state['worker_status'])
+        for status in ('created','running','paused','restarting','removing','exited','dead'):
+            raw=copy.deepcopy(base);raw['worker_last_inspect']['State']['Status']=status
+            self.assertEqual(module.public_captured_failure_state(raw,'candidate')['worker_status'],status)
+        for field in ('Running','Pid','Status'):
+            raw=copy.deepcopy(base);del raw['worker_last_inspect']['State'][field]
+            projected={'Running':'worker_running','Pid':'worker_pid','Status':'worker_status'}[field]
+            self.assertIsNone(module.public_captured_failure_state(raw,'candidate')[projected])
+        changes=[('daemon','foreign'),('daemon',True),('workers',None),('worker_last_inspect',None)]
+        for key,value in changes:
+            raw=copy.deepcopy(base);raw[key]=value
+            self.assertEqual(module.public_captured_failure_state(raw,'candidate'),unknown)
+        for field,value in (('Id','foreign'),('Name','/foreign'),('Image','foreign'),('Config',None)):
+            raw=copy.deepcopy(base);raw['workers'][cid][field]=value
+            self.assertEqual(module.public_captured_failure_state(raw,'candidate'),unknown)
+        for field in ('bakabel.worker','bakabel.run','bakabel.daemon'):
+            raw=copy.deepcopy(base);raw['workers'][cid]['Config']['Labels'][field]='foreign'
+            self.assertEqual(module.public_captured_failure_state(raw,'candidate'),unknown)
+        raw=copy.deepcopy(base);raw['worker_terminal_before_recovery']=copy.deepcopy(raw['worker_last_inspect'])
+        raw['worker_terminal_before_recovery']['State'].update(Running=False,Pid=0,Status='exited')
+        state=module.public_captured_failure_state(raw,'candidate')
+        self.assertIs(state['worker_running'],False);self.assertEqual(state['worker_pid'],0);self.assertEqual(state['worker_status'],'exited')
+        self.assertEqual(state['basis'],'historical_not_current')
+
     def test_failed_case_retains_numeric_observations_without_claiming_oom(self):
         module=self.module()
         import json,tempfile

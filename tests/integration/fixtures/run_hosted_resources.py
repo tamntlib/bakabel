@@ -2,6 +2,7 @@
 """Replay actual lifecycle/resources and OOM/ENOSPC on an exclusive hosted VM."""
 import argparse
 import copy
+import datetime
 import json
 import os
 import re
@@ -143,6 +144,67 @@ def public_failure_diagnostics(raw):
         rows=raw.get(key,[]);count=raw.get(key+'_count',len(rows) if isinstance(rows,list) else None)
         count=max(count,len(rows)) if isinstance(rows,list) and type(count) is int and 0<=count<2**63 else None
         out['observer_errors'][label]={'count':count,'items':[observer_error_fields(row) for row in rows[:32]] if isinstance(rows,list) else []}
+    return out
+
+
+def public_captured_failure_state(raw,image):
+    """Project retained snapshots only: not simultaneous, fresh or terminal proof.
+
+    No timestamps were captured for the worker inspect. Never date it using the
+    owner's separate sample time or claim this is the state at cleanup/failure.
+    """
+    out={'basis':'historical_not_current','worker_running':None,'worker_pid':None,'worker_status':None,
+         'owner_phase':None,'worker_start_authorized':None,'source_present':None,'exec_present':None}
+    def token(item):return isinstance(item,str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}',item)
+    worker=raw.get('worker_terminal_before_recovery',raw.get('worker_last_inspect'))
+    records=raw.get('workers');daemon=raw.get('daemon')
+    if not isinstance(worker,dict) or not isinstance(records,dict) or not token(daemon) or not token(image):return out
+    cid=worker.get('Id');name=worker.get('Name')
+    if not token(cid) or not isinstance(name,str) or not name.startswith('/') or not token(name[1:]):return out
+    record=records.get(cid)
+    if not isinstance(record,dict) or not token(record.get('runID')):return out
+    config=record.get('Config');labels=config.get('Labels') if isinstance(config,dict) else None
+    if (record.get('Id')!=cid or record.get('Name')!=name or worker.get('Image')!=image or record.get('Image')!=image or
+        not isinstance(labels,dict) or labels.get('bakabel.worker')!='1' or labels.get('bakabel.daemon')!=daemon or
+        labels.get('bakabel.run')!=record['runID']):return out
+    state=worker.get('State')
+    if isinstance(state,dict):
+        running=state.get('Running');pid=state.get('Pid');status=state.get('Status')
+        out.update(worker_running=running if type(running) is bool else None,
+                   worker_pid=pid if type(pid) is int and 0<=pid<2**31 else None,
+                   worker_status=status if isinstance(status,str) and status in ('created','running','paused','restarting','removing','exited','dead') else None)
+    history=raw.get('owner_history')
+    for row in reversed(history) if isinstance(history,list) else []:
+        owner=row.get('owner') if isinstance(row,dict) else None
+        if (not isinstance(owner,dict) or owner.get('runID')!=record['runID'] or owner.get('daemonID')!=daemon or
+            owner.get('workerContainerID')!=cid or owner.get('workerName')!=name[1:]):continue
+        # Record has a closed flat schema. A matching ID alone must not turn
+        # malformed/foreign records into bound diagnostic evidence.
+        required={'runID','daemonID','workerName','phase','status'}
+        optional={'workerContainerID','workerStartAuthorized','sourceContainerID','sourceStartedAt','execID','targetID','execKind','importRunID'}
+        if not required<=owner.keys()<=required|optional:continue
+        phase=owner.get('phase');start=owner.get('workerStartAuthorized')
+        if (not isinstance(phase,str) or phase not in ('intent','creating_exec','exec_created','exec_started','quarantine') or
+            owner.get('status')!=('blocked' if phase=='quarantine' else 'active') or
+            ('workerStartAuthorized' in owner and type(start) is not bool)):continue
+        if any(key in owner and (not isinstance(owner[key],str) or (owner[key] and not token(owner[key])))
+               for key in ('sourceContainerID','execID','targetID','importRunID')):continue
+        source=owner.get('sourceContainerID','');exec_id=owner.get('execID','');stamp=owner.get('sourceStartedAt','')
+        if not isinstance(stamp,str) or bool(source)!=bool(stamp):continue
+        if stamp:
+            if len(stamp)>64 or not re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?(?:Z|[+-]\d\d:\d\d)',stamp):continue
+            try:datetime.datetime.fromisoformat(stamp)
+            except ValueError:continue
+        kind=owner.get('execKind','');import_run=owner.get('importRunID','')
+        if not isinstance(kind,str) or kind not in ('','dump','restore'):continue
+        if import_run and (kind!='restore' or import_run==owner['runID']):continue
+        if phase!='quarantine':
+            if phase=='intent' and exec_id:continue
+            if phase=='creating_exec' and (not source or exec_id):continue
+            if phase in ('exec_created','exec_started') and (not source or not exec_id or (kind=='restore' and not import_run)):continue
+        out.update(owner_phase=phase,worker_start_authorized=start,
+                   source_present=bool(source),exec_present=bool(exec_id))
+        break
     return out
 
 
@@ -412,6 +474,7 @@ def run_case(args,case,engine):
         samples=raw.get('failure_cgroup_samples',[])
         counts=[kv_numbers(s.get('memory.events',''))['oom_kill'] for s in samples if 'oom_kill' in kv_numbers(s.get('memory.events',''))]
         public['failure_observations']={'worker_exit_code':state.get('ExitCode') if type(state.get('ExitCode')) is int else None,'worker_oom_killed':state.get('OOMKilled') if type(state.get('OOMKilled')) is bool else None,'worker_memory_bytes':config.get('Memory') if type(config.get('Memory')) is int else None,'cgroup_samples':len(samples),'sampled_oom_kill_max':max(counts,default=None),'sampled_memory_max_bytes':sorted({int(s['memory.max']) for s in samples if str(s.get('memory.max','')).isdigit()})}
+        public['failure_observations']['last_captured_state']=public_captured_failure_state(raw,getattr(args,'expected_image_id',None))
     if row['failed']:
         public['failed']=True
         if case=='scheduler':public['scheduler_diagnostics']=public_scheduler_diagnostics(raw)
