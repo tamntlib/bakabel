@@ -253,7 +253,7 @@ class FailureProbe(Probe):
         # substitute for rejecting an unfavorable observation at the producer.
         if 'cpu.max' in row:assert row['cpu.max']=='200000 100000', 'cgroup_identity'
         if 'memory.max' in row:
-            expected={'oom':('33554432',),'oom-active':('536870912','16777216'),'enospc':('536870912',)}[self.result['mode']]
+            expected={'oom':('16777216',),'oom-active':('536870912','16777216'),'enospc':('536870912',)}[self.result['mode']]
             assert row['memory.max'] in expected, 'cgroup_identity'
 
     def arm_kernel_counter(self,worker,owner):
@@ -578,7 +578,8 @@ def main():
     a.add_argument('--image',required=True);a.add_argument('--socket',type=Path)
     a.add_argument('--mode',choices=['oom','oom-active','enospc'],required=True);a.add_argument('--memory-mib',type=int)
     args=a.parse_args()
-    if args.memory_mib is None:args.memory_mib=16 if args.mode=='oom-active' else 32
+    if args.memory_mib is None:args.memory_mib=16 if args.mode in ('oom','oom-active') else 32
+    if args.mode=='oom' and args.memory_mib!=16:a.error('--mode oom requires --memory-mib 16 (fixed fixture cap)')
     assert 16<=args.memory_mib<=128
     if args.mode=='oom-active':assert args.memory_mib==16
     os.sched_setaffinity(0,{0,1});p=FailureProbe(args);code=1

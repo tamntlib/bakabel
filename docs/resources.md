@@ -76,6 +76,28 @@ required.
 
 Failed attempts remain failed: one configured 32 MiB run proved early OOM but its harness waited for an unreachable later checkpoint; another had no positive OOM proof. Other failed fixture assertions are recorded, not relabeled as successful application runs. The checked-in-ready reproduction procedures and limits are in [the fixture guide](../tests/integration/fixtures/RESOURCE_PROBE.md) and [the candidate handoff](../tests/integration/B4_RESOURCE_HANDOFF.md).
 
+## Configured early OOM replacement — unproven
+
+The current configured-early fixture explicitly replaces32MiB with fixed16MiB
+(16777216 bytes), including standalone default, hosted selection, producer
+validation and independent inspect/kernel expectations.32 was a fixture value,
+not a literal user/PLAN sizing requirement; PLAN §8 requires measured configurable
+ceilings, not invented MB guarantees. The latest32 attempt (`40369174738` at
+`3ca6aec`) failed the20s controller wait:2,831 samples had no positive oom_kill.
+Last captured worker Running=true/PID66867 and a separate matched exec_started
+owner are historical, not necessarily simultaneous or direct PG Lock-wait proof.
+Earlier32 failures and their unknowns are preserved in the [release ledger](../tests/integration/RELEASE_GATE_LEDGER.md#configured-early-oom-fixture-correction).
+
+Configured16 is **UNPROVEN**, pending one fixed exact-revision hosted attempt
+and independent bound verification of every unchanged before-source, terminal,
+positive-kernel-counter, failed/empty-snapshot, online-source and cleanup gate.
+The same ordinary image,2CPU/production512MiB defaults,200000-row workload,
+fresh empty native128MiB repository, ordinary swap policy and20s/3s/45s windows
+are unchanged. No cap ladder, retry-until-lucky, injected allocator or weakened
+predicate is introduced. Active512→16 injection and repository ENOSPC remain
+separate unchanged evidence; neither proves configured-early16 or supported
+active-export sizing. No new runtime PASS is claimed by this correction.
+
 ## Remaining acceptance boundary
 
 This measured baseline's broad B2/B3 CLI replay on Docker-in-Docker is **blocked**: memory512MiB is preserved in requests/inspect, but the nested runtime cannot start the first worker because its parent cgroup is threaded. The separate native-rootless alternative also failed before worker execution because it could not read/load the Docker AppArmor profile; it was cleaned without disabling AppArmor or changing production/user-manager policy. Its failed precursor also requested a shell unavailable in the scratch image, so it is explicitly not ordinary-worker support proof. Historical baseline 11-gate success does not certify this or later candidates. The [Compose/local+S3 PostgreSQL subset](../tests/integration/COMPOSE_PG_CLI_HANDOFF.md) passed on source2fd683f9/imageff1a6cd8 without file restore or Swarm; its eleven subset checks are not the original full11gate matrix. Full replay and independent approval of the security-review fixes remain separate release gates.

@@ -44,7 +44,14 @@ All rows below executed on the exact R3 image/core; parent verifiers read back e
 | Scheduler/resources | Eight gates PASS: actual schedule, scheduler SIGKILL/restart adopts same worker/original deadline, no overlap, readonly/socketless failed+overdue health, source continuity,256MiB512-file full readback/unchanged parent,200,000-row PG restore | Four workers with actual kernel2CPU/512MiB limits; bounded fixture, not universal sizing |
 | Active OOM | Exact worker limit lowered512→16MiB during PG source lock-wait; actual kernel oom_kill/OOMKilled; failed-not-complete, source exec/session terminal before release | Controlled Engine update, not configured32MiB active-export/during-byte-stream proof |
 | ENOSPC | Actual same-repository8MiB tmpfs exhaustion; observed errno28 through failed backup; failed-not-complete/terminal proof/bounded recovery; snapshots[] after only owned filler removed | Real disk pressure within owned tmpfs, not host disk exhaustion |
-| Configured low-cap OOM | Actual32MiB worker limit and early-intent oom_kill=1/OOMKilled; no source dump/session, failed result/snapshots[] | Failure-safety only;32MiB not supported success sizing or active-export proof |
+| Historical configured low-cap OOM | Actual32MiB worker limit and early-intent oom_kill=1/OOMKilled; no source dump/session, failed result/snapshots[] | Historical failure-safety only;32MiB not supported success sizing or active-export proof |
+
+Current fixture addendum: configured-early32→fixed16MiB is an explicit replacement
+candidate, **UNPROVEN** pending one fixed hosted attempt and independent exact
+revision/source/image/daemon/artifact-bound verification. Historical32 attempts
+are not relabeled. Production2CPU/512MiB, active512→16 injection, ENOSPC,
+workload, ordinary swap policy, deadlines and substantive proof gates are
+unchanged; see the [current rationale and preserved failures](RELEASE_GATE_LEDGER.md#configured-early-oom-fixture-correction).
 
 Nine current scoped attempts were cleaned and independently checked: **113 unique containers and31 unique volumes absent**, private fixture data/credentials/binary copies removed, primary Swarm inactive. Shared caches/local development images remain intentionally available.
 

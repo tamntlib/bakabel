@@ -45,14 +45,15 @@ The mixed runner leaves production worker defaults untouched. Current candidate 
 ## Controlled failures (separate short PG-only fixtures)
 
 ```sh
+# Configured16 replacement candidate: UNPROVEN pending one fixed hosted attempt.
 # Explicit configuration-small-cap diagnostic. It requires observed actual
 # oom_kill and failed-before-source proof; a generic exit1 is NOT accepted.
 # A very small cap may fail for another reason or die before a late barrier.
 taskset -c 0,1 python tests/integration/fixtures/run_resource_failures.py \
   --source "$SOURCE" --runtime "$TMPDIR/new-early-oom" --image "$IMAGE" \
-  --minio-binary "$MINIO" --mode oom --memory-mib 32
+  --minio-binary "$MINIO" --mode oom --memory-mib 16
 
-# Authorized REAL fault injection, not a production default/config32 benchmark:
+# Authorized REAL fault injection, not a production default/configured-early benchmark:
 # same ordinary worker starts at effective defaults512MiB (zero=>defaults),
 # reaches PG exec_started/lock-wait, then only its exact owned container gets
 # Engine update Memory16MiB; actual memory.max and oom_kill must be observed.
@@ -77,6 +78,26 @@ taskset -c 0,1 python tests/integration/fixtures/verify_resource_failures.py \
 ENOSPC is injected only AFTER the same real source exec and Restic pipeline reach lock-wait. The fixture fills only its inspected8MiB repository tmpfs with its own known filler, then releases its source lock. Repeated actual one-byte writes on that exact backing return errno28 while the real worker fails. Original full-capacity/zero-free observations and worker bind mapping are preserved. Ordinary `serve` must establish failed-not-complete, source exec terminal, matching sessions0, worker absent and owner release. Only AFTER that exact proof is the known filler removed to allow a normally locked native `restic snapshots --json` readback. No repository packs/index/snapshots/locks are deleted or unlocked. A fully filled repository can otherwise prevent the verifier's own read lock; do not call that a new backup defect or fake an empty list.
 
 OOM failure mode does not relabel generic errors as OOM. If counters miss a short terminal interval, retain the failed attempt; a future replay needs an exact-container Docker oom-event subscription before workload/fault or another authoritative kernel observation, not a weakened counter assertion. Current retained run-oom-01 has actual configured32MiB oom_kill=1 but its old late-barrier harness exited1; run-oom-02 has no positive OOM proof. See the handoff attempt history.
+
+The configured-early `oom` fixture now defaults to fixed16MiB instead of32;
+explicit non16 caps are rejected before affinity changes or probe construction.
+Hosted selection, producer limit validation and independent inspect/kernel
+expectations all require16777216 bytes. This is a fixture correction, not
+production tuning or proof that16 will OOM in the required phase. Standalone
+`oom-active` remains16, `enospc` remains32, and production remains2CPU/512MiB.
+The20s controller-exit wait,3s terminal observation and45s product deadline are
+unchanged. Keep the same ordinary image,200000-row source, fresh empty native
+Restic repository on128MiB and ordinary swap policy; no injected allocator,
+active memory update, cap ladder, corpus change or retry-until-lucky is allowed.
+Actual kernel positive `oom_kill`, terminal OOMKilled/Running=false/PID0,
+strict intent-only bound owner history, no source/exec identity or dump event,
+zero matching sessions, failed-not-complete, empty snapshots, online read/write
+source identity, fatal observer errors/quiescence and exact cleanup all remain
+mandatory. Existing active512→16 proof is separate. See the [current addendum
+and retained failures](../RELEASE_GATE_LEDGER.md#configured-early-oom-fixture-correction).
+Configured16 remains **UNPROVEN** until a single fixed exact-revision hosted
+attempt and independent artifact/source/image/daemon-bound verification satisfy
+every gate. If it fails, retain the failure and diagnose; do not auto-tune.
 
 ## Measurement and safety semantics
 

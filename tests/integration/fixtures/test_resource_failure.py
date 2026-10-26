@@ -36,8 +36,8 @@ class FailureProof(unittest.TestCase):
         from run_hosted_resources import verify_early_oom
         with tempfile.TemporaryDirectory() as directory:
             probe,owner,worker,cg=self.cgroup_probe(directory,mode='oom')
-            (cg/'memory.max').write_text('33554432');(cg/'memory.events').write_text('oom_kill 1')
-            worker['HostConfig']={'Memory':33554432,'NanoCpus':2000000000}
+            (cg/'memory.max').write_text('16777216');(cg/'memory.events').write_text('oom_kill 1')
+            worker['HostConfig']={'Memory':16777216,'NanoCpus':2000000000}
             complete=probe.sample_failure_cgroup(worker,owner)
             (cg/'memory.max').unlink()
             worker['State']={'Pid':0,'Running':False,'OOMKilled':True}
@@ -56,12 +56,12 @@ class FailureProof(unittest.TestCase):
         from run_resource_probe import Probe
         for route in ('terminal','fd'):
             for remaining,missing,wrong in (('cpu.max','memory.max','100000 100000'),
-                                            ('memory.max','cpu.max','16777216')):
+                                            ('memory.max','cpu.max','33554432')):
                 for value in (wrong,'','PRIVATE-CANARY'):
                     with self.subTest(route=route,remaining=remaining,value=value),tempfile.TemporaryDirectory() as directory:
                         probe,owner,worker,cg=self.cgroup_probe(directory,mode='oom')
-                        (cg/'memory.max').write_text('33554432');(cg/'memory.events').write_text('oom_kill 1')
-                        worker['HostConfig']={'Memory':33554432,'NanoCpus':2000000000}
+                        (cg/'memory.max').write_text('16777216');(cg/'memory.events').write_text('oom_kill 1')
+                        worker['HostConfig']={'Memory':16777216,'NanoCpus':2000000000}
                         complete=probe.sample_failure_cgroup(worker,owner)
                         rejected=False
                         if route=='terminal':
@@ -84,7 +84,7 @@ class FailureProof(unittest.TestCase):
                                     with self.assertRaisesRegex(AssertionError,'observer_failure'):probe.gate('partial-limit')
                                     gate.assert_not_called()
                         self.assertIn(complete,probe.result['failure_cgroup_samples'])
-                        self.assertTrue(all(r['cpu.max']=='200000 100000' and r['memory.max']=='33554432'
+                        self.assertTrue(all(r['cpu.max']=='200000 100000' and r['memory.max']=='16777216'
                                             for r in probe.result['failure_cgroup_samples']))
                         self.assertNotIn(partial,probe.result['failure_cgroup_samples'])
                         self.assertNotIn(missing,partial);self.assertEqual(partial[remaining],value)
@@ -97,7 +97,7 @@ class FailureProof(unittest.TestCase):
 
     def test_partial_available_limits_use_known_mode_without_cached_or_hostconfig_substitution(self):
         from run_resource_failures import assert_oom_proof
-        modes={'oom':('33554432',),'oom-active':('536870912','16777216'),'enospc':('536870912',)}
+        modes={'oom':('16777216',),'oom-active':('536870912','16777216'),'enospc':('536870912',)}
         for route in ('terminal','fd'):
             for mode,memories in modes.items():
                 for remaining,missing,allowed,values in (
@@ -170,8 +170,8 @@ class FailureProof(unittest.TestCase):
         for missing in ('cpu.max','memory.max'):
             with self.subTest(missing=missing),tempfile.TemporaryDirectory() as directory:
                 probe,owner,worker,cg=self.cgroup_probe(directory,mode='oom')
-                (cg/'memory.max').write_text('33554432');(cg/'memory.events').write_text('oom_kill 1')
-                worker['HostConfig']={'Memory':33554432,'NanoCpus':2000000000}
+                (cg/'memory.max').write_text('16777216');(cg/'memory.events').write_text('oom_kill 1')
+                worker['HostConfig']={'Memory':16777216,'NanoCpus':2000000000}
                 probe.sample_failure_cgroup(worker,owner)
                 partial=self.kernel_fd_unavailable(probe,owner,worker,cg,missing,counter='oom_kill 2')
                 worker['State']={'Pid':0,'Running':False,'OOMKilled':True}
@@ -186,14 +186,14 @@ class FailureProof(unittest.TestCase):
         from run_hosted_resources import verify_early_oom
         with tempfile.TemporaryDirectory() as directory:
             probe,owner,worker,cg=self.cgroup_probe(directory,mode='oom')
-            (cg/'memory.max').write_text('33554432');(cg/'memory.events').write_text('oom_kill 1')
-            worker['HostConfig']={'Memory':33554432,'NanoCpus':2000000000}
+            (cg/'memory.max').write_text('16777216');(cg/'memory.events').write_text('oom_kill 1')
+            worker['HostConfig']={'Memory':16777216,'NanoCpus':2000000000}
             complete=probe.sample_failure_cgroup(worker,owner)
             (cg/'cpu.max').unlink();worker['State']={'Pid':0,'Running':False,'OOMKilled':True}
             partial=probe.sample_failure_cgroup(worker,owner)
             self.assertEqual(probe.result['failure_cgroup_samples'],[complete])
             self.assertEqual(probe.result['terminal_cgroup_sample'],partial)
-            self.assertNotIn('cpu.max',partial);self.assertEqual(partial['memory.max'],'33554432')
+            self.assertNotIn('cpu.max',partial);self.assertEqual(partial['memory.max'],'16777216')
             self.assertEqual(partial['memory.events'],'oom_kill 1')
             self.assertEqual(partial['unavailable_errno']['cpu.max'],2)
             self.assertTrue(verify_early_oom(self.early_oom_receipt(probe,owner,worker),'candidate')['verified'])
@@ -205,8 +205,8 @@ class FailureProof(unittest.TestCase):
             for missing in ('cpu.max','memory.max'):
                 with self.subTest(route=route,missing=missing),tempfile.TemporaryDirectory() as directory:
                     probe,owner,worker,cg=self.cgroup_probe(directory,mode='oom')
-                    (cg/'memory.max').write_text('33554432')
-                    worker['HostConfig']={'Memory':33554432,'NanoCpus':2000000000}
+                    (cg/'memory.max').write_text('16777216')
+                    worker['HostConfig']={'Memory':16777216,'NanoCpus':2000000000}
                     probe.sample_failure_cgroup(worker,owner)
                     if route=='fd':
                         partial=self.kernel_fd_unavailable(probe,owner,worker,cg,missing,counter='oom_kill 1')
@@ -232,9 +232,9 @@ class FailureProof(unittest.TestCase):
             for prior_positive in (False,True):
                 with self.subTest(route=route,prior_positive=prior_positive),tempfile.TemporaryDirectory() as directory:
                     probe,owner,worker,cg=self.cgroup_probe(directory,mode='oom')
-                    (cg/'memory.max').write_text('33554432')
+                    (cg/'memory.max').write_text('16777216')
                     (cg/'memory.events').write_text('oom_kill '+str(int(prior_positive)))
-                    worker['HostConfig']={'Memory':33554432,'NanoCpus':2000000000}
+                    worker['HostConfig']={'Memory':16777216,'NanoCpus':2000000000}
                     complete=probe.sample_failure_cgroup(worker,owner)
                     if route=='fd':unknown=self.kernel_fd_unavailable(probe,owner,worker,cg,'memory.events')
                     else:
@@ -245,7 +245,7 @@ class FailureProof(unittest.TestCase):
                     self.assertIn(complete,rows);self.assertIn(unknown,rows)
                     self.assertEqual(unknown['counter_status'],'unavailable');self.assertEqual(unknown['memory.events'],'')
                     self.assertIn('memory.events',unknown['unavailable_errno'])
-                    self.assertEqual(unknown['cpu.max'],'200000 100000');self.assertEqual(unknown['memory.max'],'33554432')
+                    self.assertEqual(unknown['cpu.max'],'200000 100000');self.assertEqual(unknown['memory.max'],'16777216')
                     raw=self.early_oom_receipt(probe,owner,worker)
                     if prior_positive:
                         self.assertTrue(verify_early_oom(raw,'candidate')['verified'])
@@ -275,10 +275,10 @@ class FailureProof(unittest.TestCase):
         import copy,json
         from types import SimpleNamespace
         from unittest.mock import Mock
-        modes={'oom':'33554432','oom-active':'536870912','enospc':'536870912'}
+        modes={'oom':'16777216','oom-active':'536870912','enospc':'536870912'}
         for route in ('live','terminal','fd','fast-live','fast-terminal','settling','fast-settling'):
             for mode,memory in modes.items():
-                for name,wrong in (('cpu.max','100000 100000'),('memory.max','999')):
+                for name,wrong in (('cpu.max','100000 100000'),('memory.max','999'),('memory.max','33554432')):
                     other='memory.max' if name=='cpu.max' else 'cpu.max'
                     for missing in (None,other,'memory.events','memory.swap.max'):
                         for value in (wrong,'','PRIVATE-CANARY'):
@@ -342,7 +342,7 @@ class FailureProof(unittest.TestCase):
 
     def test_settling_contradiction_is_fatal_before_post_read_gap_exits(self):
         from unittest.mock import Mock
-        for mode,memory in (('oom','33554432'),('oom-active','536870912'),('enospc','536870912')):
+        for mode,memory in (('oom','16777216'),('oom-active','536870912'),('enospc','536870912')):
             for name,wrong in (('cpu.max','100000 100000'),('memory.max','999')):
                 for value in (wrong,'','PRIVATE-CANARY'):
                     for exit in ('directory-disappears','proc-disappears'):
@@ -383,7 +383,7 @@ class FailureProof(unittest.TestCase):
         from unittest.mock import Mock
         from run_resource_failures import assert_oom_proof
         for route in ('live','terminal','fd','fast-live','fast-terminal','settling','fast-settling'):
-            for mode,memories in (('oom',('33554432',)),('oom-active',('536870912','16777216')),('enospc',('536870912',))):
+            for mode,memories in (('oom',('16777216',)),('oom-active',('536870912','16777216')),('enospc',('536870912',))):
                 for memory in memories:
                     for missing in ('cpu.max','memory.max','memory.events','memory.swap.max'):
                         with self.subTest(route=route,mode=mode,memory=memory,missing=missing),tempfile.TemporaryDirectory() as directory:
@@ -431,8 +431,8 @@ class FailureProof(unittest.TestCase):
         from run_resource_failures import assert_oom_proof
         with tempfile.TemporaryDirectory() as directory:
             probe,owner,worker,cg=self.cgroup_probe(directory,mode='oom')
-            (cg/'memory.max').write_text('33554432')
-            worker['HostConfig']={'Memory':33554432,'NanoCpus':2000000000}
+            (cg/'memory.max').write_text('16777216')
+            worker['HostConfig']={'Memory':16777216,'NanoCpus':2000000000}
             probe.sample_failure_cgroup(worker,owner)
             worker['State']={'Pid':0,'Running':False,'OOMKilled':True}
             (cg/'memory.events').write_text('oom_kill 1')
@@ -769,8 +769,8 @@ class FailureProof(unittest.TestCase):
             with self.subTest(mode=mode),tempfile.TemporaryDirectory() as directory:
                 probe,owner,worker,cg=self.cgroup_probe(directory)
                 probe.sample_failure_cgroup(worker,owner)
-                # Both 16 and 512 MiB are legitimate active-OOM stages; 32 MiB
-                # belongs only to early OOM and is now a producer contradiction.
+                # Both 16 and 512 MiB are legitimate active-OOM stages; old
+                # configured32 belongs to neither accepted OOM fixture now.
                 (cg/'memory.max').write_text('536870912')
                 if mode in ('cpu.max','memory.max','memory.swap.max','memory.events'):(cg/mode).write_text('PRIVATE-CANARY')
                 probe.cgroup=Mock(side_effect=[None,cg]+[cg/'foreign' if mode=='path-during-read' else cg]*30)
@@ -1017,17 +1017,75 @@ class FailureProof(unittest.TestCase):
         self.assertEqual(probe.result['error'],'RuntimeError')
         self.assertNotIn('PRIVATE-CANARY',json.dumps(probe.result))
 
-    def test_cli_oom_active_defaults_to_exact_16_mib_without_changing_other_modes(self):
+    def test_cli_oom_modes_default_to_fixed_16_mib_and_enospc_stays_32(self):
         from types import SimpleNamespace
         from unittest.mock import Mock
         import run_resource_failures as module
-        for mode,expected in (('oom-active',16),('oom',32),('enospc',32)):
+        for mode,expected in (('oom-active',16),('oom',16),('enospc',32)):
             with self.subTest(mode=mode):
                 probe=SimpleNamespace(result={},run=Mock(),cleanup=Mock())
                 argv=['fixture','--source','/unused','--runtime','/unused','--minio-binary','/unused','--image','candidate','--mode',mode]
                 with patch('sys.argv',argv),patch.object(module.os,'sched_setaffinity'),patch.object(module,'FailureProbe',return_value=probe) as create:
                     self.assertEqual(module.main(),0)
                     self.assertEqual(create.call_args.args[0].memory_mib,expected)
+                    self.assertEqual(create.call_args.args[0].mode,mode)
+                probe.run.assert_called_once_with();probe.cleanup.assert_called_once_with()
+
+    def test_cli_explicit_configured_early_16_mib_reaches_probe(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        import run_resource_failures as module
+        probe=SimpleNamespace(result={},run=Mock(),cleanup=Mock())
+        argv=['fixture','--source','/unused','--runtime','/unused','--minio-binary','/unused','--image','candidate',
+              '--mode','oom','--memory-mib','16']
+        with patch('sys.argv',argv),patch.object(module.os,'sched_setaffinity') as affinity,patch.object(module,'FailureProbe',return_value=probe) as create:
+            self.assertEqual(module.main(),0)
+            self.assertEqual(create.call_args.args[0].memory_mib,16)
+            affinity.assert_called_once_with(0,{0,1})
+        probe.run.assert_called_once_with();probe.cleanup.assert_called_once_with()
+
+    def test_cli_rejects_every_non16_early_cap_before_affinity_or_probe(self):
+        import contextlib,io
+        import run_resource_failures as module
+        for cap in (-1,0,15,17,32,64,128,129):
+            argv=['fixture','--source','/unused','--runtime','/unused','--minio-binary','/unused','--image','candidate',
+                  '--mode','oom','--memory-mib',str(cap)]
+            stderr=io.StringIO()
+            with self.subTest(cap=cap),patch('sys.argv',argv),patch.object(module.os,'sched_setaffinity') as affinity,patch.object(module,'FailureProbe') as create,contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as caught:module.main()
+                self.assertEqual(caught.exception.code,2)
+                self.assertIn('--mode oom requires --memory-mib 16',stderr.getvalue())
+                affinity.assert_not_called();create.assert_not_called()
+
+    def test_cli_other_mode_cap_and_range_controls_are_unchanged(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        import run_resource_failures as module
+        for mode,cap,accepted in (('oom-active',16,True),('oom-active',32,False),
+                                  ('enospc',16,True),('enospc',32,True),('enospc',128,True),
+                                  ('enospc',15,False),('enospc',129,False)):
+            argv=['fixture','--source','/unused','--runtime','/unused','--minio-binary','/unused','--image','candidate',
+                  '--mode',mode,'--memory-mib',str(cap)]
+            probe=SimpleNamespace(result={},run=Mock(),cleanup=Mock())
+            with self.subTest(mode=mode,cap=cap),patch('sys.argv',argv),patch.object(module.os,'sched_setaffinity') as affinity,patch.object(module,'FailureProbe',return_value=probe) as create:
+                if accepted:
+                    self.assertEqual(module.main(),0)
+                    self.assertEqual(create.call_args.args[0].memory_mib,cap)
+                    probe.run.assert_called_once_with();probe.cleanup.assert_called_once_with()
+                else:
+                    with self.assertRaises(AssertionError):module.main()
+                    affinity.assert_not_called();create.assert_not_called()
+                    probe.run.assert_not_called();probe.cleanup.assert_not_called()
+
+    def test_cli_parser_rejects_malformed_cap_before_affinity_or_probe(self):
+        import contextlib,io
+        import run_resource_failures as module
+        argv=['fixture','--source','/unused','--runtime','/unused','--minio-binary','/unused','--image','candidate',
+              '--mode','oom','--memory-mib','not-an-integer']
+        with patch('sys.argv',argv),patch.object(module.os,'sched_setaffinity') as affinity,patch.object(module,'FailureProbe') as create,contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:module.main()
+            self.assertEqual(caught.exception.code,2)
+            affinity.assert_not_called();create.assert_not_called()
 
     def test_engine_event_bounds_use_outward_unix_seconds(self):
         import run_resource_failures

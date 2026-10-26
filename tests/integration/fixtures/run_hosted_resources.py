@@ -25,7 +25,7 @@ CASES=('scheduler','oom-active','enospc','oom')
 
 def case_settings(case):
     if case not in CASES:raise ValueError('unsupported resource case')
-    return {'mode':case,'memory_mib':16 if case=='oom-active' else 32}
+    return {'mode':case,'memory_mib':16 if case in ('oom','oom-active') else 32}
 
 
 def numeric_fields(value,keys):
@@ -260,14 +260,14 @@ def verify_early_oom(raw,image):
     state=worker.get('State')
     assert isinstance(state,dict) and state.get('OOMKilled') is True, 'early_oom_worker_oom'
     assert state.get('Running') is False and type(state.get('Pid')) is int and state['Pid']==0, 'early_oom_worker_terminal'
-    assert worker['HostConfig']['Memory']==33554432 and worker['HostConfig']['NanoCpus']==2000000000
+    assert worker['HostConfig']['Memory']==16777216 and worker['HostConfig']['NanoCpus']==2000000000
     verify_early_oom_owners(raw,last,worker)
     rows=raw['failure_cgroup_samples']
-    assert rows and all(r['cpu.max']=='200000 100000' and r['memory.max']=='33554432' for r in rows)
+    assert rows and all(r['cpu.max']=='200000 100000' and r['memory.max']=='16777216' for r in rows)
     assert max(kv_numbers(row['memory.events']).get('oom_kill',0) for row in rows)>0
     assert not any('pg_dump' in str(e.get('action','')) or 'pg_dump' in str(e.get('execCommand','')) for e in raw['source_exec_events'])
     assert raw['source_after']['identity_unchanged'] and raw['source_after']['read_write_ok']
-    return {'verified':True,'before_source_only':True,'configured_memory_bytes':33554432,'active_export_support_claimed':False}
+    return {'verified':True,'before_source_only':True,'configured_memory_bytes':16777216,'active_export_support_claimed':False}
 
 
 class BoundEvidence:

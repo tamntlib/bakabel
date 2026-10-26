@@ -911,8 +911,9 @@ class HostedResources(unittest.TestCase):
     def test_required_cases_include_lifecycle_and_real_fault_variants(self):
         module=self.module()
         self.assertEqual(module.CASES,('scheduler','oom-active','enospc','oom'))
+        self.assertEqual(module.case_settings('scheduler'),{'mode':'scheduler','memory_mib':32})
         self.assertEqual(module.case_settings('oom-active'),{'mode':'oom-active','memory_mib':16})
-        self.assertEqual(module.case_settings('oom'),{'mode':'oom','memory_mib':32})
+        self.assertEqual(module.case_settings('oom'),{'mode':'oom','memory_mib':16})
         self.assertEqual(module.case_settings('enospc'),{'mode':'enospc','memory_mib':32})
         with self.assertRaises(ValueError):module.case_settings('invented')
 
@@ -934,6 +935,7 @@ class HostedResources(unittest.TestCase):
         workflow.go saves active intent before CreateWorker, then the exact ID,
         then start authorization. Record's omitempty omits both zero values.
         These are source-derived fixtures, not recovered historical owner rows.
+        Configured16 is synthetic here, not proof of a hosted replacement PASS.
         """
         run='b'*32;cid='a'*64;name='bakabel-worker-'+run;daemon='unit-daemon'
         intent={'runID':run,'daemonID':daemon,'workerName':name,'phase':'intent','status':'active'}
@@ -944,10 +946,49 @@ class HostedResources(unittest.TestCase):
                 'source_never_started':True,'session_count':0,'last_result':{'runID':run,'status':'failed'}},
             'worker_last_inspect':{'Id':cid,'Name':'/'+name,'Image':'candidate',
                 'State':{'Status':'exited','Running':False,'Pid':0,'ExitCode':137,'OOMKilled':True},
-                'HostConfig':{'Memory':33554432,'NanoCpus':2000000000}},
+                'HostConfig':{'Memory':16777216,'NanoCpus':2000000000}},
             'owner_history':[{'owner':owner} for owner in owners],
-            'failure_cgroup_samples':[{'cpu.max':'200000 100000','memory.max':'33554432','memory.events':'oom_kill 1'}],
+            'failure_cgroup_samples':[{'cpu.max':'200000 100000','memory.max':'16777216','memory.events':'oom_kill 1'}],
             'source_exec_events':[],'source_after':{'identity_unchanged':True,'read_write_ok':True},'snapshots_after_failure':[]}
+
+    def test_configured_early_oom_reports_fixed_16_mib_expectation(self):
+        self.assertEqual(self.module().verify_early_oom(self.early_oom_receipt(),'candidate'),
+                         {'verified':True,'before_source_only':True,'configured_memory_bytes':16777216,
+                          'active_export_support_claimed':False})
+
+    def test_configured_early_oom_rejects_old_32_mib_hostconfig(self):
+        raw=self.early_oom_receipt();raw['worker_last_inspect']['HostConfig']['Memory']=33554432
+        with self.assertRaises(AssertionError):self.module().verify_early_oom(raw,'candidate')
+
+    def test_configured_early_oom_rejects_old_32_mib_kernel_limit(self):
+        raw=self.early_oom_receipt();raw['failure_cgroup_samples'][0]['memory.max']='33554432'
+        with self.assertRaises(AssertionError):self.module().verify_early_oom(raw,'candidate')
+
+    def test_configured_early_oom_rejects_old_32_mib_even_when_both_agree(self):
+        raw=self.early_oom_receipt();raw['worker_last_inspect']['HostConfig']['Memory']=33554432
+        raw['failure_cgroup_samples'][0]['memory.max']='33554432'
+        with self.assertRaises(AssertionError):self.module().verify_early_oom(raw,'candidate')
+
+    def test_configured_early_oom_rejects_malformed_missing_or_mixed_caps(self):
+        module=self.module()
+        for value in (None,False,0,536870912,'16777216','',[]):
+            raw=self.early_oom_receipt();raw['worker_last_inspect']['HostConfig']['Memory']=value
+            with self.subTest(host=value),self.assertRaises(AssertionError):module.verify_early_oom(raw,'candidate')
+        for value in (None,False,0,16777216,'536870912','max','','invalid',[]):
+            raw=self.early_oom_receipt();raw['failure_cgroup_samples'][0]['memory.max']=value
+            with self.subTest(kernel=value),self.assertRaises(AssertionError):module.verify_early_oom(raw,'candidate')
+        for where,key in (('host','Memory'),('kernel','memory.max')):
+            raw=self.early_oom_receipt()
+            target=raw['worker_last_inspect']['HostConfig'] if where=='host' else raw['failure_cgroup_samples'][0]
+            del target[key]
+            with self.subTest(missing=key),self.assertRaises((AssertionError,KeyError)):module.verify_early_oom(raw,'candidate')
+        for wrong in ('33554432','536870912','max',''):
+            for index in (0,1):
+                raw=self.early_oom_receipt();raw['failure_cgroup_samples']*=2
+                raw['failure_cgroup_samples'][index]={**raw['failure_cgroup_samples'][index],'memory.max':wrong}
+                with self.subTest(mixed=wrong,index=index),self.assertRaises(AssertionError):module.verify_early_oom(raw,'candidate')
+        raw=self.early_oom_receipt();raw['failure_cgroup_samples']=[]
+        with self.assertRaises(AssertionError):module.verify_early_oom(raw,'candidate')
 
     def test_early_oom_accepts_serialized_intent_before_worker_create(self):
         module=self.module()

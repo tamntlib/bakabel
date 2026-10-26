@@ -32,7 +32,7 @@ The first twelve rows passed on hosted run `40292564391` at commit `c50cf16e9dd8
 | F10 | Restore-import start response lost | §6; §7 | `restore-start-response-loss`: PASS on `c50cf16`, run above. |
 | F11 | Backup versus public restore / retention-configured run | §7; §10 | `backup-vs-restore-and-retention`: PASS on `c50cf16`. No standalone maintenance CLI is invented. |
 | F12 | Controller kill and two scheduler restarts preserve original deadline/worker/job and last success | §7; §10 | `scheduler-restart-original-deadline`: PASS on `c50cf16`, run above. |
-| F13 | Kill exactly after persisted exec ID but before start forwarding | §5.2 | Separate experiment still missing; response-loss cases bracket but do not replace this instance. |
+| F13 | Kill exactly after persisted exec ID but before start forwarding | §5.2 | `dump-persisted-before-start-worker-SIGKILL`: PASS on `97b9611`, hosted run `40365486870`; exact retained quarantine, **not** terminal exec success, ownership release or production fencing. See the preserved attempt below. |
 | F14 | Restore reader failure with otherwise valid import | §6; §10 | Current reader/import exit-status unit/API coverage retained; current public fault experiment still missing. |
 | F15 | Worker dies during observable active import; independent import-token terminal recovery | §6; §10 | Current orchestration experiment still missing; retain existing API cancellation evidence. |
 | F16 | Genuine Restic exit 3: snapshot ID **and** error, partial/unknown refusal | §5.4; §10 | Historical real exit-3 and current status tests retained; current-workflow generated partial receipt still missing. Operator retagging is not this case. |
@@ -51,7 +51,7 @@ Source-task replacement, wrong credentials, wrong repository password, missing r
 |---|---|---|
 | R01 | Real scheduling, restart/adoption, original deadline, readonly failed/overdue health | `run_hosted_resources.py --case scheduler`, eight named verifier gates; hosted replay pending. |
 | R02 | Active-export OOM failure safety | `--case oom-active`, actual 16MiB injection; hosted replay pending. |
-| R03 | Configured small-cap early OOM | `--case oom`, actual 32MiB before-source failure safety only; hosted replay pending. |
+| R03 | Configured small-cap early OOM | `--case oom`, fixed configured16MiB replacement candidate; **UNPROVEN**, before-source failure safety only. Actual hosted attempt and independent verification pending; historical32 failures remain failed. |
 | R04 | Actual repository ENOSPC | `--case enospc`, 8MiB bounded repository; hosted replay pending. Does not close F19/F20. |
 | C01 | Larger mixed repository and distinct index entries | `run_hosted_capacity.py`: declared 1GiB/8192-file corpus plus 400000 PG rows; actual decoded index/stats and repository check. Hosted run pending. |
 | C02 | Unchanged backup selects exact parent, zero new file data | Independent second worker, full identity/summary assertions; hosted run pending. |
@@ -62,7 +62,82 @@ Source-task replacement, wrong credentials, wrong repository password, missing r
 
 Capacity reports must retain worker/scheduler/source/restore scope separately, actual image/binary/helper-image overhead, sampled tmp/state/log footprints, persistent S3/source/target storage and exact cleanup. Missing counters and exit-race observations are not zero measurements. Host physical-device attribution, continuous process-birth affinity, arbitrary repository size, universal 512MiB sufficiency, scheduler-128MiB sufficiency and universal RTO are **not** requirements or promises established by these fixtures. PLAN §8 explicitly forbids invented premeasurement RAM thresholds.
 
+## Configured early OOM fixture correction
+
+The current fixture explicitly changes32→16MiB, not a production sizing
+requirement or a verifier-only repair. The earliest Git-recorded standalone
+default32 is `ac2d0a6` (accepted range16..128); `04cc2ca` fixed hosted selection
+and inspect/kernel expectations at32, and `3a36f6b` recorded R03. PLAN §8
+requires configurable measured ceilings and forbids invented MB thresholds;
+it does not prescribe32 or promise OOM at any cap. Independent read-only
+contract review of `3ca6aec9c42115980902be98ee3f939734b21d21` accepted16 only
+as an unproved candidate. This correction does not reinterpret historical32
+attempts, the R3 evidence above or the B4 handoff.
+
+Configured16 remains **UNPROVEN** pending one fixed hosted attempt on the exact
+reviewed revision and independent source/image/daemon/artifact-bound verification.
+All substantive gates remain: positive exact-worker kernel `oom_kill` plus
+terminal OOMKilled=true/Running=false/PID0; legitimate monotonic prebinding to
+exact bound intent-only owner history; no source/exec identity or pg_dump event;
+matching sessions0; durable failed-not-complete and empty native snapshots;
+unchanged source StartedAt/RestartCount with real read/write availability;
+fatal observer errors, quiescent observers and exact cleanup. Preserve the
+ordinary image/core,2CPU,200000-row corpus, fresh empty128MiB repository,
+ordinary swap policy and20s controller/3s terminal/45s job windows. Active
+512→16 and ENOSPC are unchanged separate cases. No cap ladder, automatic retry,
+corpus/deadline relaxation or gate weakening is permitted. If16 fails, R03
+stays red; a future16 PASS would not relabel32 or establish production sizing.
+
 ## Preserved new failed attempts
+
+Run `40369174738` at `3ca6aec9c42115980902be98ee3f939734b21d21`
+remains **FAIL** overall. Configured early32 failed the unchanged20-second
+controller-exit wait before its verifier (`run_resource_failures.py:471` →
+`run_resource_probe.py:390,360`). Its2,831 samples had maximum `oom_kill=0`,
+inspect OOMKilled=false and actual33554432 bytes. The last captured worker
+was Running=true/PID66867; separately the last identity-matching owner was
+exec_started with start authorization true and source/exec present. These
+historical captures are not necessarily simultaneous or the failure-time/current
+state. No direct PG Lock-wait proof was retained; exit0 is not completion or
+terminality proof. Public receipts emitted scheduler/active-OOM/ENOSPC verified
+results, not a fresh private-input/Engine re-verification. Earlier133/97
+terminality and non-OOM causes remain unknown as recorded below. Retained
+parent audit SHA-256:
+`1a8d23db56ae37158119095731494aec0ffe2b1a54f80b0b115976bb6284bb3b`.
+
+Run `40365486870` at `97b9611bf38672281a430e03b28cd68b751dbb26`
+remains failed overall; CI `40365486241` passed. The exact frozen fault
+verifier accepted all 13 cases, the aggregate and its CLI (exit 0), including
+F13's actual persisted-before-forwarding interruption. Its one held request
+contained 261 bytes; all correlated starts remained unforwarded and unanswered.
+Three exact exec observations retained raw nullable exit state, while the owned
+worker was observed live and then terminal with exit 137. A fresh scheduler
+remained blocked without creating a replacement or changing last success/result;
+the source remained online with restart count zero. Exact fixture cleanup
+recorded 10 containers and one volume absent and retained quarantine state.
+This closes F13 only within the tested Compose/local boundary.
+The audit also validated core's 44 public gates, all six capacity gates and
+the recomputed 2,798-sample capacity summary. Resource receipts emitted verified
+scheduler eight-gate, active-OOM and repository-ENOSPC results; ENOSPC recorded
+6,574 real errno-28 observations. Raw private resource inputs were not uploaded,
+so that part of the independent offline audit checks public consistency, not a
+fresh execution of private verification or Engine cleanup.
+Configured early 32MiB OOM again failed the 20-second **controller-exit wait**
+before reaching the early verifier. Its 2,965 samples recorded no positive
+`oom_kill`; the projected worker exit zero does not prove termination or backup
+completion because Running/PID were omitted. Its execution stage and cause of
+non-OOM remain unknown. Retained audit SHA-256:
+`ee4186dc65c0c31db384104bc6026e9fc97d8f0311512d1b41f5675ec67ee375`.
+
+Run `40360630725` at `133dcf0ac9985dcf2add006b2e7bd8e510b7df3b`
+also remains failed overall despite successful CI `40360629715`, core 44,
+capacity six, faults 12 and emitted scheduler/active-OOM/repository-ENOSPC
+verification. Early 32MiB OOM hit the same 20-second controller-exit wait
+before its verifier; 2,837 sampled observations had no positive `oom_kill`.
+Worker terminality and the cause of non-OOM are unknown, not inferred from the
+public exit-zero placeholder. This is distinct from the earlier owner-history
+KeyError. Retained audit SHA-256:
+`5150b18b31c4347c9d7dfd6a09bac9d84469889eccab6fdf8c2104820e6a9dcf`.
 
 Run `40343287948` at `a81622e3e17dda0abb830614dadf320f3aa2b2b1`
 retains independent core 44, capacity six, faults 12, scheduler eight,
