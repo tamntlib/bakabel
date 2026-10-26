@@ -317,6 +317,122 @@ class RelayTests(unittest.TestCase):
                 relay.close(); thread.join(2); server.close()
 
 
+class PersistedStartRelayTests(unittest.TestCase):
+    # Real Unix peers; no Docker claims and no positive response for start.
+    module = RelayTests.module
+    exchange = RelayTests.exchange
+
+    def test_hold_discard_timeout_and_cleanup_never_connect_or_send_start(self):
+        import time
+        m = self.module()
+        for ending in ('worker-terminal', 'watchdog', 'cleanup'):
+            with self.subTest(ending=ending), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); eid = 'a'*64; cid = 'b'*64
+                upstream = socket.socket(socket.AF_UNIX); upstream.bind(str(root/'back')); upstream.listen(); upstream.settimeout(.1)
+                relay = m.FaultRelay(root/'front', root/'back'); relay.start()
+                owner = {'runID':'c'*32,'daemonID':'daemon','workerContainerID':'d'*64,
+                         'workerName':'bakabel-worker-'+'c'*32,'workerStartAuthorized':True,
+                         'sourceContainerID':cid,'sourceStartedAt':'source-start','targetID':'e'*64,
+                         'execID':eid,'execKind':'dump','phase':'exec_started','status':'active'}
+                relay.observer = lambda phase, record: record.update(owner_checkpoint=(dict(owner) if record['boundary'] == 'dump-start' else {**owner,'phase':'creating_exec','execID':''})) if phase == 'request' else None
+                replies = []; errors = []
+                try:
+                    self.assertTrue(hasattr(relay, 'discard_start'), 'need bounded pre-forward hold/discard seam')
+                    relay.arm('dump-start','hold-before-forward',hold_seconds=.2 if ending == 'watchdog' else 2)
+                    # Actual create/201 through the same relay populates exact wrapper authority.
+                    created = json.dumps({'Id':eid}).encode()
+                    def create_peer():
+                        conn, _ = upstream.accept()
+                        with conn:
+                            _, _, headers = m.read_headers(conn); m.read_exact(conn,int(headers['content-length']))
+                            conn.sendall(b'HTTP/1.1 201 Created\r\nContent-Length: '+str(len(created)).encode()+b'\r\n\r\n'+created)
+                    peer = threading.Thread(target=create_peer); peer.start()
+                    self.exchange(relay,'/containers/'+cid+'/exec',json.dumps(wrapped_dump()).encode()); peer.join(1)
+                    def start():
+                        try: replies.append(self.exchange(relay,'/v1.55/exec/'+eid+'/start',b'{"Detach":false,"Tty":false}'))
+                        except Exception as exc: errors.append(type(exc).__name__)
+                    client = threading.Thread(target=start); client.start()
+                    self.assertTrue(relay.hit.wait(1))
+                    # Snapshot takes relay.lock while hold is pending: must not deadlock.
+                    snapshots = []; reader = threading.Thread(target=lambda: snapshots.append(relay.snapshot())); reader.start(); reader.join(.2)
+                    self.assertFalse(reader.is_alive(), 'hold retained relay lock')
+                    self.assertEqual(snapshots[0]['records'][-1]['hold_state'],'held')
+                    created_record=snapshots[0]['records'][0]
+                    self.assertEqual(created_record['producer_contract'],'wrapped-dump-v1')
+                    self.assertEqual(created_record['producer_run_id'],owner['runID'])
+                    self.assertEqual(created_record['command_sha256'],snapshots[0]['records'][-1]['command_sha256'])
+                    with self.assertRaises(socket.timeout): upstream.accept()
+                    if ending == 'worker-terminal': relay.discard_start(eid)
+                    elif ending == 'cleanup': relay.close()
+                    client.join(2); self.assertFalse(client.is_alive())
+                    self.assertEqual(errors,[]); self.assertEqual(replies,[b''])
+                    snap = relay.snapshot(); record = snap['records'][-1]
+                    self.assertEqual(snap.get('denied_start'),eid)
+                    self.assertIs(record['forwarded'],False); self.assertNotIn('status',record)
+                    self.assertEqual(record['hold_state'], {'worker-terminal':'discarded','watchdog':'expired','cleanup':'closed'}[ending])
+                    self.assertLessEqual(record['held_bytes'],65536+4096)
+                    if ending != 'cleanup':
+                        relay.recover_transport()  # Existing status recovery cannot authorize a late start.
+                        self.assertEqual(self.exchange(relay,'/exec/'+eid+'/start',b'{"Detach":false,"Tty":false}'),b'')
+                        self.assertEqual(relay.snapshot()['records'][-1]['fault'],'start-transport-refused')
+                    with self.assertRaises(socket.timeout): upstream.accept()
+                    for secret in ('Cmd','Env','run=$1',"dbname='fixture'"):
+                        self.assertNotIn(secret,json.dumps(snap))
+                finally:
+                    relay.close(); upstream.close()
+
+
+    def test_hold_denies_racing_retry_before_observer_returns_and_rejects_unbound_checkpoint(self):
+        m = self.module()
+        for violation in (None,'execID','runID','targetID','phase','workerContainerID','sourceContainerID','daemonID','legacy'):
+            with self.subTest(violation=violation), tempfile.TemporaryDirectory() as directory:
+                root=Path(directory); eid='a'*64; cid='b'*64
+                upstream=socket.socket(socket.AF_UNIX); upstream.bind(str(root/'back')); upstream.listen(); upstream.settimeout(.1)
+                relay=m.FaultRelay(root/'front',root/'back'); relay.start()
+                arrived=threading.Event(); proceed=threading.Event()
+                owner={'runID':'c'*32,'daemonID':'daemon','workerContainerID':'d'*64,'workerName':'bakabel-worker-'+'c'*32,
+                       'workerStartAuthorized':True,'sourceContainerID':cid,'sourceStartedAt':'start','targetID':'e'*64,
+                       'execID':eid,'execKind':'dump','phase':'exec_started','status':'active'}
+                relay.execs[eid]={'kind':'dump','container_id':cid,'stdout_bytes':0,'stdin_bytes':0}
+                create_owner={**owner,'execID':'','phase':'creating_exec'}
+                relay.dump_bindings[eid]={'run_id':owner['runID'],'command_sha256':'f'*64,'owner_checkpoint':create_owner}
+                relay.records=[{'boundary':'dump-create','forwarded':True,'status':201,'exec_id':eid,'container_id':cid,'owner_checkpoint':create_owner}]
+                if violation == 'legacy': relay.dump_bindings.clear()
+                elif violation: owner[violation]='wrong'
+                def observe(phase,record):
+                    record['owner_checkpoint']=dict(owner); arrived.set(); proceed.wait(1)
+                relay.observer=observe
+                out=[]
+                try:
+                    relay.arm('dump-start','hold-before-forward',hold_seconds=1)
+                    thread=threading.Thread(target=lambda: out.append(self.exchange(relay,'/exec/'+eid+'/start',b'{"Detach":false,"Tty":false}'))); thread.start()
+                    self.assertTrue(arrived.wait(1))
+                    self.assertEqual(self.exchange(relay,'/exec/'+eid+'/start',b'{"Detach":false,"Tty":false}'),b'')
+                    with self.assertRaises(socket.timeout): upstream.accept()
+                    proceed.set()
+                    if violation is None:
+                        self.assertTrue(relay.hit.wait(1)); relay.discard_start(eid)
+                    thread.join(2); self.assertFalse(thread.is_alive()); self.assertEqual(out,[b''])
+                    if violation: self.assertFalse(relay.hit.is_set())
+                    with self.assertRaises(socket.timeout): upstream.accept()
+                finally: proceed.set(); relay.close(); upstream.close()
+
+    def test_hold_rejects_oversized_body_before_read_and_invalid_wait_bounds(self):
+        m=self.module()
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory); relay=m.FaultRelay(root/'front',root/'absent'); relay.start()
+            try:
+                for value in (True,0,-1,11,float('inf'),float('nan')):
+                    with self.subTest(value=value), self.assertRaises(ValueError): relay.arm('dump-start','hold-before-forward',hold_seconds=value)
+                relay.arm('dump-start','hold-before-forward')
+                with socket.socket(socket.AF_UNIX) as client:
+                    client.settimeout(.5);client.connect(str(relay.path))
+                    client.sendall(b'POST /exec/'+b'a'*64+b'/start HTTP/1.1\r\nContent-Length: 4097\r\n\r\n')
+                    self.assertEqual(client.recv(1),b'')
+                self.assertFalse(relay.hit.is_set())
+            finally: relay.close()
+
+
 class FixtureContracts(unittest.TestCase):
     def module(self):
         m = importlib.import_module('run_hosted_faults')
@@ -792,7 +908,7 @@ class FixtureContracts(unittest.TestCase):
             events = []
             probe.prepare = lambda: events.append('prepare')
             probe.verify_source_online = lambda: events.append('source-online')
-            for name in ('exercise_stream_fault','exercise_stream_drop','exercise_response_loss','exercise_overlap','exercise_restart'):
+            for name in ('exercise_stream_fault','exercise_stream_drop','exercise_response_loss','exercise_overlap','exercise_restart','exercise_persisted_start'):
                 setattr(probe, name, lambda name=name: events.append(name))
             probe.run()
             self.assertEqual(events[0], 'prepare'); self.assertEqual(events[-1], 'source-online')
@@ -1224,6 +1340,350 @@ class VerifierTests(unittest.TestCase):
         with self.assertRaises(ValueError): m.verify_case(broken)
         broken = json.loads(json.dumps(record)); broken['proof']['outcome'] = 'recovered'
         with self.assertRaises(ValueError): m.verify_case(broken)
+
+
+class PersistedStartVerifierTests(unittest.TestCase):
+    def receipt(self):
+        # Fabricated OFFLINE verifier input, never an execution receipt.
+        owner={'runID':'e'*32,'daemonID':'daemon','workerContainerID':'b'*64,'workerName':'bakabel-worker-'+'e'*32,
+               'workerStartAuthorized':True,'targetID':'f'*64,'sourceContainerID':'c'*64,'sourceStartedAt':'source-start',
+               'execID':'d'*64,'execKind':'dump','phase':'exec_started','status':'active'}
+        create={'boundary':'dump-create','method':'POST','forwarded':True,'status':201,'exec_id':'d'*64,'container_id':'c'*64,
+                'owner_checkpoint':{**owner,'phase':'creating_exec','execID':''}}
+        held={'boundary':'dump-start','method':'POST','forwarded':False,'exec_id':'d'*64,'container_id':'c'*64,
+              'owner_checkpoint':owner,'fault':'hold-before-forward','hold_state':'discarded','held_bytes':200,
+              'producer_contract':'wrapped-dump-v1','command_sha256':'a'*64}
+        terminal={'daemon':'daemon','container_id':'c'*64,'started_at':'source-start','exec_id':'d'*64,
+                  'running':False,'pid':0,'exit_code':None,'exit_state':'null','command_sha256':'a'*64,'sessions':0,'processes':0}
+        row=VerifierTests().worker_loss_receipt('dump-persisted-before-start-worker-SIGKILL')
+        row['source']['restart_count']=0
+        row['workers']['b'*64].update(run_id=owner['runID'],**{'cpu.max':'200000 100000','memory.max':'536870912'})
+        row['injection']={**held,'hold_state':'held'}
+        row['relay']={'records':[create,held],'errors':[],'workers':['b'*64],'denied_start':'d'*64,
+                      'execs':{'d'*64:{'kind':'dump','container_id':'c'*64,'stdin_bytes':0,'stdout_bytes':0}}}
+        create.update(producer_contract='wrapped-dump-v1',producer_run_id=owner['runID'],command_sha256='a'*64)
+        terminal['restart_count']=0
+        row['cleanup'].update(quarantine_state_retained=True,source_removed_only_after_gate=True)
+        row['cleanup']['containers_absent']['c'*64]=True
+        row['proof']={'outcome':'quarantined','owner_retained':True,'fresh_cli_blocked':True,'exec_never_started':True,
+                      'persisted_exec_id':True,'fault_forwarded':False,'last_success_unchanged':True,'last_result_unchanged':True,
+                      'no_complete_snapshot':True,'cli_exit':1,'fresh_cli_exit':1,
+                      'owner_before_kill':owner,'owner_after_kill':owner,
+                      'owner_quarantine':{**owner,'phase':'quarantine','status':'blocked'},
+                      'owner_fresh':{**owner,'phase':'quarantine','status':'blocked'},
+                      'exec_observations':[dict(terminal) for _ in range(3)],
+                      'worker_observations':[{'container_id':'b'*64,'running':True,'pid':123,'exit_code':None},
+                                             {'container_id':'b'*64,'running':False,'pid':0,'exit_code':137},
+                                             {'container_id':'b'*64,'running':False,'pid':0,'exit_code':137}],
+                      'workers_before_fresh':['b'*64],'workers_after_fresh':['b'*64],
+                      'events':['persisted-start-held','prekill-checked','worker-kill-requested','worker-terminal-137',
+                                'start-discarded','quarantine-retained','fresh-scheduler-quarantine','source-online-before-cleanup','owned-cleanup']}
+        return row
+
+    def test_held_and_injection_exec_agreement_cannot_replace_durable_exec_identity(self):
+        m=importlib.import_module('verify_hosted_faults')
+        row=json.loads(json.dumps(self.receipt()))  # Break shared checkpoint aliases as on disk.
+        m.verify_case(row)
+        owner=json.loads(json.dumps(row['injection']['owner_checkpoint']))
+        row['relay']['records'][1]['exec_id']=row['injection']['exec_id']='9'*64
+        self.assertEqual(row['injection']['owner_checkpoint'],owner)
+        self.assertNotEqual(row['injection']['exec_id'],owner['execID'])
+        with self.assertRaises(ValueError):m.verify_case(row)
+
+    def test_held_and_injection_source_agreement_cannot_replace_durable_source_identity(self):
+        m=importlib.import_module('verify_hosted_faults')
+        row=json.loads(json.dumps(self.receipt()))
+        m.verify_case(row)
+        owner=json.loads(json.dumps(row['injection']['owner_checkpoint']))
+        row['relay']['records'][1]['container_id']=row['injection']['container_id']='8'*64
+        self.assertEqual(row['injection']['owner_checkpoint'],owner)
+        self.assertNotEqual(row['injection']['container_id'],owner['sourceContainerID'])
+        with self.assertRaises(ValueError):m.verify_case(row)
+
+    def test_correlated_retry_cannot_claim_a_different_exec(self):
+        m=importlib.import_module('verify_hosted_faults')
+        for correlation in ('owner-run','command'):
+            for forwarded in (False,True):
+                with self.subTest(correlation=correlation,forwarded=forwarded):
+                    row=json.loads(json.dumps(self.receipt()))
+                    held=row['relay']['records'][1]
+                    retry={'boundary':'dump-start','method':'POST','forwarded':False,
+                           'exec_id':held['exec_id'],'container_id':held['container_id'],
+                           'fault':'start-transport-refused'}
+                    if correlation == 'owner-run':retry['owner_checkpoint']=dict(held['owner_checkpoint'])
+                    else:retry['command_sha256']=held['command_sha256']
+                    row['relay']['records'].append(retry)
+                    m.verify_case(row)  # Correctly bound retry is valid, including no HTTP response.
+                    retry.update(exec_id='9'*64,forwarded=forwarded)
+                    if forwarded:retry['status']=101
+                    with self.assertRaises(ValueError):m.verify_case(row)
+
+    def test_retry_cannot_claim_a_different_source(self):
+        m=importlib.import_module('verify_hosted_faults')
+        row=json.loads(json.dumps(self.receipt()))
+        owner=row['injection']['owner_checkpoint']
+        # Same-run worker launch is not a dump retry and must remain accepted.
+        row['relay']['records'].insert(0,{'boundary':'worker-start','method':'POST','forwarded':True,
+                                          'status':204,'container_id':owner['workerContainerID'],
+                                          'owner_checkpoint':dict(owner)})
+        retry={'boundary':'dump-start','method':'POST','forwarded':False,'exec_id':owner['execID'],
+               'container_id':owner['sourceContainerID'],'fault':'start-transport-refused'}
+        row['relay']['records'].append(retry)
+        m.verify_case(row)  # Real denied retries have no observer checkpoint or command annotation.
+        retry['container_id']='8'*64
+        with self.assertRaises(ValueError):m.verify_case(row)
+
+    def test_correlated_exec_operation_semantics_cannot_be_relabelled(self):
+        m=importlib.import_module('verify_hosted_faults')
+        # Roundtrip first: receipt/checkpoint aliases must not mask causal mutations.
+        original=json.loads(json.dumps(self.receipt()))
+        m.verify_case(original)
+        owner=original['injection']['owner_checkpoint']
+        retry={'boundary':'dump-start','method':'POST','forwarded':False,
+               'exec_id':owner['execID'],'container_id':owner['sourceContainerID'],
+               'fault':'start-transport-refused'}
+        # Real classifier shapes: the create gains its exec ID from the 201
+        # response, a worker launch has no exec ID, and inspect is GET/other.
+        controls=json.loads(json.dumps(original))
+        controls['relay']['records'].insert(0,{'boundary':'worker-start','method':'POST','forwarded':True,
+                                              'status':204,'container_id':owner['workerContainerID'],
+                                              'owner_checkpoint':dict(owner)})
+        controls['relay']['records'] += [
+            {'boundary':'other','method':'GET','forwarded':True,'status':200,'exec_id':owner['execID']},
+            {'boundary':'other','method':'GET','forwarded':False,'exec_id':owner['execID'],
+             'fault':'status-transport-refused'},
+            {'boundary':'other','method':'POST','forwarded':True,'status':201,'exec_id':'9'*64,
+             'container_id':'8'*64,'owner_checkpoint':{'runID':'7'*32},'command_sha256':'6'*64},
+            dict(retry)]
+        m.verify_case(json.loads(json.dumps(controls)))
+        for boundary in (None,'other','restore-start','worker-start','dump-create','dump-start'):
+            for correlation in ('exec','owner-run','command'):
+                for contradiction in ('forwarded','answered','wrong-source','refused'):
+                    with self.subTest(boundary=boundary,correlation=correlation,contradiction=contradiction):
+                        row=json.loads(json.dumps(original))
+                        candidate=dict(retry)
+                        if correlation == 'owner-run':candidate['owner_checkpoint']=dict(owner)
+                        if correlation == 'command':candidate['command_sha256']='a'*64
+                        row['relay']['records'].append(candidate)
+                        m.verify_case(json.loads(json.dumps(row)))  # Same exact denied retry is valid.
+                        if correlation != 'exec':candidate['exec_id']='9'*64
+                        if boundary is None:candidate.pop('boundary')
+                        else:candidate['boundary']=boundary
+                        if contradiction == 'forwarded':candidate.update(forwarded=True,status=101,fault='none')
+                        elif contradiction == 'answered':candidate['status']=200
+                        elif contradiction == 'wrong-source':candidate['container_id']='8'*64
+                        if (boundary,correlation,contradiction) == ('dump-start','exec','refused'):
+                            m.verify_case(json.loads(json.dumps(row)))
+                        else:
+                            with self.assertRaises(ValueError):m.verify_case(json.loads(json.dumps(row)))
+        # A second create-looking row is not the unique causally verified create,
+        # even when it precedes the hold and copies the creating checkpoint.
+        row=json.loads(json.dumps(original))
+        counterfeit=json.loads(json.dumps(row['relay']['records'][0]));counterfeit['exec_id']='9'*64
+        row['relay']['records'].insert(1,counterfeit)
+        with self.subTest(counterfeit_create=True),self.assertRaises(ValueError):m.verify_case(json.loads(json.dumps(row)))
+        for method in (None,'GET','PUT'):
+            with self.subTest(created_method=method):
+                row=json.loads(json.dumps(original))
+                if method is None:row['relay']['records'][0].pop('method')
+                else:row['relay']['records'][0]['method']=method
+                with self.assertRaises(ValueError):m.verify_case(json.loads(json.dumps(row)))
+            for boundary in (None,'other','dump-start'):
+                for forwarded in (False,True):
+                    with self.subTest(method=method,boundary=boundary,forwarded=forwarded):
+                        row=json.loads(json.dumps(original));candidate=dict(retry)
+                        row['relay']['records'].append(candidate)
+                        m.verify_case(json.loads(json.dumps(row)))
+                        if method is None:candidate.pop('method')
+                        else:candidate['method']=method
+                        if boundary is None:candidate.pop('boundary')
+                        else:candidate['boundary']=boundary
+                        if forwarded:candidate.update(forwarded=True,status=101,fault='none')
+                        with self.assertRaises(ValueError):m.verify_case(json.loads(json.dumps(row)))
+
+    def test_nullable_unstarted_is_distinct_from_create_gap_or_terminal_success(self):
+        m=importlib.import_module('verify_hosted_faults');row=self.receipt()
+        self.assertIn(row['case'],m.CASES,'F13 needs its own public gate')
+        self.assertNotIn(row['case'],m.CREATE_GAPS)
+        m.verify_case(row)
+        for observation in row['proof']['exec_observations']: observation['exit_state']='absent'
+        m.verify_case(row)
+
+    def test_f13_rejects_missing_bindings_wrong_ids_false_zero_forwarding_and_early_cleanup(self):
+        m=importlib.import_module('verify_hosted_faults');m.verify_case(self.receipt())
+        edits=[]
+        for field in ('runID','daemonID','workerContainerID','sourceContainerID','sourceStartedAt','targetID','execID','execKind','phase','workerStartAuthorized'):
+            edits.append((('injection','owner_checkpoint',field),None))
+        for owner in ('owner_before_kill','owner_after_kill','owner_quarantine','owner_fresh'):
+            for field in ('runID','daemonID','workerContainerID','sourceContainerID','sourceStartedAt','targetID','execID'):
+                edits.append((('proof',owner,field),'wrong'))
+        edits += [(('proof','owner_fresh','phase'),'exec_started'),(('proof','fresh_cli_blocked'),False),
+                  (('proof','fresh_cli_exit'),0),(('proof','cli_exit'),0),
+                  (('proof','workers_after_fresh'),['a'*64]),(('relay','workers'),['b'*64,'a'*64]),
+                  (('relay','denied_start'),None),(('relay','denied_start'),'a'*64),
+                  (('source','started_at'),'changed'),(('source','restart_count'),1),(('cleanup','quarantine_state_retained'),False),
+                  (('cleanup','source_removed_only_after_gate'),False),(('proof','last_result_unchanged'),False),
+                  (('proof','events'),['owned-cleanup']), (('proof','no_complete_snapshot'),False),
+                  (('relay','records',0,'status'),200),(('relay','records',0,'owner_checkpoint','targetID'),'a'*64),
+                  (('relay','records',0,'producer_contract'),'legacy'),(('relay','records',0,'command_sha256'),'b'*64),
+                  (('relay','records',0,'producer_run_id'),'a'*32),
+                  (('relay','records',1,'forwarded'),True),(('relay','records',1,'status'),101),
+                  (('relay','records',1,'hold_state'),'expired'),(('relay','records',1,'held_bytes'),999999),
+                  (('relay','execs','d'*64,'stdout_bytes'),1)]
+        for index in range(3):
+            for field,value in (('exit_code',0),('running',True),('pid',1),('sessions',False),('processes',1),('exec_id','a'*64),('command_sha256','b'*64),('restart_count',1)):
+                edits.append((('proof','exec_observations',index,field),value))
+        for index in (1,2):
+            for field,value in (('exit_code',0),('running',True),('pid',1),('container_id','a'*64)):
+                edits.append((('proof','worker_observations',index,field),value))
+        for path,value in edits:
+            row=self.receipt();node=row
+            for key in path[:-1]:node=node[key]
+            node[path[-1]]=value
+            with self.subTest(path=path),self.assertRaises(ValueError):m.verify_case(row)
+        for key in self.receipt()['proof']:
+            row=self.receipt();del row['proof'][key]
+            with self.subTest(missing=key),self.assertRaises(ValueError):m.verify_case(row)
+        row=self.receipt();row['relay']['records'].append({**row['relay']['records'][1],'forwarded':True,'fault':'none'})
+        with self.assertRaises(ValueError):m.verify_case(row)
+
+
+class PersistedStartFixtureTests(unittest.TestCase):
+    @contextlib.contextmanager
+    def probe(self, violation=None):
+        # Deterministic offline lifecycle doubles, not a Docker/API PASS.
+        from unittest.mock import Mock
+        import hashlib
+        m=importlib.import_module('run_hosted_faults');row=PersistedStartVerifierTests().receipt()
+        active=row['injection']['owner_checkpoint'];target='literal-source'
+        target_hash=hashlib.sha256(target.encode()).hexdigest()
+        active['targetID']=target_hash
+        for record in row['relay']['records']:record['owner_checkpoint']['targetID']=target_hash
+        for key in ('owner_before_kill','owner_after_kill','owner_quarantine','owner_fresh'):row['proof'][key]['targetID']=target_hash
+        command=wrapped_dump(active['runID'])['Cmd'];command_hash=hashlib.sha256(json.dumps(command,separators=(',',':')).encode()).hexdigest()
+        row['injection']['command_sha256']=command_hash
+        row['relay']['records'][0]['command_sha256']=command_hash
+        row['relay']['records'][1].update(command_sha256=command_hash,hold_state='held')
+        worker={'Id':'b'*64,'Name':'/'+active['workerName'],'Image':row['image_id'],
+                'Config':{'Labels':{'bakabel.worker':'1','bakabel.run':active['runID'],'bakabel.daemon':'daemon'},'Cmd':['_workflow'],'Entrypoint':['/usr/local/bin/bakabel']},
+                'HostConfig':{'Memory':536870912,'NanoCpus':2000000000},'State':{'Running':True,'Pid':123,'ExitCode':0},
+                'Mounts':[{'Type':'bind','Source':'/owned/relay.sock','Destination':'/run/bakabel/docker.sock','RW':False}]}
+        execution={'ID':'d'*64,'ContainerID':'c'*64,'Running':False,'Pid':0,'ExitCode':None,
+                   'ProcessConfig':{'entrypoint':command[0],'arguments':command[1:]}}
+        source={'Id':'c'*64,'RestartCount':0,'State':{'Running':True,'StartedAt':'source-start'}}
+        current=[dict(active)];events=[]
+        probe=m.FaultProbe.__new__(m.FaultProbe);probe.case=row['case'];probe.target=target;probe.daemon='daemon'
+        probe.image=row['image_id'];probe.sock='/owned/relay.sock';probe.source='c'*64;probe.source_before=row['source']
+        probe.result={'commands':[]};probe.worker_records=row['workers'];probe.worker_owners={};probe.roles={}
+        probe.success_snapshot=Mock(return_value='a'*64);probe.baseline_success='baseline'
+        probe.last=Mock(return_value={'lastBackupSuccessAt':'baseline','runID':'a'*32,'status':'success'})
+        probe.capture_owned_worker=Mock();probe.owner=lambda:dict(current[0])
+        def call(method,path,**kwargs):
+            events.append((method,path))
+            if path=='/info':return {'ID':'daemon'}
+            if path=='/exec/'+'d'*64+'/json':return execution
+            if path=='/containers/'+'b'*64+'/kill?signal=KILL':
+                worker['State']={'Running':False,'Pid':0,'ExitCode':137};return None
+            raise AssertionError('unexpected offline Engine request')
+        probe.e=Mock();probe.e.call.side_effect=call
+        probe.e.inspect.side_effect=lambda cid,**kw: worker if cid=='b'*64 else source
+        probe.sql=Mock(return_value='0');probe.process_count=Mock(return_value=0)
+        probe.no_complete_snapshot=Mock(return_value=True);probe.verify_source_online=Mock()
+        probe.relay=Mock();probe.relay.hit.wait.return_value=True
+        import time
+        probe.relay.held_deadline.side_effect=lambda eid:time.monotonic()+2
+        probe.relay.snapshot.side_effect=lambda:json.loads(json.dumps(row['relay']))
+        def discard(eid):row['relay']['records'][1]['hold_state']='discarded';events.append(('discard',eid))
+        probe.relay.discard_start.side_effect=discard
+        probe.controller=Mock(side_effect=lambda command: 'run-cli' if command=='run' else 'serve-cli')
+        def finish(cid,**kw):
+            current[0]={**current[0],'phase':'quarantine','status':'blocked'}
+            return []
+        probe.finish=Mock(side_effect=finish)
+        probe.wait=lambda fn,*a:fn()
+        if violation=='zero':execution['ExitCode']=0
+        elif violation=='source':source['State']['StartedAt']='changed'
+        elif violation=='worker':worker['Image']='wrong'
+        elif violation=='target':current[0]['targetID']='a'*64
+        elif violation=='forwarded':row['relay']['records'][1]['forwarded']=True
+        elif violation=='expired':row['relay']['records'][1]['hold_state']='expired'
+        elif violation=='command':execution['ProcessConfig']['arguments']=['private-canary']
+        yield probe,events,row,execution
+
+    def test_public_case_kills_only_exact_worker_then_discards_and_keeps_fresh_quarantine(self):
+        m=importlib.import_module('run_hosted_faults')
+        self.assertIn('exercise_persisted_start',m.FaultProbe.__dict__,'need ordinary public F13 lifecycle')
+        with self.probe() as (probe,events,row,execution):
+            probe.exercise_persisted_start()
+            self.assertEqual([event for event in events if event[0]=='POST'],[('POST','/containers/'+'b'*64+'/kill?signal=KILL')])
+            self.assertLess(events.index(('POST','/containers/'+'b'*64+'/kill?signal=KILL')),events.index(('discard','d'*64)))
+            probe.relay.arm.assert_called_once_with('dump-start','hold-before-forward')
+            self.assertEqual([call.args for call in probe.controller.call_args_list],[('run',),('serve',)])
+            proof=probe.result['proof'];self.assertEqual(proof['outcome'],'quarantined')
+            self.assertNotIn('owner_released',proof);self.assertNotIn('terminal',proof)
+            self.assertEqual([obj['exit_code'] for obj in proof['exec_observations']],[None]*3)
+            self.assertEqual(proof['owner_fresh']['phase'],'quarantine')
+            self.assertEqual(proof['events'][-1],'source-online-before-cleanup')
+            self.assertNotIn('private-canary',json.dumps(proof))
+
+    def test_ambiguous_nullable_api_or_identity_blocks_before_kill(self):
+        m=importlib.import_module('run_hosted_faults')
+        self.assertIn('exercise_persisted_start',m.FaultProbe.__dict__)
+        for violation in ('zero','source','worker','target','forwarded','expired','command'):
+            with self.subTest(violation=violation),self.probe(violation) as (probe,events,*_):
+                with self.assertRaises((ValueError,TimeoutError)):probe.exercise_persisted_start()
+                self.assertFalse(any(event[0]=='POST' for event in events))
+                self.assertNotIn('proof',probe.result)
+
+
+    def test_absent_raw_exit_remains_absent_not_fabricated_zero(self):
+        with self.probe() as (probe,events,row,execution):
+            del execution['ExitCode']
+            probe.exercise_persisted_start()
+            self.assertEqual([obj['exit_state'] for obj in probe.result['proof']['exec_observations']],['absent']*3)
+            self.assertTrue(all(obj['exit_code'] is None for obj in probe.result['proof']['exec_observations']))
+
+    def test_hold_expiry_between_observation_and_kill_never_signals_worker(self):
+        with self.probe() as (probe,events,*_):
+            probe.relay.held_deadline.side_effect=TimeoutError('offline hold expired')
+            with self.assertRaises(TimeoutError):probe.exercise_persisted_start()
+            self.assertFalse(any(event[0]=='POST' for event in events))
+            probe.relay.discard_start.assert_not_called()
+            self.assertNotIn('proof',probe.result)
+
+    def test_non137_worker_exit_cannot_be_used_to_discard_or_claim_quarantine(self):
+        with self.probe() as (probe,events,*_):
+            original=probe.e.call.side_effect
+            def call(method,path,**kwargs):
+                value=original(method,path,**kwargs)
+                if method=='POST':probe.e.inspect('b'*64)['State']['ExitCode']=0
+                return value
+            probe.e.call.side_effect=call
+            with self.assertRaises(ValueError):probe.exercise_persisted_start()
+            probe.relay.discard_start.assert_not_called()
+            self.assertNotIn('proof',probe.result)
+
+    def test_f13_cleanup_closes_hold_before_engine_deletes_and_retains_quarantine(self):
+        for changed in (False,True):
+            with self.subTest(changed=changed),CompletionTests().cleanup_probe() as (probe,_,__):
+                probe.case='dump-persisted-before-start-worker-SIGKILL'
+                owner={**probe.worker_owners['b'*64],'phase':'quarantine','status':'blocked'}
+                probe.owner=lambda:owner
+                events=[];original=probe.e.call.side_effect
+                probe.e.call.side_effect=lambda method,path,**kw:(events.append(method) or original(method,path,**kw))
+                probe.relay.close.side_effect=lambda:events.append('relay-closed')
+                proof_events=PersistedStartVerifierTests().receipt()['proof']['events'][:-1]
+                probe.result={'proof':{'owner_fresh':dict(owner),'events':proof_events}}
+                if changed:owner['execID']='f'*64
+                if changed:
+                    with self.assertRaises(ValueError):probe.cleanup()
+                    self.assertNotIn('DELETE',events)
+                else:
+                    probe.cleanup()
+                    self.assertLess(events.index('relay-closed'),events.index('DELETE'))
+                    self.assertTrue(probe.result['cleanup']['quarantine_state_retained'])
+                    self.assertTrue((probe.root/'state/keep').exists())
+                    self.assertEqual(probe.result['proof']['events'][-1],'owned-cleanup')
 
 
 class CompletionTests(unittest.TestCase):

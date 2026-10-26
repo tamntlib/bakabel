@@ -23,6 +23,7 @@ CASES = (
     'restore-start-response-loss',
     'backup-vs-restore-and-retention',
     'scheduler-restart-original-deadline',
+    'dump-persisted-before-start-worker-SIGKILL',
 )
 CREATE_GAPS = ('dump-create-response-loss', 'restore-create-response-loss')
 STREAMING = ('producer-failure-after-output', 'streaming-worker-SIGKILL', 'docker-stream-drop', 'docker-stream-drop-status-unavailable-recovery')
@@ -52,7 +53,9 @@ def verify_case(row):
         demand(isinstance(mapping, dict) and bool(mapping) and all(value is True for value in mapping.values()), 'exact owned cleanup missing')
     demand(cleanup.get('private_paths_absent') is True, 'credential cleanup missing')
     proof = row.get('proof', {})
-    if name in CREATE_GAPS:
+    if name == 'dump-persisted-before-start-worker-SIGKILL':
+        verify_persisted_start(row)
+    elif name in CREATE_GAPS:
         demand(proof.get('outcome') == 'quarantined', 'create gap incorrectly claimed recovered')
         for key in ('owner_retained','fresh_cli_blocked','exec_never_started','fault_forwarded'):
             demand(proof.get(key) is True, 'unknown create ownership not retained')
@@ -113,6 +116,111 @@ def verify_case(row):
             # deadline-renewal shift, unlike the former 18s timeout/+25s cap.
             demand(deadline-2 <= alive <= observed <= deadline+10 and
                    abs(delta-(observed-deadline)) < .000001, 'early terminal or extended original deadline')
+
+
+def verify_persisted_start(row):
+    # This is retained authorization with a nullable unstarted exec, NOT a
+    # create-ID gap, successful terminal exit, release or production fencing.
+    proof = row['proof']; relay = row.get('relay',{}); injection = row.get('injection',{})
+    owner = injection.get('owner_checkpoint',{}); workers = row['workers']; cleanup = row['cleanup']
+    demand(proof.get('outcome') == 'quarantined', 'persisted start must remain quarantined')
+    for key in ('owner_retained','fresh_cli_blocked','exec_never_started','persisted_exec_id',
+                'last_success_unchanged','last_result_unchanged','no_complete_snapshot'):
+        demand(proof.get(key) is True, 'persisted start safety proof missing')
+    demand(proof.get('fault_forwarded') is False and not proof.get('owner_released') and
+           not proof.get('worker_absent') and 'terminal' not in proof and 'actual_response_status' not in proof and
+           not row.get('fresh_cli_recovery'), 'unstarted exec falsely claimed terminal/recovered')
+    demand(all(type(proof.get(k)) is int and proof[k] == 1 for k in ('cli_exit','fresh_cli_exit')), 'public nonzero CLI proof missing')
+    demand(owner.get('phase') == 'exec_started' and owner.get('status') == 'active' and
+           owner.get('execKind') == 'dump' and owner.get('workerStartAuthorized') is True and
+           owner.get('daemonID') == row['daemon'] and isinstance(owner.get('runID'),str) and re.fullmatch('[a-f0-9]{32}',owner['runID']),
+           'durable start authorization missing')
+    for key in ('workerContainerID','sourceContainerID','execID','targetID'):
+        demand(isinstance(owner.get(key),str) and re.fullmatch('[a-f0-9]{64}',owner[key]), 'durable exact identity missing')
+    demand(owner.get('workerName') == 'bakabel-worker-'+owner['runID'] and bool(owner.get('sourceStartedAt')), 'worker/source durable identity missing')
+    cid = owner['workerContainerID']; eid = owner['execID']; source = row.get('source',{})
+    demand(relay.get('denied_start') == eid, 'exact exec start denial not retained through cleanup')
+    demand(source.get('container_id') == owner['sourceContainerID'] and source.get('started_at') == owner['sourceStartedAt'] and
+           type(source.get('restart_count')) is int and source['restart_count'] >= 0, 'source incarnation binding missing')
+    demand(cid in workers and workers[cid].get('run_id') == owner['runID'] and
+           workers[cid].get('cpu.max') == '200000 100000' and workers[cid].get('memory.max') == '536870912', 'exact default worker kernel proof missing')
+    keys = ('runID','daemonID','workerContainerID','workerName','workerStartAuthorized','targetID','sourceContainerID','sourceStartedAt','execID','execKind')
+    for key in ('owner_before_kill','owner_after_kill','owner_quarantine','owner_fresh'):
+        observed = proof.get(key,{})
+        demand(all(observed.get(k) == owner[k] for k in keys), 'persisted identity changed across kill/restart')
+        if key in ('owner_quarantine','owner_fresh'):
+            demand(observed.get('phase') == 'quarantine' and observed.get('status') == 'blocked', 'fresh scheduler quarantine missing')
+    demand(proof['owner_before_kill'] == owner, 'prekill checkpoint not identical to held authorization')
+    records = relay.get('records')
+    demand(isinstance(records,list) and 2 <= len(records) <= 12000 and relay.get('errors') == [], 'bounded relay proof missing')
+    held = [r for r in records if r.get('fault') == 'hold-before-forward']
+    creates = [r for r in records if r.get('boundary') == 'dump-create' and r.get('exec_id') == eid]
+    demand(len(held) == len(creates) == 1, 'unique actual create and held start missing')
+    held = held[0]; created = creates[0]
+    demand(created.get('producer_contract') == 'wrapped-dump-v1' and created.get('producer_run_id') == owner['runID'] and
+           created.get('command_sha256') == held.get('command_sha256'), 'exact wrapped create command binding missing')
+    demand(records.index(created) < records.index(held) and created.get('method') == 'POST' and created.get('forwarded') is True and
+           type(created.get('status')) is int and created['status'] == 201 and created.get('container_id') == owner['sourceContainerID'], 'real create/201 before hold missing')
+    create_owner = created.get('owner_checkpoint',{})
+    demand(create_owner.get('phase') == 'creating_exec' and not create_owner.get('execID') and
+           all(create_owner.get(k) == owner[k] for k in keys if k != 'execID'), 'create checkpoint not bound to persisted exec')
+    demand(held.get('exec_id') == eid and held.get('container_id') == owner['sourceContainerID'],
+           'held start not bound to durable exec/source')
+    demand(injection == {**held,'hold_state':'held'} and held.get('hold_state') == 'discarded' and
+           held.get('boundary') == 'dump-start' and held.get('method') == 'POST' and held.get('forwarded') is False and
+           'status' not in held and type(held.get('held_bytes')) is int and 0 < held['held_bytes'] <= 65536+4096 and
+           held.get('producer_contract') == 'wrapped-dump-v1' and re.fullmatch('[a-f0-9]{64}',held.get('command_sha256','')),
+           'bounded unforwarded discard proof missing')
+    for record in records:
+        # Only the uniquely verified, causally prior create may carry a returned
+        # exec ID without being a start/inspect. Labels alone grant no exemption;
+        # a same-run worker launch has no exec ID and is not an exec operation.
+        if (record is not created and
+                ('exec_id' in record or record.get('boundary') in ('dump-start','restore-start') or
+                 record.get('fault') in ('hold-before-forward','start-transport-refused')) and
+                (record.get('exec_id') == eid or record.get('owner_checkpoint',{}).get('runID') == owner['runID'] or
+                 record.get('command_sha256') == held['command_sha256'])):
+            if record.get('method') == 'GET':
+                demand(record.get('boundary') == 'other' and 'hold_state' not in record and
+                       ((record.get('forwarded') is True and type(record.get('status')) is int and
+                         record['status'] == 200 and record.get('fault') is None) or
+                        (record.get('forwarded') is False and 'status' not in record and
+                         record.get('fault') == 'status-transport-refused')), 'correlated exec inspect contradicts method/response')
+                continue
+            demand(record.get('method') == 'POST' and record.get('boundary') == 'dump-start' and
+                   record.get('exec_id') == eid and record.get('container_id') == owner['sourceContainerID'],
+                   'correlated start not bound to durable exec/source')
+            demand(record.get('forwarded') is False and 'status' not in record and
+                   record.get('fault') in ('hold-before-forward','start-transport-refused'), 'exact start forwarded or answered')
+    execution = relay.get('execs',{}).get(eid,{})
+    demand(execution.get('kind') == 'dump' and execution.get('container_id') == owner['sourceContainerID'] and
+           all(type(execution.get(k)) is int and execution[k] == 0 for k in ('stdin_bytes','stdout_bytes')), 'unstarted exec stream bytes observed')
+    observations = proof.get('exec_observations')
+    demand(isinstance(observations,list) and len(observations) == 3, 'prekill/postkill/fresh nullable observations missing')
+    for obj in observations:
+        demand(obj.get('daemon') == row['daemon'] and obj.get('container_id') == owner['sourceContainerID'] and
+               type(obj.get('restart_count')) is int and obj['restart_count'] == source['restart_count'] and
+               obj.get('started_at') == owner['sourceStartedAt'] and obj.get('exec_id') == eid and
+               obj.get('command_sha256') == held['command_sha256'] and obj.get('running') is False and
+               'exit_code' in obj and obj['exit_code'] is None and obj.get('exit_state') in ('null','absent') and
+               all(type(obj.get(k)) is int and obj[k] == 0 for k in ('pid','sessions','processes')), 'exact nullable-unstarted proof missing')
+    observed_workers = proof.get('worker_observations')
+    demand(isinstance(observed_workers,list) and len(observed_workers) == 3, 'worker kill readbacks missing')
+    for index, obj in enumerate(observed_workers):
+        demand(obj.get('container_id') == cid, 'kill targeted wrong worker')
+        if index == 0:
+            demand(obj.get('running') is True and type(obj.get('pid')) is int and obj['pid'] > 0, 'prekill worker not live')
+        else:
+            demand(obj.get('running') is False and type(obj.get('pid')) is int and obj['pid'] == 0 and
+                   type(obj.get('exit_code')) is int and obj['exit_code'] == 137, 'worker not observed terminal 137')
+    before = proof.get('workers_before_fresh'); after = proof.get('workers_after_fresh')
+    demand(isinstance(before,list) and cid in before and len(before) == len(set(before)) and
+           before == after == relay.get('workers') and set(before) == set(workers), 'fresh scheduler created replacement worker')
+    demand(proof.get('events') == ['persisted-start-held','prekill-checked','worker-kill-requested','worker-terminal-137',
+           'start-discarded','quarantine-retained','fresh-scheduler-quarantine','source-online-before-cleanup','owned-cleanup'], 'kill/discard/quarantine/cleanup ordering missing')
+    demand(cleanup.get('quarantine_state_retained') is True and cleanup.get('source_removed_only_after_gate') is True and
+           cleanup['containers_absent'].get(cid) is True and cleanup['containers_absent'].get(owner['sourceContainerID']) is True,
+           'cleanup cannot substitute for safe quarantine')
 
 
 def verify_report(report, rows):

@@ -32,13 +32,24 @@ class WorkflowContract(unittest.TestCase):
                     receipt=root/'bakabel-capacity/capacity-receipt.json';receipt.parent.mkdir()
                     receipt.write_text(json.dumps({'offline_unit_fixture':True}))
                 else:
-                    receipt=root/'bakabel-faults'/CASES[0]/'receipt.json';receipt.parent.mkdir(parents=True)
-                    receipt.write_text(json.dumps({'offline_unit_fixture':True}))
+                    f13='dump-persisted-before-start-worker-SIGKILL'
+                    self.assertIn(f13,CASES)
+                    for name in (CASES[0],f13):
+                        receipt=root/'bakabel-faults'/name/'receipt.json';receipt.parent.mkdir(parents=True)
+                        receipt.write_text(json.dumps({'offline_unit_fixture':True,'case':name}))
+                    for name in ('unknown-fault','private','proc','tracer','dump-start-private-canary'):
+                        private=root/'bakabel-faults'/name/'receipt.json';private.parent.mkdir(parents=True)
+                        private.write_text(secret)
+                    (root/'bakabel-faults/raw-errors.log').write_text(secret)
                 private=root/'bakabel-capacity/private/receipt.json';private.parent.mkdir(parents=True,exist_ok=True);private.write_text(secret)
                 cp=subprocess.run(['bash','-eu','-c',script],cwd=ROOT,env={**os.environ,'RUNNER_TEMP':str(root),'PATH':str(tools)+os.pathsep+os.environ['PATH']},capture_output=True,text=True)
                 self.assertEqual(cp.returncode,0,cp.stderr)
                 self.assertNotIn(secret,''.join(p.read_text() for p in (root/'bakabel-public').iterdir()))
                 self.assertEqual(json.loads((root/'bakabel-public/candidate.json').read_text())['suite'],suite)
+                if suite=='faults':
+                    exported={path.name for path in (root/'bakabel-public').iterdir()}
+                    self.assertEqual(exported,{'candidate.json','faults-'+CASES[0]+'.json','faults-'+f13+'.json'})
+                    self.assertEqual(json.loads((root/('bakabel-public/faults-'+f13+'.json')).read_text())['case'],f13)
 
     def test_capacity_and_faults_run_on_independent_fresh_vms(self):
         text=(ROOT/'.github/workflows/acceptance.yaml').read_text()

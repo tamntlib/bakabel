@@ -276,6 +276,8 @@ class FaultProbe(ComposeProbe):
             self.exercise_overlap()
         elif self.case == 'scheduler-restart-original-deadline':
             self.exercise_restart()
+        elif self.case == 'dump-persisted-before-start-worker-SIGKILL':
+            self.exercise_persisted_start()
         self.verify_source_online()
         self.result['exercised'] = True
 
@@ -434,6 +436,110 @@ class FaultProbe(ComposeProbe):
             raise ValueError('trusted restore snapshot missing exact complete readback')
         return snapshot
 
+    def nullable_unstarted_proof(self, active, command_sha256):
+        # Inspect the real raw API shape. An integer zero is NOT converted to
+        # null, and relay non-forwarding is NOT production fencing authority.
+        cid = active['sourceContainerID']; eid = active['execID']
+        source = self.e.inspect(cid)
+        execution = self.e.call('GET','/exec/'+eid+'/json')
+        process = execution.get('ProcessConfig',{})
+        command = [process.get('entrypoint'),*(process.get('arguments') or [])]
+        actual_hash = hashlib.sha256(json.dumps(command,separators=(',',':')).encode()).hexdigest()
+        if (self.e.call('GET','/info')['ID'] != self.daemon or active['daemonID'] != self.daemon or
+                source.get('Id') != cid or source['State'].get('Running') is not True or
+                source['State'].get('StartedAt') != active['sourceStartedAt'] or
+                source.get('RestartCount') != self.source_before['restart_count'] or
+                execution.get('ID') != eid or execution.get('ContainerID') != cid or actual_hash != command_sha256):
+            raise ValueError('exact never-started source/exec identity unavailable')
+        if (execution.get('Running') is not False or type(execution.get('Pid')) is not int or execution['Pid'] != 0 or
+                execution.get('ExitCode') is not None):
+            raise TimeoutError('raw nullable never-started exec API unavailable')
+        token = active['runID']
+        if not re.fullmatch('[a-f0-9]{32}',token): raise ValueError('invalid durable dump run')
+        sessions = int(self.sql(cid,"SELECT count(*) FROM pg_stat_activity WHERE application_name='"+token+"'"))
+        processes = self.process_count(cid,token,'pg_dump')
+        if sessions or processes: raise ValueError('never-started source has export activity')
+        return {'daemon':self.daemon,'container_id':cid,'started_at':active['sourceStartedAt'],'exec_id':eid,
+                'restart_count':source['RestartCount'],
+                'running':False,'pid':execution['Pid'],'exit_code':execution.get('ExitCode'),
+                'exit_state':'null' if 'ExitCode' in execution else 'absent','command_sha256':actual_hash,
+                'sessions':sessions,'processes':processes}
+
+    def exercise_persisted_start(self):
+        self.success_snapshot()  # Established durable last-success baseline.
+        baseline = self.last()
+        self.relay.arm('dump-start','hold-before-forward')
+        controller = self.controller('run')
+        if not self.relay.hit.wait(45): raise TimeoutError('persisted dump start hold not reached')
+        records = self.relay.snapshot()['records']
+        held = [r for r in records if r.get('fault') == 'hold-before-forward']
+        if len(held) != 1 or held[0].get('hold_state') != 'held' or held[0].get('forwarded') is not False or 'status' in held[0]:
+            raise TimeoutError('exact unforwarded hold unavailable')
+        record = held[0]; active = record['owner_checkpoint']; cid = active['workerContainerID']; eid = active['execID']
+        self.result['injection'] = record
+        events = ['persisted-start-held']
+        if (active.get('phase') != 'exec_started' or active.get('status') != 'active' or active.get('execKind') != 'dump' or
+                active.get('sourceContainerID') != self.source or active.get('sourceStartedAt') != self.source_before['started_at'] or
+                active.get('targetID') != hashlib.sha256(self.target.encode()).hexdigest() or self.owner() != active):
+            raise ValueError('prekill durable owner/frozen target changed')
+        self.capture_owned_worker(cid)
+        before = self.e.inspect(cid); self.worker_identity_proof(before,active)
+        if before['State'].get('Running') is not True: raise ValueError('owned worker not live before kill')
+        started = time.monotonic()
+        worker_observations = [self.worker_observation(cid,before,started)]
+        exec_observations = [self.nullable_unstarted_proof(active,record['command_sha256'])]
+        owner_before = self.owner()
+        if owner_before != active: raise ValueError('owner changed before kill')
+        # Reinspect immediately before the only signal; prior capture is not
+        # sufficient authority. Watchdog expiry never authorizes a late kill.
+        before = self.e.inspect(cid); self.worker_identity_proof(before,active)
+        if before['State'].get('Running') is not True: raise ValueError('worker stopped before injection')
+        end = self.relay.held_deadline(eid)
+        events.extend(('prekill-checked','worker-kill-requested'))
+        self.e.call('POST','/containers/'+cid+'/kill?signal=KILL',deadline=end)
+        terminal = None
+        while time.monotonic() < end:
+            observed = self.e.inspect(cid,deadline=end); self.worker_identity_proof(observed,active)
+            if observed['State']['Running'] is False:
+                state = observed['State']
+                if type(state.get('ExitCode')) is not int or state['ExitCode'] != 137 or type(state.get('Pid')) is not int or state['Pid'] != 0:
+                    raise ValueError('exact killed worker not terminal 137')
+                terminal = observed; break
+            time.sleep(min(.02,max(0,end-time.monotonic())))
+        if terminal is None: raise TimeoutError('worker terminal not observed during hold')
+        worker_observations.append(self.worker_observation(cid,terminal,started))
+        owner_after = self.owner()
+        if not owner_after or any(owner_after.get(k) != active.get(k) for k in active if k not in ('phase','status')):
+            raise ValueError('persisted exec identity lost across kill')
+        events.append('worker-terminal-137')
+        self.relay.discard_start(eid); events.append('start-discarded')
+        self.finish(controller,expect=1,timeout=85)
+        quarantine = self.assert_quarantine(active); events.append('quarantine-retained')
+        exec_observations.append(self.nullable_unstarted_proof(active,record['command_sha256']))
+        workers_before = self.relay.snapshot()['workers']
+        self.fresh_recovery(active,blocked=True)
+        fresh = self.assert_quarantine(active)
+        if any(fresh.get(k) != active.get(k) for k in active if k not in ('phase','status')):
+            raise ValueError('fresh scheduler changed persisted identity')
+        workers_after = self.relay.snapshot()['workers']
+        if workers_before != workers_after: raise ValueError('fresh scheduler created replacement worker')
+        observed = self.e.inspect(cid); self.worker_identity_proof(observed,active)
+        state = observed['State']
+        if state.get('Running') is not False or type(state.get('ExitCode')) is not int or state['ExitCode'] != 137 or state.get('Pid') != 0:
+            raise ValueError('fresh scheduler lost retained terminal worker')
+        worker_observations.append(self.worker_observation(cid,observed,started))
+        exec_observations.append(self.nullable_unstarted_proof(active,record['command_sha256']))
+        events.append('fresh-scheduler-quarantine')
+        if self.last() != baseline or not self.no_complete_snapshot(active):
+            raise ValueError('quarantine changed last success/result or committed snapshot')
+        self.verify_source_online(); events.append('source-online-before-cleanup')
+        self.result['proof'] = {'outcome':'quarantined','owner_retained':True,'fresh_cli_blocked':True,'exec_never_started':True,
+            'persisted_exec_id':True,'fault_forwarded':False,'cli_exit':1,'fresh_cli_exit':1,
+            'last_success_unchanged':True,'last_result_unchanged':True,'no_complete_snapshot':True,
+            'owner_before_kill':owner_before,'owner_after_kill':owner_after,'owner_quarantine':quarantine,'owner_fresh':fresh,
+            'exec_observations':exec_observations,'worker_observations':worker_observations,
+            'workers_before_fresh':workers_before,'workers_after_fresh':workers_after,'events':events}
+
     def exercise_response_loss(self):
         boundary = self.case.removesuffix('-response-loss')
         if boundary.startswith('restore-'):
@@ -569,6 +675,13 @@ class FaultProbe(ComposeProbe):
                                 'seconds_after_original_deadline':observed-deadline,'scheduler_restarts':2}
 
     def cleanup(self):
+        persisted_start = getattr(self,'case',None) == 'dump-persisted-before-start-worker-SIGKILL'
+        if persisted_start:
+            # Close/discard, never forward a pending request during teardown.
+            self.relay.close()
+            proof = self.result.get('proof')
+            if proof and self.assert_quarantine(proof['owner_fresh']) != proof['owner_fresh']:
+                raise ValueError('quarantine identity changed before cleanup')
         # Validate the ENTIRE deletion authority before the first write. These
         # are only immutable create-returned IDs, never a daemon-wide inventory.
         if getattr(self,'unresolved_creates',set()): raise ValueError('unresolved fixture create; preserve all recovery paths')
@@ -611,6 +724,8 @@ class FaultProbe(ComposeProbe):
         if not retained: shutil.rmtree(self.root/'state')
         self.result['cleanup'] = {'containers_absent':absent,'volumes_absent':volabsent,'private_paths_absent':not (self.root/'private').exists(),
                                   'quarantine_state_retained':retained,'source_removed_only_after_gate':True}
+        if persisted_start and self.result.get('proof'):
+            self.result['proof']['events'].append('owned-cleanup')
         if self.result['relay']['errors']: raise ValueError('unclassified relay transport errors')
 
     def config(self, filename='config.yaml', timeout='45s', fresh=False):
@@ -722,6 +837,10 @@ class FaultRelay:
         self.rule = None
         self.denied_exec = None
         self.hit = threading.Event()
+        self.denied_start = None
+        self.dump_bindings = {}
+        self.hold = None
+        self.closed = False
         self.observer = None
         relay = self
         class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
@@ -739,15 +858,31 @@ class FaultRelay:
         self.path.chmod(0o600)
         self.thread.start()
 
-    def arm(self, boundary, action, *, after_stdout=65536, deny_status=False):
-        if boundary not in ('worker-create', 'worker-start', 'dump-create', 'dump-start', 'restore-create', 'restore-start') or action not in ('response-loss', 'stream-drop'):
+    def arm(self, boundary, action, *, after_stdout=65536, deny_status=False, hold_seconds=10):
+        if boundary not in ('worker-create', 'worker-start', 'dump-create', 'dump-start', 'restore-create', 'restore-start') or action not in ('response-loss', 'stream-drop', 'hold-before-forward'):
             raise ValueError('unsupported transport boundary')
+        if action == 'hold-before-forward' and (boundary != 'dump-start' or type(hold_seconds) not in (int,float) or not 0 < hold_seconds <= 10):
+            raise ValueError('invalid bounded pre-forward hold')
         if action == 'stream-drop' and (boundary != 'dump-start' or after_stdout < 1):
             raise ValueError('stream drop requires positive dump stdout threshold')
         with self.lock:
             if self.rule is not None: raise ValueError('fault already armed')
             self.rule = {'boundary': boundary, 'action': action, 'after_stdout': after_stdout, 'deny_status': deny_status}
+            if action == 'hold-before-forward': self.rule['hold_seconds'] = hold_seconds
             self.hit.clear()
+
+    def held_deadline(self, eid):
+        with self.lock:
+            if (not self.hold or self.denied_start != eid or self.hold['record']['hold_state'] != 'held' or
+                    time.monotonic() >= self.hold['deadline']):
+                raise TimeoutError('pre-forward hold expired or unavailable')
+            return self.hold['deadline']
+
+    def discard_start(self, eid):
+        with self.lock:
+            self.held_deadline(eid)
+            self.hold['record']['hold_state'] = 'discarded'
+            self.hold['done'].set()
 
     def status_allowed(self, eid):
         with self.lock:
@@ -785,6 +920,8 @@ class FaultRelay:
         match = re.fullmatch(r'/exec/([a-f0-9]{64})/(start|json)', path)
         if match:
             eid, operation = match.groups(); record['exec_id'] = eid
+            if operation == 'start' and eid == getattr(self,'denied_start',None):
+                record['fault'] = 'start-transport-refused'
             if operation == 'start' and eid in self.execs:
                 record['boundary'] = self.execs[eid]['kind']+'-start'
                 record['container_id'] = self.execs[eid]['container_id']
@@ -794,9 +931,17 @@ class FaultRelay:
 
     def snapshot(self):
         with self.lock:
-            return copy.deepcopy({'records': self.records, 'errors': self.errors, 'execs': self.execs, 'workers':sorted(self.workers), 'denied_exec': self.denied_exec})
+            out = {'records': self.records, 'errors': self.errors, 'execs': self.execs, 'workers':sorted(self.workers), 'denied_exec': self.denied_exec}
+            if self.denied_start is not None: out['denied_start'] = self.denied_start
+            return copy.deepcopy(out)
 
     def close(self):
+        with self.lock:
+            if self.closed: return
+            self.closed = True
+            if self.hold and self.hold['record']['hold_state'] == 'held':
+                self.hold['record']['hold_state'] = 'closed'
+                self.hold['done'].set()
         self.server.shutdown()
         self.server.server_close()
         with self.lock:
@@ -823,16 +968,52 @@ class FaultRelay:
             n = int(headers.get('content-length', 0))
             if n < 0 or n > 2*1024*1024:
                 raise ValueError('request body limit')
+            with self.lock:
+                holding = self.denied_start is not None or (self.rule and self.rule['action'] == 'hold-before-forward')
+            if holding and re.fullmatch(r'/v[0-9.]+/exec/[a-f0-9]{64}/start|/exec/[a-f0-9]{64}/start',urlsplit(path).path) and n > 4096:
+                raise ValueError('held start body limit')
             body = read_exact(front, n)
             with self.lock:
                 record = self.classify(method, path, body)
                 if len(self.records) >= 12000: raise ValueError('bounded relay record limit')
                 self.records.append(record)
-                if record.get('fault') == 'status-transport-refused': return
+                if record.get('fault') in ('status-transport-refused','start-transport-refused'): return
                 rule = None
                 if self.rule and self.rule['boundary'] == record['boundary']:
                     rule = self.rule; self.rule = None
+                    if rule['action'] == 'hold-before-forward': self.denied_start = record['exec_id']
             if self.observer: self.observer('request',record)
+            if rule and rule['action'] == 'hold-before-forward':
+                # Never connect, send, or synthesize a reply on this path. A
+                # retry is denied from the instant the exact hold is installed.
+                if method != 'POST' or body != b'{"Detach":false,"Tty":false}':
+                    raise ValueError('unexpected held start command')
+                with self.lock:
+                    eid = record['exec_id']
+                    if self.closed or self.hold is not None: raise ValueError('hold unavailable')
+                    if eid not in self.dump_bindings: raise ValueError('exact wrapped create missing')
+                    binding = self.dump_bindings[eid]; active = record.get('owner_checkpoint',{})
+                    created = binding.get('owner_checkpoint',{})
+                    keys = ('runID','daemonID','workerContainerID','workerName','workerStartAuthorized','sourceContainerID','sourceStartedAt','targetID','execKind')
+                    if (any(not active.get(k) or active.get(k) != created.get(k) for k in keys) or
+                            any(re.fullmatch('[a-f0-9]{64}',active.get(k,'')) is None for k in ('workerContainerID','sourceContainerID','targetID')) or
+                            re.fullmatch('[a-f0-9]{32}',active.get('runID','')) is None or
+                            active['runID'] != binding['run_id'] or active.get('execID') != eid or
+                            active.get('sourceContainerID') != record.get('container_id') or
+                            active.get('execKind') != 'dump' or active.get('workerStartAuthorized') is not True or
+                            active.get('phase') != 'exec_started' or active.get('status') != 'active' or
+                            created.get('phase') != 'creating_exec' or created.get('execID')):
+                        raise ValueError('durable pre-forward binding mismatch')
+                    self.denied_start = eid
+                    record.update(fault='hold-before-forward',hold_state='held',held_bytes=len(head)+len(body),
+                                  producer_contract='wrapped-dump-v1',command_sha256=binding['command_sha256'])
+                    done = threading.Event(); deadline = time.monotonic()+rule['hold_seconds']
+                    self.hold = {'record':record,'done':done,'deadline':deadline}
+                    self.hit.set()
+                done.wait(max(0,deadline-time.monotonic()))  # No relay lock held.
+                with self.lock:
+                    if record['hold_state'] == 'held': record['hold_state'] = 'expired'
+                return
             back.connect(self.target)
             back.sendall(head+body)
             with self.lock: record['forwarded'] = True
@@ -851,6 +1032,13 @@ class FaultRelay:
                     else:
                         record['exec_id'] = identity
                         self.execs[identity] = {'kind': record['boundary'].removesuffix('-create'), 'container_id': record['container_id'], 'stdout_bytes': 0, 'stdin_bytes': 0}
+                        spec = json.loads(body)
+                        if record['boundary'] == 'dump-create' and is_dump_wrapper(spec):
+                            self.dump_bindings[identity] = {'run_id':spec['Cmd'][4],'owner_checkpoint':copy.deepcopy(record.get('owner_checkpoint',{})),
+                                'command_sha256':hashlib.sha256(json.dumps(spec['Cmd'],separators=(',',':')).encode()).hexdigest()}
+                            if self.rule and self.rule['action'] == 'hold-before-forward':
+                                record.update(producer_contract='wrapped-dump-v1',producer_run_id=spec['Cmd'][4],
+                                              command_sha256=self.dump_bindings[identity]['command_sha256'])
             if self.observer: self.observer('response',record)
             if rule and rule['action'] == 'response-loss':
                 with self.lock: record['fault'] = 'response-loss'
