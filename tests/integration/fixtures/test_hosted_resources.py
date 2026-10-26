@@ -266,7 +266,9 @@ class HostedResources(unittest.TestCase):
         module=self.module();cid='a'*64;run='b'*32
         diagnostic={'workers':[{'container':cid,'run_id':run,'state_directory':'state','inspect_status':'observed','state':'exited','running':False,'exit_code':137,'oom_killed':False,'error':'PRIVATE-CANARY'}],
                     'durable':[{'state_directory':'state','record':'last_result','run_id':run,'status':'failed','phase':None,'error':'PRIVATE-CANARY'}],
-                    'events':{'status':'observed','items':[{'container':cid,'event':'die','time_ns':123,'exit_code':137,'attributes':'PRIVATE-CANARY'}]},'logs':'PRIVATE-CANARY'}
+                    'events':{'status':'observed','items':[{'container':cid,'event':'die','time_ns':123,'exit_code':137,'attributes':'PRIVATE-CANARY'}]},
+                    'controller_completions':{'status':'observed','items':[{'state_directory':'state','run_id':run,'status':'failed','controller_failed':True,
+                        'targets':[{'ordinal':0,'status':'unknown','failureCode':'backup','resticExitCode':1,'resticReason':'enospc','targetID':'PRIVATE-CANARY','error':'PRIVATE-CANARY'}]}]},'logs':'PRIVATE-CANARY'}
         for failure in ('run','verification',None):
             with self.subTest(failure=failure),tempfile.TemporaryDirectory() as directory:
                 root=Path(directory);case=root/'scheduler';case.mkdir()
@@ -280,6 +282,9 @@ class HostedResources(unittest.TestCase):
                     self.assertEqual(public['scheduler_diagnostics']['workers'][0]['exit_code'],137)
                     self.assertEqual(public['scheduler_diagnostics']['durable'][0]['status'],'failed')
                     self.assertEqual(public['scheduler_diagnostics']['events']['items'][0]['event'],'die')
+                    completion=public['scheduler_diagnostics']['controller_completions']['items'][0]
+                    self.assertTrue(completion['controller_failed'])
+                    self.assertEqual(completion['targets'],[{'ordinal':0,'status':'unknown','failureCode':'backup','resticExitCode':1,'resticReason':'enospc'}])
                     self.assertFalse(public['verified']);self.assertTrue(public['failed'])
                 else:self.assertNotIn('scheduler_diagnostics',public)
                 self.assertEqual(json.loads((case/'public.json').read_text()),public)
@@ -294,6 +299,7 @@ class HostedResources(unittest.TestCase):
             def __init__(self,args):
                 args.runtime.mkdir();p,_,_=test.scheduler_probe(args.runtime)
                 self.__dict__.update(p.__dict__);self.values=[];self.stopped=Mock();self.thread=Mock()
+                test.scheduler_stdout(self,OSError('PRIVATE-CANARY'))
                 (self.root/'private').mkdir();(self.root/'private'/'credential').write_text('PRIVATE-CANARY')
             def run(self):
                 self.result['sampler_errors']=[{'type':'OSError','frames':[]}]
@@ -315,6 +321,265 @@ class HostedResources(unittest.TestCase):
             probe,_,_=self.scheduler_probe(Path(directory))
             with patch.object(probe,'collect_scheduler_diagnostics',side_effect=OSError('PRIVATE-CANARY')),patch.object(module.Probe,'cleanup') as base:probe.cleanup()
             base.assert_called_once_with()
+
+    def scheduler_stdout(self,probe,payload,framed=False):
+        """Synthetic Engine bytes only; no live containers or daemon access."""
+        import copy,struct
+        from urllib.parse import parse_qs,urlsplit
+        cid='e'*64;probe.prefix='unit-probe';name=probe.prefix+'-serve-123abc'
+        probe.containers={cid:name};probe.roles={cid:'scheduler'}
+        scheduler={'Id':cid,'Name':'/'+name,'Image':probe.image,
+                   'Config':{'Entrypoint':['/usr/local/bin/bakabel'],'Cmd':['--config','/config.yaml','serve'],
+                             'Labels':{'probe.bakabel.owner':probe.prefix,'bakabel.installation':probe.prefix,'bakabel.role':'scheduler'},'Env':['PRIVATE-CANARY']},
+                   'Mounts':[{'Type':'bind','Source':str(probe.root/'state'),'Destination':'/state'}]}
+        worker=copy.deepcopy(probe.e.inspect.return_value)
+        probe.e.inspect.side_effect=lambda target,**kw:copy.deepcopy(scheduler if target==cid else worker)
+        queries=[]
+        def call(method,path,**kwargs):
+            if path=='/info':return {'ID':probe.daemon}
+            self.assertEqual(method,'GET');self.assertEqual(urlsplit(path).path,'/containers/'+cid+'/logs')
+            query=parse_qs(urlsplit(path).query);queries.append(query)
+            self.assertEqual(query,{'stdout':['true'],'stderr':['false'],'follow':['false'],'timestamps':['false'],'tail':['256']})
+            self.assertTrue(kwargs['raw'])
+            if isinstance(payload,Exception):raise payload
+            return struct.pack('>BxxxI',1,len(payload))+payload if isinstance(payload,bytes) and not framed else payload
+        probe.e.call.side_effect=call
+        return scheduler,queries
+
+    def test_scheduler_stdout_preserves_failed_first_run_after_replacement_deletes_output(self):
+        import copy,json,tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        module=self.module()
+        with tempfile.TemporaryDirectory() as directory:
+            probe,cid,run=self.scheduler_probe(Path(directory));next_cid='d'*64;next_run='f'*32
+            replacement=copy.deepcopy(probe.worker_records[cid]);replacement.update(Id=next_cid,Name='/replacement',runID=next_run)
+            replacement['Config']['Labels']['bakabel.run']=next_run;probe.worker_records[next_cid]=replacement
+            state=probe.root/'state';(state/'workflow/output').mkdir(parents=True)
+            output=state/'workflow/output/result.json';output.write_text(json.dumps({'runID':run,'status':'failed'}));output.unlink()
+            (state/'last-result.json').write_text(json.dumps({'runID':next_run,'status':'success'}))
+            event={'event':'run_finished','failed':True,'result':{'runID':run,'status':'failed','targets':[
+                {'targetID':'PRIVATE-CANARY','status':'unknown','failureCode':'backup','resticExitCode':1,'resticReason':'enospc','error':'PRIVATE-CANARY'}]},'error':'PRIVATE-CANARY'}
+            _,queries=self.scheduler_stdout(probe,(json.dumps(event)+'\n'+json.dumps({'event':'run_finished','result':{'runID':next_run,'status':'complete','targets':[]}})+'\n').encode())
+            def cleanup(p):
+                self.assertTrue(queries);self.assertFalse(output.exists())
+                p.worker_records.clear()
+            with patch.object(module.Probe,'cleanup',cleanup):probe.cleanup()
+            public=module.public_scheduler_diagnostics(probe.result)
+            completion=public.get('controller_completions',{})
+            self.assertEqual(completion.get('status'),'observed')
+            self.assertEqual(completion['items'],[
+                {'state_directory':'state','run_id':run,'status':'failed','controller_failed':True,'targets':[
+                    {'ordinal':0,'status':'unknown','failureCode':'backup','resticExitCode':1,'resticReason':'enospc'}]},
+                {'state_directory':'state','run_id':next_run,'status':'complete','controller_failed':False,'targets':[]}])
+            self.assertEqual(public['durable'],[{'state_directory':'state','record':'last_result','run_id':next_run,'status':'success','phase':None}])
+            self.assertNotIn('PRIVATE-CANARY',json.dumps(probe.result));self.assertNotIn('PRIVATE-CANARY',json.dumps(public))
+
+    def test_scheduler_stdout_mixed_lines_and_split_frames_keep_only_valid_stdout(self):
+        import json,struct,tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        module=self.module()
+        with tempfile.TemporaryDirectory() as directory:
+            probe,_,run=self.scheduler_probe(Path(directory))
+            event={'event':'run_finished','failed':True,'result':{'runID':run,'status':'failed','targets':[]}}
+            valid=json.dumps(event).encode()+b'\n'
+            text=b'PRIVATE-CANARY\n{\n[]\nnull\n42\n'+json.dumps({'event':'tick'}).encode()+b'\n'+valid+valid
+            frame=lambda stream,data:struct.pack('>BxxxI',stream,len(data))+data
+            stderr=json.dumps({**event,'failed':False}).encode()+b'\n'
+            self.scheduler_stdout(probe,frame(1,text[:31])+frame(2,stderr)+frame(1,text[31:]),framed=True)
+            with patch.object(module.Probe,'cleanup'):probe.cleanup()
+            observed=module.public_scheduler_diagnostics(probe.result)['controller_completions']
+            self.assertEqual(observed,{'status':'observed','items':[{'state_directory':'state','run_id':run,'status':'failed','controller_failed':True,'targets':[]}]})
+            self.assertNotIn('PRIVATE-CANARY',json.dumps(probe.result))
+
+    def test_scheduler_stdout_missing_oversized_and_invalid_records_are_unavailable(self):
+        import json,struct,tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        module=self.module()
+        modes=('missing','exception','empty','oversize','too-many-lines','bad-json','bad-utf8',
+               'truncated-frame','trailing-header','reserved-header','unknown-stream','tty-text',
+               'no-result','bad-result','no-targets','null-targets','bad-target','too-many-targets')
+        for mode in modes:
+            with self.subTest(mode=mode),tempfile.TemporaryDirectory() as directory:
+                probe,_,run=self.scheduler_probe(Path(directory))
+                value={'runID':run,'status':'complete','targets':[]};event={'event':'run_finished','result':value}
+                if mode=='no-result':event.pop('result')
+                if mode=='bad-result':event['result']=[]
+                if mode=='no-targets':value.pop('targets')
+                if mode=='null-targets':value['targets']=None
+                if mode=='bad-target':value['targets']=[None]
+                if mode=='too-many-targets':value['targets']=[{}]*129
+                valid=json.dumps(event).encode()+b'\n';frame=struct.pack('>BxxxI',1,len(valid))+valid
+                payload={'missing':None,'exception':OSError('PRIVATE-CANARY'),'empty':b'',
+                         'oversize':valid+b' '*262145,'too-many-lines':valid+b'\n'*256,'bad-json':b'{',
+                         'bad-utf8':valid+b'\xff','truncated-frame':frame[:-1],
+                         'trailing-header':frame+b'\x01','reserved-header':b'\x01\x00\x01\x00'+frame[4:],
+                         'unknown-stream':b'\x03'+frame[1:],'tty-text':valid}.get(mode,valid)
+                self.scheduler_stdout(probe,payload,framed=mode in ('truncated-frame','trailing-header','reserved-header','unknown-stream','tty-text'))
+                with patch.object(module.Probe,'cleanup') as cleanup:probe.cleanup()
+                cleanup.assert_called_once_with()
+                expected={'status':'unavailable','items':[]}
+                self.assertEqual(probe.result['scheduler_diagnostics']['controller_completions'],expected)
+                self.assertEqual(module.public_scheduler_diagnostics(probe.result)['controller_completions'],expected)
+                self.assertNotIn('PRIVATE-CANARY',json.dumps(probe.result))
+
+    def test_scheduler_stdout_queries_only_exact_owned_serve_identity_and_verified_run(self):
+        import json,tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        module=self.module()
+        modes=('id','name','image','owner','installation','role-label','command','entrypoint','tty',
+               'role-record','name-record','state-mount','foreign-state','daemon','worker-image','worker-run','foreign-run')
+        for mode in modes:
+            with self.subTest(mode=mode),tempfile.TemporaryDirectory() as directory:
+                probe,cid,run=self.scheduler_probe(Path(directory))
+                event={'event':'run_finished','failed':True,'result':{'runID':'f'*32 if mode=='foreign-run' else run,'status':'failed','targets':[]}}
+                scheduler,queries=self.scheduler_stdout(probe,json.dumps(event).encode())
+                if mode=='id':scheduler['Id']='d'*64
+                if mode=='name':scheduler['Name']='/foreign'
+                if mode=='image':scheduler['Image']='foreign'
+                if mode in ('owner','installation','role-label'):
+                    key={'owner':'probe.bakabel.owner','installation':'bakabel.installation','role-label':'bakabel.role'}[mode]
+                    scheduler['Config']['Labels'][key]='foreign'
+                if mode=='command':scheduler['Config']['Cmd']=['--config','/config.yaml','run']
+                if mode=='entrypoint':scheduler['Config']['Entrypoint']=['sh','-c']
+                if mode=='tty':scheduler['Config']['Tty']=True
+                if mode=='role-record':probe.roles['e'*64]='controller'
+                if mode=='name-record':probe.containers['e'*64]='foreign'
+                if mode=='state-mount':scheduler['Mounts'][0]['Source']=str(probe.root/'private')
+                if mode=='foreign-state':scheduler['Mounts'][0]['Source']=str(probe.root/'fresh-state')
+                if mode=='worker-image':probe.worker_records[cid]['Image']='foreign'
+                if mode=='worker-run':probe.worker_records[cid]['Config']['Labels']['bakabel.run']='f'*32
+                if mode=='daemon':probe.e.call.side_effect=lambda *a,**kw:{'ID':'foreign'}
+                with patch.object(module.Probe,'cleanup'):probe.cleanup()
+                self.assertEqual(len(queries),1 if mode=='foreign-run' else 0)
+                self.assertEqual(probe.result['scheduler_diagnostics']['controller_completions'],{'status':'unavailable','items':[]})
+
+    def test_scheduler_stdout_and_public_reprojection_enforce_types_finite_codes_and_canaries(self):
+        import copy,json,tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        module=self.module()
+        stages=('file_preflight','list_before','backup','list_after','source_verification','tag','final_readback','metadata_readback')
+        reasons=('enospc','permission','backend','unknown')
+        for failed in (True,False,'PRIVATE-CANARY',1,None,[],{}):
+            with self.subTest(failed=failed),tempfile.TemporaryDirectory() as directory:
+                probe,_,run=self.scheduler_probe(Path(directory));targets=[];expected=[]
+                for index,stage in enumerate(stages):
+                    target={'status':('complete','restored','partial','unknown')[index%4],'failureCode':stage,
+                            'resticExitCode':0 if index%2==0 else 255,'resticReason':reasons[index%4]}
+                    targets.append({**target,'targetID':'PRIVATE-CANARY','error':'PRIVATE-CANARY','Env':['PRIVATE-CANARY']})
+                    expected.append({'ordinal':index,**target})
+                for bad in ('PRIVATE-CANARY',True,False,1.5,-1,256,float('nan'),float('inf'),[],{},None):
+                    targets.append({key:bad for key in ('status','failureCode','resticExitCode','resticReason')})
+                    expected.append({'ordinal':len(expected),'status':None,'failureCode':None,'resticExitCode':None,'resticReason':None})
+                event={'event':'run_finished','failed':failed,'result':{'runID':run,'status':'PRIVATE-CANARY','targets':targets},'logs':'PRIVATE-CANARY'}
+                self.scheduler_stdout(probe,json.dumps(event).encode())
+                with patch.object(module.Probe,'cleanup'):probe.cleanup()
+                completion=probe.result['scheduler_diagnostics']['controller_completions']['items'][0]
+                self.assertIsNone(completion['status']);self.assertEqual(completion['targets'],expected)
+                self.assertEqual(completion['controller_failed'],failed if type(failed) is bool else None)
+                self.assertNotIn('PRIVATE-CANARY',json.dumps(probe.result))
+                # Re-project a poisoned private receipt too, not only our own collector output.
+                poisoned=copy.deepcopy(probe.result)
+                row=poisoned['scheduler_diagnostics']['controller_completions']['items'][0]
+                row.update(status='PRIVATE-CANARY',controller_failed=failed,targets=targets,error='PRIVATE-CANARY')
+                public=module.public_scheduler_diagnostics(poisoned)
+                self.assertEqual(public['controller_completions']['items'][0],completion)
+                self.assertNotIn('PRIVATE-CANARY',json.dumps(public))
+
+    def test_scheduler_public_completions_require_bounded_typed_owned_records(self):
+        import copy
+        module=self.module();cid='a'*64;run='b'*32
+        row={'state_directory':'state','run_id':run,'status':'failed','controller_failed':True,
+             'targets':[{'status':'unknown','failureCode':'backup','resticExitCode':1,'resticReason':'enospc'}]}
+        base={'scheduler_diagnostics':{'workers':[{'container':cid,'run_id':run,'state_directory':'state'}],
+              'controller_completions':{'status':'observed','items':[row]}}}
+        for mode in ('foreign-run','foreign-state','bad-run-type','bad-state-type','oversized','bad-items','no-targets','bad-targets'):
+            with self.subTest(mode=mode):
+                raw=copy.deepcopy(base);section=raw['scheduler_diagnostics']['controller_completions'];item=section['items'][0]
+                if mode=='foreign-run':item['run_id']='f'*32
+                if mode=='foreign-state':item['state_directory']='fresh-state'
+                if mode=='bad-run-type':item['run_id']=[]
+                if mode=='bad-state-type':item['state_directory']={}
+                if mode=='oversized':section['items']*=257
+                if mode=='bad-items':section['items']='PRIVATE-CANARY'
+                if mode=='no-targets':item.pop('targets')
+                if mode=='bad-targets':item['targets']=[None]
+                self.assertEqual(module.public_scheduler_diagnostics(raw)['controller_completions'],{'status':'unavailable','items':[]})
+
+    def test_scheduler_stdout_container_tracking_is_bounded_before_inspection(self):
+        import json,tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        module=self.module()
+        for mode in ('bad-id','too-many-containers'):
+            with self.subTest(mode=mode),tempfile.TemporaryDirectory() as directory:
+                probe,_,run=self.scheduler_probe(Path(directory))
+                _,queries=self.scheduler_stdout(probe,json.dumps({'event':'run_finished','result':{'runID':run,'status':'complete','targets':[]}}).encode())
+                if mode=='bad-id':
+                    probe.containers={'not-an-id':next(iter(probe.containers.values()))};probe.roles={'not-an-id':'scheduler'}
+                else:probe.containers.update({str(i):'synthetic' for i in range(128)})
+                with patch.object(module.Probe,'cleanup'):probe.cleanup()
+                self.assertEqual(queries,[])
+                self.assertEqual([c.args[0] for c in probe.e.inspect.call_args_list],['a'*64])
+                self.assertEqual(probe.result['scheduler_diagnostics']['controller_completions'],{'status':'unavailable','items':[]})
+
+    def test_scheduler_controller_failure_is_not_a_worker_failure_receipt(self):
+        import json,tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        module=self.module()
+        with tempfile.TemporaryDirectory() as directory:
+            probe,_,run=self.scheduler_probe(Path(directory))
+            probe.e.inspect.return_value['State'].update(ExitCode=0,OOMKilled=False)
+            output=probe.root/'state/workflow/output/result.json';output.parent.mkdir(parents=True)
+            output.write_text(json.dumps({'runID':run,'status':'complete','targets':[{'targetID':'PRIVATE-CANARY','status':'complete'}]}))
+            self.scheduler_stdout(probe,json.dumps({'event':'run_finished','failed':True,'result':{'runID':run,'status':'failed','targets':[
+                {'targetID':'PRIVATE-CANARY','status':'unknown','error':'PRIVATE-CANARY'}]}}).encode())
+            with patch.object(module.Probe,'cleanup'):probe.cleanup()
+            public=module.public_scheduler_diagnostics(probe.result)
+            self.assertEqual(public['workers'][0]['exit_code'],0)
+            self.assertEqual(public['durable'],[{'state_directory':'state','record':'workflow_output','run_id':run,'status':'complete','phase':None}])
+            controller=public['controller_completions']['items'][0]
+            self.assertEqual(controller['status'],'failed');self.assertTrue(controller['controller_failed'])
+            self.assertEqual(controller['targets'],[{'ordinal':0,'status':'unknown','failureCode':None,'resticExitCode':None,'resticReason':None}])
+            # A controller can synthesize a failed result; never relabel it worker-published.
+            self.assertNotIn('targets',public['durable'][0]);self.assertNotIn('PRIVATE-CANARY',json.dumps(public))
+
+    def test_scheduler_stdout_multiple_schedulers_preserve_first_evidence_with_bounded_items(self):
+        import copy,json,tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+        module=self.module()
+        for first_missing in (False,True):
+            with self.subTest(first_missing=first_missing),tempfile.TemporaryDirectory() as directory:
+                probe,_,run=self.scheduler_probe(Path(directory))
+                events=[{'event':'run_finished','failed':True,'result':{'runID':run,'status':'failed','targets':[
+                    {'status':'unknown','failureCode':'backup','resticExitCode':code,'resticReason':'unknown'}]}} for code in range(256)]
+                payload=b'\n'.join(json.dumps(e).encode() for e in events)
+                scheduler,queries=self.scheduler_stdout(probe,payload)
+                second=copy.deepcopy(scheduler);second['Id']='f'*64;second['Name']='/unit-probe-serve-456def'
+                probe.containers[second['Id']]=second['Name'][1:];probe.roles[second['Id']]='scheduler'
+                inspect=probe.e.inspect.side_effect;call=probe.e.call.side_effect
+                probe.e.inspect.side_effect=lambda cid,**kw:second if cid==second['Id'] else inspect(cid,**kw)
+                def response(method,path,**kwargs):
+                    if '/'+scheduler['Id']+'/logs' in path:
+                        if first_missing:raise OSError('PRIVATE-CANARY')
+                        return call(method,path,**kwargs)
+                    if '/'+second['Id']+'/logs' in path:
+                        # Same run can be reported after scheduler adoption; keep provenance separate.
+                        raw=json.dumps({**events[0],'failed':False}).encode()
+                        return bytes([1,0,0,0])+len(raw).to_bytes(4,'big')+raw
+                    return call(method,path,**kwargs)
+                probe.e.call.side_effect=response
+                with patch.object(module.Probe,'cleanup'):probe.cleanup()
+                section=probe.result['scheduler_diagnostics']['controller_completions']
+                self.assertEqual(section['status'],'observed');self.assertEqual(len(section['items']),1 if first_missing else 256)
+                self.assertEqual(section['items'][0]['controller_failed'],not first_missing)
+                self.assertEqual(module.public_scheduler_diagnostics(probe.result)['controller_completions'],section)
 
     def module(self):
         try:module=importlib.import_module('run_hosted_resources')

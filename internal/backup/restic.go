@@ -21,6 +21,10 @@ type Repository struct {
 	VerifySource func(context.Context) error `json:"-"`
 }
 
+// Smaller packs leave room for concurrent open-unlinked uploads in worker tmpfs.
+// This is a measured default, not a universal temporary-storage bound.
+const packSizeArg = "--pack-size=4"
+
 type Snapshot struct {
 	ID       string   `json:"id"`
 	Tags     []string `json:"tags"`
@@ -145,7 +149,7 @@ func (r Repository) Backup(ctx context.Context, m Metadata, run, host string, so
 			return fail("metadata_readback", errors.New("run identity already exists"))
 		}
 	}
-	args := []string{"backup", "--json", "--host", host}
+	args := []string{"backup", packSizeArg, "--json", "--host", host}
 	for _, tag := range tags {
 		args = append(args, "--tag", tag)
 	}

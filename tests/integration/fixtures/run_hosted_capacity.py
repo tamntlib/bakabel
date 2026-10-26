@@ -24,7 +24,7 @@ from run_compose_pg_acceptance import fingerprint
 from run_hosted_acceptance import require_hosted_daemon, failure_location
 
 # Reviewed completion-protocol candidate; never infer admission from CLI input.
-STOCK_SOURCE = '87ae2798a7c388c0eaad4d17e7604758000db052d34dc08c73282f3b8fabf9ac'
+STOCK_SOURCE = 'c143839dbdf75e409e927d087575c4ebd6201eb521594ed5dced7d6a8bb18293'
 
 
 FILES = 8192

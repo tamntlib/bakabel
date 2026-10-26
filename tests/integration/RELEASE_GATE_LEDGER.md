@@ -16,22 +16,22 @@ The historical Astra R3 core fingerprint is `6a592fcf1159d301bbe9acf0ff82e3e6819
 
 ## Current-workflow fault instances
 
-The first twelve rows are implemented in `fixtures/run_hosted_faults.py`; `fixtures/verify_hosted_faults.py` defines their exact case identities and fail-closed assertions. **No hosted result for this new runner is recorded yet.** Offline tests are not substituted for the runtime column.
+The first twelve rows passed on hosted run `40292564391` at commit `c50cf16e9dd89796b9cf6f33b522620c762a3a48`, core fingerprint `87ae2798a7c388c0eaad4d17e7604758000db052d34dc08c73282f3b8fabf9ac`. Parent reran every case verifier and the aggregate verifier against the digest-checked artifacts. This is retained evidence for that candidate, not certification of subsequent production changes. `fixtures/verify_hosted_faults.py` defines the exact case identities and fail-closed assertions.
 
 | ID | Required instance | PLAN reference | Evidence / remaining action |
 |---|---|---|---|
-| F01 | Producer fails after real partial dump output | §5.2; §10 | Implemented `producer-failure-after-output`; real run pending. |
-| F02 | Worker SIGKILL during active output | §5.2; §10 | Implemented `streaming-worker-SIGKILL`; real run pending. |
-| F03 | Docker exec stream disconnect | §5.2; §10 | Implemented `docker-stream-drop`; real run pending. |
-| F04 | Exact exec status unavailable, quarantine survives fresh scheduler, then real recovery | §5.2; §7 | Implemented `docker-stream-drop-status-unavailable-recovery`; real run pending. |
-| F05 | Scheduled/current worker create response lost after real side effect | §7 | Implemented `worker-create-response-loss`; real run pending. |
-| F06 | Worker start response lost | §7 | Implemented `worker-start-response-loss`; real run pending. |
-| F07 | Dump exec-create response lost before ID persistence | §5.2 | Implemented `dump-create-response-loss`; expected durable quarantine, **not** ownership recovery. Real run pending. |
-| F08 | Dump exec-start response lost after persisted ID | §5.2 | Implemented `dump-start-response-loss`; real run pending. |
-| F09 | Independent restore-import create response lost | §6; §7 | Implemented `restore-create-response-loss`; expected durable quarantine, not recovery. Real run pending. |
-| F10 | Restore-import start response lost | §6; §7 | Implemented `restore-start-response-loss`; real run pending. |
-| F11 | Backup versus public restore / retention-configured run | §7; §10 | Implemented `backup-vs-restore-and-retention`; real run pending. No standalone maintenance CLI is invented. |
-| F12 | Controller kill and two scheduler restarts preserve original deadline/worker/job and last success | §7; §10 | Implemented `scheduler-restart-original-deadline`; real run pending. |
+| F01 | Producer fails after real partial dump output | §5.2; §10 | `producer-failure-after-output`: PASS on `c50cf16`, run above. |
+| F02 | Worker SIGKILL during active output | §5.2; §10 | `streaming-worker-SIGKILL`: PASS on `c50cf16`, run above. |
+| F03 | Docker exec stream disconnect | §5.2; §10 | `docker-stream-drop`: PASS on `c50cf16`, run above. |
+| F04 | Exact exec status unavailable, quarantine survives fresh scheduler, then real recovery | §5.2; §7 | `docker-stream-drop-status-unavailable-recovery`: PASS on `c50cf16`, run above. |
+| F05 | Scheduled/current worker create response lost after real side effect | §7 | `worker-create-response-loss`: PASS on `c50cf16`, run above. |
+| F06 | Worker start response lost | §7 | `worker-start-response-loss`: PASS on `c50cf16`, run above. |
+| F07 | Dump exec-create response lost before ID persistence | §5.2 | `dump-create-response-loss`: PASS on `c50cf16`; durable quarantine, **not** ownership recovery. |
+| F08 | Dump exec-start response lost after persisted ID | §5.2 | `dump-start-response-loss`: PASS on `c50cf16`, run above. |
+| F09 | Independent restore-import create response lost | §6; §7 | `restore-create-response-loss`: PASS on `c50cf16`; durable quarantine, not recovery. |
+| F10 | Restore-import start response lost | §6; §7 | `restore-start-response-loss`: PASS on `c50cf16`, run above. |
+| F11 | Backup versus public restore / retention-configured run | §7; §10 | `backup-vs-restore-and-retention`: PASS on `c50cf16`. No standalone maintenance CLI is invented. |
+| F12 | Controller kill and two scheduler restarts preserve original deadline/worker/job and last success | §7; §10 | `scheduler-restart-original-deadline`: PASS on `c50cf16`, run above. |
 | F13 | Kill exactly after persisted exec ID but before start forwarding | §5.2 | Separate experiment still missing; response-loss cases bracket but do not replace this instance. |
 | F14 | Restore reader failure with otherwise valid import | §6; §10 | Current reader/import exit-status unit/API coverage retained; current public fault experiment still missing. |
 | F15 | Worker dies during observable active import; independent import-token terminal recovery | §6; §10 | Current orchestration experiment still missing; retain existing API cancellation evidence. |
@@ -63,6 +63,15 @@ Source-task replacement, wrong credentials, wrong repository password, missing r
 Capacity reports must retain worker/scheduler/source/restore scope separately, actual image/binary/helper-image overhead, sampled tmp/state/log footprints, persistent S3/source/target storage and exact cleanup. Missing counters and exit-race observations are not zero measurements. Host physical-device attribution, continuous process-birth affinity, arbitrary repository size, universal 512MiB sufficiency, scheduler-128MiB sufficiency and universal RTO are **not** requirements or promises established by these fixtures. PLAN §8 explicitly forbids invented premeasurement RAM thresholds.
 
 ## Preserved new failed attempts
+
+Run `40292564391` at `c50cf16` passed core 44 and faults 12/12, but remains failed:
+scheduler did not reach its first scheduled success, and capacity's third
+(changed-data) file backup returned stage `backup`, Restic exit 1, reason `enospc`.
+First and unchanged capacity rounds completed, but their success does not close
+the full C01–C06 gates or missing readback/restore. Hosted OOM/repository-ENOSPC
+cases were not reached. The separate local temp-pack failure and 4 MiB pack
+correction are documented in [resource evidence](../../docs/resources.md);
+the changed candidate needs fresh exact-source hosted replay.
 
 | Run | Actual boundary |
 |---|---|

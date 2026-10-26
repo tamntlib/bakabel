@@ -27,7 +27,7 @@ from run_hosted_acceptance import require_hosted_daemon, failure_location
 from run_hosted_capacity import CapacityEngine
 
 # Reviewed completion-protocol candidate; never infer admission from CLI input.
-FROZEN_SOURCE = '87ae2798a7c388c0eaad4d17e7604758000db052d34dc08c73282f3b8fabf9ac'
+FROZEN_SOURCE = 'c143839dbdf75e409e927d087575c4ebd6201eb521594ed5dced7d6a8bb18293'
 
 
 def relay_path(root, case):

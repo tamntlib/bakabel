@@ -54,10 +54,25 @@ def public_measurements(summary):
     return result
 
 
+def scheduler_completion_fields(value):
+    """Only the completion status and ordinal target diagnostics, never IDs/text."""
+    targets=value.get('targets')
+    if not isinstance(targets,list) or len(targets)>128 or any(not isinstance(t,dict) for t in targets):return None
+    def enum(item,allowed):return item if isinstance(item,str) and item in allowed else None
+    rows=[]
+    for index,target in enumerate(targets):
+        code=target.get('resticExitCode')
+        rows.append({'ordinal':index,'status':enum(target.get('status'),('complete','restored','unknown','partial')),
+            'failureCode':enum(target.get('failureCode'),('file_preflight','list_before','backup','list_after','source_verification','tag','final_readback','metadata_readback')),
+            'resticExitCode':code if type(code) is int and 0<=code<=255 else None,
+            'resticReason':enum(target.get('resticReason'),('enospc','permission','backend','unknown'))})
+    return {'status':enum(value.get('status'),('complete','restored','failed')),'targets':rows}
+
+
 def public_scheduler_diagnostics(raw):
     """Re-project even our private diagnostic receipt; never copy free text."""
     value=raw.get('scheduler_diagnostics',{})
-    out={'workers':[],'durable':[],'events':{'status':'unavailable','items':[]}}
+    out={'workers':[],'durable':[],'events':{'status':'unavailable','items':[]},'controller_completions':{'status':'unavailable','items':[]}}
     if not isinstance(value,dict):return out
     def identifier(item,length):return isinstance(item,str) and re.fullmatch(r'[0-9a-f]{'+str(length)+'}',item)
     def enum(item,allowed):return item if item in allowed else None
@@ -81,6 +96,18 @@ def public_scheduler_diagnostics(raw):
         out['durable'].append({'state_directory':row['state_directory'],'record':row['record'],'run_id':row['run_id'],
             'status':enum(row.get('status'),statuses[row['record']]),
             'phase':enum(row.get('phase'),('intent','creating_exec','exec_created','exec_started','quarantine')) if row['record']=='owner' else None})
+    completions=value.get('controller_completions',{})
+    if isinstance(completions,dict) and completions.get('status')=='observed':
+        rows=completions.get('items',[])
+        for row in rows if isinstance(rows,list) and len(rows)<=256 else []:
+            if (not isinstance(row,dict) or not identifier(row.get('run_id'),32) or
+                row.get('state_directory') not in ('state','fresh-state') or
+                (row['state_directory'],row['run_id']) not in owned):continue
+            fields=scheduler_completion_fields(row)
+            if fields is not None:
+                out['controller_completions']['items'].append({'state_directory':row['state_directory'],'run_id':row['run_id'],
+                    **fields,'controller_failed':row.get('controller_failed') if type(row.get('controller_failed')) is bool else None})
+        if out['controller_completions']['items']:out['controller_completions']['status']='observed'
     events=value.get('events',{})
     if not isinstance(events,dict) or events.get('status')!='observed':return out
     out['events']['status']='observed'
@@ -150,10 +177,57 @@ class HostedResourceProbe(BoundEvidence,Probe):
         finally:
             if directory is not None:os.close(directory)
 
+    def collect_scheduler_completions(self,verified,diagnostics):
+        """Retained stdout is controller evidence, not a worker-published receipt."""
+        completion=diagnostics['controller_completions']
+        containers=dict(getattr(self,'containers',{}))
+        if not verified or len(containers)>128:return
+        for cid,name in containers.items():
+            if (not isinstance(cid,str) or not re.fullmatch(r'[0-9a-f]{64}',cid) or not isinstance(name,str) or
+                getattr(self,'roles',{}).get(cid)!='scheduler'):continue
+            try:
+                obj=self.e.inspect(cid,missing=True)
+                if not isinstance(obj,dict):continue
+                config=obj.get('Config',{});labels=config.get('Labels') or {}
+                if (obj.get('Id')!=cid or obj.get('Name')!='/'+name or obj.get('Image')!=self.image or
+                    labels.get('probe.bakabel.owner')!=self.prefix or labels.get('bakabel.installation')!=self.prefix or
+                    labels.get('bakabel.role')!='scheduler' or config.get('Cmd')!=['--config','/config.yaml','serve'] or
+                    config.get('Entrypoint')!=['/usr/local/bin/bakabel'] or config.get('Tty',False) is not False):continue
+                states=[state for state in ('state','fresh-state') if any(
+                    m.get('Type')=='bind' and m.get('Destination')=='/state' and m.get('Source')==str(self.root/state)
+                    for m in obj.get('Mounts',[]))]
+                if len(states)!=1 or not any(r['state']==states[0] for r in verified.values()):continue
+                raw=self.e.call('GET','/containers/'+cid+'/logs?stdout=true&stderr=false&follow=false&timestamps=false&tail=256',raw=True)
+                if not isinstance(raw,bytes) or len(raw)>256*1024:continue
+                text=b''
+                while raw:
+                    if len(raw)<8 or raw[0] not in (1,2) or raw[1:4]!=b'\0\0\0':raise ValueError('invalid log frame')
+                    stream=raw[0];size=int.from_bytes(raw[4:8],'big')
+                    if size>len(raw)-8:raise ValueError('truncated log frame')
+                    if stream==1:text+=raw[8:8+size]
+                    raw=raw[8+size:]
+                lines=text.decode().splitlines()
+                if len(lines)>256:continue
+                for line in lines:
+                    try:event=json.loads(line)
+                    except ValueError:continue
+                    if not isinstance(event,dict) or event.get('event')!='run_finished':continue
+                    value=event.get('result')
+                    if not isinstance(value,dict):continue
+                    run=value.get('runID')
+                    if not any(r['runID']==run and r['state']==states[0] for r in verified.values()):continue
+                    fields=scheduler_completion_fields(value)
+                    if fields is None:continue
+                    failed=event.get('failed',False)  # Serve omits false; absence is not a missing receipt.
+                    row={'state_directory':states[0],'run_id':run,**fields,'controller_failed':failed if type(failed) is bool else None}
+                    if len(completion['items'])<256 and row not in completion['items']:completion['items'].append(row)
+            except Exception:continue
+        if completion['items']:completion['status']='observed'
+
     def collect_scheduler_diagnostics(self):
         """Best effort only; never replace the lifecycle or sampler's errors."""
         from run_resource_probe import worker_owned
-        diagnostics={'workers':[],'durable':[],'events':{'status':'unavailable','items':[]}}
+        diagnostics={'workers':[],'durable':[],'events':{'status':'unavailable','items':[]},'controller_completions':{'status':'unavailable','items':[]}}
         self.result['scheduler_diagnostics']=diagnostics
         if len(self.worker_records)>128:return
         if self.e.call('GET','/info')['ID']!=self.daemon:return
@@ -202,6 +276,7 @@ class HostedResourceProbe(BoundEvidence,Probe):
                 diagnostics['durable'].append({'state_directory':state,'record':kind,'run_id':value['runID'],
                     'status':value.get('status') if value.get('status') in statuses else None,
                     'phase':value.get('phase') if kind=='owner' and value.get('phase') in phases else None})
+        self.collect_scheduler_completions(verified,diagnostics)
         # Engine history is bounded/cache-limited; no event is not proof of no OOM.
         start=getattr(self,'_events_since_ns',None);end=time.time_ns()
         if not verified or type(start) is not int or not 0<start<end:return

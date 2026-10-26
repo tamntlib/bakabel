@@ -34,6 +34,38 @@ Export includes small Docker-injected files. These values are not a complete Doc
 
 Sampled worker temp/cache and logs were zero bytes; rootfs stayed read-only, `/tmp` was a 64 MiB tmpfs and Restic used `--no-cache`. Small workflow state remained; no full local DB dump or S3 repository mirror was introduced. Backend repository storage and source/target database/WAL growth are separate from the worker footprint. PG logical I/O/WAL counters were recorded, but physical block I/O was unavailable on this rootless daemon; they are not interchangeable.
 
+The zero temp/cache figure above counted named files only. It did not measure
+filesystem availability or open-unlinked pack files and is not evidence of zero
+temporary storage use.
+
+## Pack storage correction and current candidate
+
+Hosted run [40292564391](https://github.com/tamntlib/bakabel/actions/runs/40292564391)
+at `c50cf16e9dd89796b9cf6f33b522620c762a3a48` passed the 44 core gates and all
+12 implemented fault cases. Capacity completed its first and unchanged rounds,
+but the changed file target failed with stage `backup`, Restic exit 1 and the
+finite stderr classification `enospc`. That receipt alone does not identify the
+exhausted filesystem. Scheduler first-success replay also failed; its cause is
+not inferred from the separate capacity VM.
+
+A separate local causal probe used the same pinned Restic 0.18.1, a 128 MiB
+incompressible file corpus, real MinIO, 512 MiB memory, 64 MiB tmpfs and a fixed
+4 MiB/s upload limit. With stock 16 MiB packs, Restic reported a failed write to
+`/tmp/restic-temp-pack-*` with ENOSPC, tmpfs availability reached zero, five
+open-unlinked pack files occupied all 67,108,864 bytes, exit was 1 and no snapshot
+was created. Changing only pack size to 4 MiB completed with one snapshot;
+sampled tmpfs usage peaked at 28,340,224 bytes. Exact owned containers/volumes and
+private credential files were removed and absence checked.
+
+Bakabel now passes the fixed `--pack-size=4` option to backup and retention prune,
+the two paths that write packs. RAM/tmpfs limits, streaming, native repository
+locks and retention's disabled default are unchanged. This trades more/smaller
+repository objects for lower observed concurrent temporary-pack allocation;
+there is no new configuration knob or full-data staging. These measurements are
+not a universal storage bound, a proof of the historical scheduler cause, or
+hosted certification of the changed candidate. A fresh exact-candidate replay is
+required.
+
 ## Verified lifecycle and controlled failures
 
 - Real scheduled mixed success; scheduler SIGKILL/restart adopted the same worker with the unchanged original job/deadline, rather than spawning another run.

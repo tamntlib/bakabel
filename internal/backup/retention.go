@@ -83,5 +83,5 @@ func (r Repository) Retain(ctx context.Context, p Retention, host, installation 
 	if !removed {
 		return nil
 	}
-	return r.command(ctx, io.Discard, "prune")
+	return r.command(ctx, io.Discard, "prune", packSizeArg)
 }
