@@ -2,7 +2,7 @@
 
 **Release: NOT READY.** This ledger maps requirements to evidence; it does not turn implementation, offline tests, or a successful process exit into runtime acceptance.
 
-The historical Astra R3 core fingerprint is `6a592fcf1159d301bbe9acf0ff82e3e681913de4d1fb6f17ccc2d05c9d394ef8`. Production Go is now changing to repair frame-boundary suffix-loss acceptance; see [the completion protocol and limitations](../../docs/streaming.md). R3 review/runtime evidence does not certify this changed candidate. Every fresh hosted result must bind its exact source fingerprint, Git commit, actual image ID and disposable daemon. The previous complete core acceptance was run `40236930603` at commit `f3be77e36d1be73d9f3c8b706ec4f386b96a4a9c`; it does not certify later source or fixture revisions.
+The historical Astra R3 core fingerprint is `6a592fcf1159d301bbe9acf0ff82e3e681913de4d1fb6f17ccc2d05c9d394ef8`. The later frame-boundary suffix-loss repair is documented in [the completion protocol and limitations](../../docs/streaming.md). The current additive fixture candidate preserves the `b46b95d` production/core fingerprint `c143839dbdf75e409e927d087575c4ebd6201eb521594ed5dced7d6a8bb18293`; no Go, Dockerfile, dependency, pin, worker default or production deadline changes are included. R3 review/runtime evidence does not certify this candidate. Every fresh hosted result must bind its exact source fingerprint, Git commit, actual image ID and disposable daemon. Older core acceptance run `40236930603` at commit `f3be77e36d1be73d9f3c8b706ec4f386b96a4a9c` does not certify later source or fixture revisions.
 
 ## Evidence already credited within its boundary
 
@@ -33,15 +33,15 @@ The first twelve rows passed on hosted run `40292564391` at commit `c50cf16e9dd8
 | F11 | Backup versus public restore / retention-configured run | §7; §10 | `backup-vs-restore-and-retention`: PASS on `c50cf16`. No standalone maintenance CLI is invented. |
 | F12 | Controller kill and two scheduler restarts preserve original deadline/worker/job and last success | §7; §10 | `scheduler-restart-original-deadline`: PASS on `c50cf16`, run above. |
 | F13 | Kill exactly after persisted exec ID but before start forwarding | §5.2 | `dump-persisted-before-start-worker-SIGKILL`: PASS on `97b9611`, hosted run `40365486870`; exact retained quarantine, **not** terminal exec success, ownership release or production fencing. See the preserved attempt below. |
-| F14 | Restore reader failure with otherwise valid import | §6; §10 | Current reader/import exit-status unit/API coverage retained; current public fault experiment still missing. |
-| F15 | Worker dies during observable active import; independent import-token terminal recovery | §6; §10 | Fixture implemented provisionally; final review and hosted runtime pending. Recovery scope is the original public restore controller, independent of the killed worker, not a fresh-controller restart claim. |
-| F16 | Genuine Restic exit 3: snapshot ID **and** error, partial/unknown refusal | §5.4; §10 | Historical real exit-3 and current status tests retained; current-workflow generated partial receipt still missing. Operator retagging is not this case. |
-| F17 | Crash after unknown commit, before finalization | §5.4; §10 | Fresh-state repository classification and exact snapshot IDs required; wrapper/tag failure is not a process crash. |
-| F18 | Crash after finalization, before report | §5.4; §10 | Fresh-state complete classification and old/new ID mapping required; not yet exercised as a current-workflow crash. |
-| F19 | Actual temp/buffer storage ENOSPC | §7; §10 | Repository ENOSPC is separate; exercise bounded disposable temp storage. Persistent Restic cache is not applicable (`--no-cache`). |
-| F20 | Actual restore-output ENOSPC | §10 | Bounded disposable output filesystem required; preserve partial target and failure result. |
-| F21 | File changes/truncates while being read | §10 | Mount/unreadable tests are not this literal instance. Record actual Restic disposition; do not promise application consistency. |
-| F22 | Snapshot requires unavailable target extension binaries, then correct prerequisites | §6; §10 | Missing-role and preexisting-nonempty-extension tests are separate; missing-binary prerequisite experiment still needed. |
+| F14 | Restore reader failure with otherwise valid import | §6; §10 | Additive ordinary-public-CLI candidate and offline regressions implemented; hosted runtime **NOT RUN**. See [F14 handoff](F14_PUBLIC_CLI_HANDOFF.md). Historical APP/API evidence remains component-only. |
+| F15 | Worker dies during observable active import; independent import-token terminal recovery | §6; §10 | `restore-active-import-worker-SIGKILL`: actual hosted PASS on `b46b95d`, run `40448351015`, independently audited below. Recovery scope is the original public restore controller, independent of the killed worker, not a fresh-controller restart claim. |
+| F16 | Genuine Restic exit 3: snapshot ID **and** error, partial/unknown refusal | §5.4; §10 | Additive `restic-native-exit3` fixture and offline regressions implemented provisionally; real native read-permission denial, snapshot+error and fresh incomplete-restore refusal still require hosted execution. Runtime **NOT RUN**; no operator retag substitute. See `NATIVE_FAULT_GATES.md`. |
+| F17 | Crash after unknown commit, before finalization | §5.4; §10 | Additive `unknown-commit-before-finalize-worker-SIGKILL` fixture implemented provisionally: hold real committed-snapshot readback, classify exact unknown ID, then actual owned worker kill. Offline proof checks are not crash evidence. Hosted runtime **NOT RUN**. |
+| F18 | Crash after finalization, before report | §5.4; §10 | Additive `finalized-before-report-worker-SIGKILL` fixture implemented provisionally: hold native result-temp create after complete final readback; require actual SIGKILL, exact old/new mapping and fresh complete classification despite failed overall run. Hosted runtime **NOT RUN**. |
+| F19 | Actual temp/buffer storage ENOSPC | §7; §10 | Additive `temp-pack-ENOSPC` fixture and offline regressions implemented; exact owned 64MiB worker `/tmp`, actual traced Restic temp-pack/index write errno28, terminal source/worker proof required. Hosted runtime **NOT RUN**. Repository ENOSPC remains separate; persistent cache is not applicable (`--no-cache`). See `STORAGE_PREREQUISITES_HANDOFF.md`. |
+| F20 | Actual restore-output ENOSPC | §10 | Additive `restore-output-ENOSPC` fixture implemented; separate initially empty owned 8MiB output tmpfs, actual output-file write errno28, retained allocated partial target and unchanged source required. Hosted runtime **NOT RUN**. |
+| F21 | File changes/truncates while being read | §10 | Additive `file-truncate-during-native-read` fixture implemented provisionally: positive native descriptor/read boundary, literal owned-file truncation, actual disposition retained without application-consistency claims. Offline protocol/file tests only; hosted runtime **NOT RUN**. |
+| F22 | Snapshot requires unavailable target extension binaries, then correct prerequisites | §6; §10 | Additive `restore-missing-extension-binary-prerequisites` fixture implemented; hide only owned target `hstore.so`, require actual import failure, restore identical library and retry same target/DB without restart or deletion. Hosted runtime **NOT RUN**. Missing-role/preexisting-extension cases remain separate. |
 
 Source-task replacement, wrong credentials, wrong repository password, missing repository, unsupported replicas and unsupported nodes have older real API evidence (`fixtures/README.md`; `swarm_s3_test.go`). Keep each boundary explicit when mapping these to the final current CLI: historical evidence must not be discarded, but no current CLI execution is claimed here. No-target, path traversal, corrupt/stale state, unsupported metadata/client versions and conninfo input also retain their focused source/unit proofs; they are not multiplied into another full hosted Cartesian product merely to inflate gate counts.
 
@@ -88,7 +88,45 @@ ordinary swap policy and20s controller/3s terminal/45s job windows. Active
 corpus/deadline relaxation or gate weakening is permitted. If16 fails, R03
 stays red; the scoped16 PASS does not relabel32 or establish production sizing.
 
-## Current bounded hosted PASS
+## Latest retained bounded hosted PASS — b46b95d
+
+CI `40448350899` and acceptance `40448351015` passed at
+`b46b95d51ff9ac5437dc047b7d8f5c7f2e93230b`, tree
+`8e4ce0f596702a490277b4930160e22b4c8d313b`, unchanged core
+`c143839dbdf75e409e927d087575c4ebd6201eb521594ed5dced7d6a8bb18293`.
+The independent frozen-source audit checked retained ZIP/API-digest bindings,
+exact extracted bytes and per-VM commit/image/daemon linkage. It reran core's
+44 public criteria, all six capacity gates and summary, and all fourteen fault
+cases, aggregate and frozen verifier CLI. All four resource cases emitted
+verified projections; private raw resource inputs were not uploaded, so those
+checks are typed public consistency, not private-verifier reexecution. No fresh
+authenticated API lookup or Engine cleanup readback is claimed by that audit.
+
+F15 was the actual `restore-active-import-worker-SIGKILL` case: a live target
+COPY session/process with independent import token was observed, the exact
+authorized worker was killed and terminal exit137 proved, and the actual import
+exited1 with matching sessions0/processes0 before nonforce worker DELETE and
+ownership release. Public restore exited1, failed/unknown with exact logical
+source/snapshot and `restore failed`; last backup success was preserved and the
+partial target retained. Its receipt SHA-256 is
+`49e4437450f16da0323cd6184c4a8e463b8a1537aa383181da47d1db4fdc0068`.
+This proves original-controller recovery independent of the killed worker,
+not fresh-controller restart. F13 separately retained its exact quarantine
+boundary; a prekill running worker's exit-zero placeholder is not terminality.
+
+Independent audit SHA-256:
+`89c4b13d0a6ec0a9e428d36e4edd0c70ff557f2bb7fcf0f06437a1dd3b910322`.
+The original fourteen-case prefix and its safety assertions remain intact.
+The additive candidate appends F14/F16/F17/F18/F21 to that fault suite and runs
+F19/F20/F22 as a separate mandatory storage/prerequisite suite with its own
+independent verifier and allowlisted export. All eight new gates remain runtime
+**NOT RUN**; offline tests are not hosted receipts. Final independent review
+of the exact integrated candidate (including the requested real Astra review),
+separately authorized hosted execution and exact artifact verification remain
+required. Previous review fingerprints are stale for this changed fixture tree.
+This is not full PLAN release readiness, publication or deployment approval.
+
+## Previous bounded hosted PASS — e886bef
 
 CI `40379259970` and all three jobs of acceptance `40379260708` passed at
 `e886befa2134ea8bae8c9f460e757e5541bad1a8`, tree

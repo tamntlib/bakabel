@@ -175,6 +175,21 @@ jobs:
             --image "$image_id" --expected-source-sha256 "$source_hash" --expected-image-id "$image_id"
           sudo taskset -c 0,1 python3 tests/integration/fixtures/verify_hosted_faults.py \
             --runtime "$RUNNER_TEMP/bakabel-faults"
+      - name: Additive bounded storage and extension prerequisite gates
+        if: matrix.suite == 'faults'
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v strace >/dev/null
+          source_hash=$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/bakabel-candidate.json"))["source_sha256"])')
+          image_id=$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/bakabel-candidate.json"))["image_id"])')
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP \
+            taskset -c 0,1 python3 tests/integration/fixtures/run_hosted_storage_prereqs.py \
+            --socket "$ENGINE_SOCKET" --exclusive-hosted-daemon \
+            --source "$PWD" --runtime "$RUNNER_TEMP/bakabel-storage" \
+            --image "$image_id" --expected-source-sha256 "$source_hash" --expected-image-id "$image_id"
+          sudo taskset -c 0,1 python3 tests/integration/fixtures/verify_hosted_storage_prereqs.py \
+            --runtime "$RUNNER_TEMP/bakabel-storage"
       - name: Export only allowlisted evidence even on failure
         if: always()
         shell: bash
@@ -204,12 +219,19 @@ jobs:
           from pathlib import Path
           sys.path.insert(0,'tests/integration/fixtures')
           from verify_hosted_faults import CASES
+          from verify_hosted_storage_prereqs import CASES as STORAGE_CASES
           root=Path(os.environ['RUNNER_TEMP']); target=root/'bakabel-public'; faults=root/'bakabel-faults'
           report=faults/'hosted-faults.json'
           if report.is_file(): shutil.copyfile(report,target/'hosted-faults.json')
           for case in CASES:
               receipt=faults/case/'receipt.json'
               if receipt.is_file(): shutil.copyfile(receipt,target/('faults-'+case+'.json'))
+          storage=root/'bakabel-storage'
+          report=storage/'hosted-storage.json'
+          if report.is_file(): shutil.copyfile(report,target/'hosted-storage.json')
+          for case in STORAGE_CASES:
+              receipt=storage/case/'receipt.json'
+              if receipt.is_file(): shutil.copyfile(receipt,target/('storage-'+case+'.json'))
           PY
           sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/bakabel-public"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

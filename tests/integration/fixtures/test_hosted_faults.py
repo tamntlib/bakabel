@@ -903,12 +903,14 @@ class FixtureContracts(unittest.TestCase):
         m = self.module()
         self.assertIn('run', m.FaultProbe.__dict__, 'do not inherit/relabel the old 44-core matrix')
         from verify_hosted_faults import CASES
-        for case in CASES:
-            probe = m.FaultProbe.__new__(m.FaultProbe); probe.case = case; probe.result = {}
+        from verify_hosted_native_faults import NATIVE_CASES
+        for case in (name for name in CASES if name not in NATIVE_CASES):
+            cls = m.probe_class_for_case(case)
+            probe = cls.__new__(cls); probe.case = case; probe.result = {}
             events = []
             probe.prepare = lambda: events.append('prepare')
             probe.verify_source_online = lambda: events.append('source-online')
-            for name in ('exercise_stream_fault','exercise_stream_drop','exercise_response_loss','exercise_overlap','exercise_restart','exercise_persisted_start','exercise_import_kill'):
+            for name in ('exercise_stream_fault','exercise_stream_drop','exercise_response_loss','exercise_overlap','exercise_restart','exercise_persisted_start','exercise_import_kill','exercise_reader_failure'):
                 setattr(probe, name, lambda name=name: events.append(name))
             probe.run()
             self.assertEqual(events[0], 'prepare'); self.assertEqual(events[-1], 'source-online')

@@ -864,6 +864,7 @@ class FaultProbe(ComposeProbe):
         # exact Engine object was read back absent. A successful DELETE is not
         # absence proof; ambiguous teardown must remain operator-recoverable.
         if not all(absent.values()) or not all(volabsent.values()): raise ValueError('owned cleanup absence not observed')
+        if hasattr(self, 'before_private_cleanup'): self.before_private_cleanup()
         retained = self.owner() is not None
         self.result['relay'] = self.relay.snapshot()
         self.relay.close()
@@ -913,8 +914,9 @@ def read_exact(conn, count):
 
 class FrameCounter:
     """Docker multiplex stdout byte count; never retains payload or stderr."""
-    def __init__(self):
+    def __init__(self, stderr_observer=None):
         self.header = bytearray(); self.left = 0; self.stream = 0; self.stdout = 0
+        self.stderr_observer = stderr_observer
 
     def feed(self, data):
         view = memoryview(data)
@@ -928,7 +930,9 @@ class FrameCounter:
                 self.stream = self.header[0]
                 self.left = int.from_bytes(self.header[4:8], 'big'); self.header.clear()
                 if not self.left: continue
-            n = min(self.left, len(view)); self.left -= n; view = view[n:]
+            n = min(self.left, len(view)); self.left -= n
+            if self.stream == 2 and self.stderr_observer: self.stderr_observer(view[:n])
+            view = view[n:]
             if self.stream == 1: self.stdout += n
 
 
@@ -990,6 +994,7 @@ class FaultRelay:
         self.hold = None
         self.closed = False
         self.observer = None
+        self.stderr_classifier_factory = None  # Opt-in transient classifier, never raw capture.
         relay = self
         class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
             daemon_threads = True
@@ -1045,6 +1050,9 @@ class FaultRelay:
         url = urlsplit(path)
         path = re.sub(r'^/v[0-9.]+', '', url.path)
         record = {'method': method, 'boundary': 'other', 'forwarded': False}
+        # Read-only external observer seam; never changes bytes or replies.
+        if method == 'GET' and path == '/containers/json' and url.query == 'all=true' and not url.fragment:
+            record['inventory_all'] = True
         removal = re.fullmatch(r'/containers/([a-f0-9]{64})',path)
         if method == 'DELETE' and removal and removal[1] in self.workers:
             record.update(boundary='worker-remove',container_id=removal[1])
@@ -1215,7 +1223,8 @@ class FaultRelay:
                 front.sendall(response_body)
                 return keepalive
             eid = record.get('exec_id') if record['boundary'].endswith('-start') else None
-            counter = FrameCounter()
+            diagnostic = self.stderr_classifier_factory(record) if eid and record['status'] == 101 and self.stderr_classifier_factory else None
+            counter = FrameCounter(stderr_observer=diagnostic.feed if diagnostic is not None else None)
             def forward(src, dst, data):
                 dst.sendall(data)
                 if eid:
@@ -1243,6 +1252,9 @@ class FaultRelay:
                         if data:
                             if not forward(src, dst, data): return
                         else:
+                            if src is back and diagnostic is not None:
+                                if counter.header or counter.left: raise ValueError('incomplete diagnostic frame')
+                                with self.lock: record['import_diagnostic'] = diagnostic.finish()
                             readers.remove(src)
                             try: dst.shutdown(socket.SHUT_WR)
                             except OSError: pass
@@ -1294,9 +1306,23 @@ class FaultRelay:
             back.close()
 
 
-def run_case(args, case, probe_class=None):
+def probe_class_for_case(case):
+    if case == 'restore-reader-failure-importer-zero':
+        from run_hosted_f14 import F14Mixin
+        class F14Probe(F14Mixin, FaultProbe):
+            pass
+        return F14Probe
+    from verify_hosted_native_faults import NATIVE_CASES
+    if case in NATIVE_CASES:
+        from run_hosted_native_faults import NativeFaultProbe
+        return NativeFaultProbe
+    return FaultProbe
+
+
+def run_case(args, case, probe_class=None, case_verifier=None, failure_projector=None):
+    locate = failure_projector or failure_location
     if args.runtime.exists(): raise ValueError('case runtime must be fresh')
-    cls = probe_class or FaultProbe
+    cls = probe_class or probe_class_for_case(case)
     probe = cls.__new__(cls); initialized = False
     result = {'schema':1,'case':case,'status':'blocked','source_sha256':args.expected_source_sha256,'image_id':args.expected_image_id,'full_plan_acceptance_pass':False}
     try:
@@ -1304,7 +1330,7 @@ def run_case(args, case, probe_class=None):
         probe.run(); result['status'] = 'pass'
     except Exception as exc:
         result['status'] = 'blocked' if not initialized or isinstance(exc,(TimeoutError,ConnectionError,FileNotFoundError)) else 'failed'
-        result['failure'] = failure_location(exc)
+        result['failure'] = locate(exc)
     finally:
         try:
             if initialized:
@@ -1317,7 +1343,7 @@ def run_case(args, case, probe_class=None):
                 args.runtime.mkdir(mode=0o700)
                 result['cleanup'] = {'initialization_only':True,'private_paths_absent':True}
         except Exception as exc:
-            result['status'] = 'failed'; result['cleanup_failure'] = failure_location(exc)
+            result['status'] = 'failed'; result['cleanup_failure'] = locate(exc)
             if hasattr(probe,'relay'):
                 try: probe.relay.close()
                 except Exception: pass
@@ -1327,15 +1353,15 @@ def run_case(args, case, probe_class=None):
                 try:
                     # Validate the public projection exactly as the independent
                     # verifier will, before returning success to a workflow.
-                    probe.save(); verify_case(json.loads((args.runtime/'receipt.json').read_text()))
+                    probe.save(); (case_verifier or verify_case)(json.loads((args.runtime/'receipt.json').read_text()))
                 except Exception as exc:
-                    result['status'] = 'failed'; result['verification_failure'] = failure_location(exc)
+                    result['status'] = 'failed'; result['verification_failure'] = locate(exc)
             try:
                 probe.save()
             except Exception as exc:
                 result['status'] = 'failed'
                 safe = {'schema':1,'case':case,'status':'failed','source_sha256':args.expected_source_sha256,
-                        'image_id':args.expected_image_id,'evidence_failure':failure_location(exc),'full_plan_acceptance_pass':False}
+                        'image_id':args.expected_image_id,'evidence_failure':locate(exc),'full_plan_acceptance_pass':False}
                 (args.runtime/'receipt.json').write_text(json.dumps(safe,indent=2)+'\n')
         else:
             (args.runtime/'receipt.json').write_text(json.dumps(result,indent=2)+'\n')

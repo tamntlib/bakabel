@@ -15,7 +15,7 @@ from urllib.parse import quote
 
 from run_compose_pg_acceptance import fingerprint
 from run_hosted_acceptance import require_hosted_daemon,run_platform
-from run_resource_failures import FailureProbe,observer_error_fields
+from run_resource_failures import FailureProbe,observer_error_fields,is_write_enospc
 from run_resource_probe import Engine,PG,Probe,kv_numbers,sha,utc
 from summarize_resource_probe import summarize
 from hosted_evidence import public_receipt
@@ -502,7 +502,7 @@ def run_case(args,case,engine):
             public['failure_safety']={k:proof[k] for k in ('status','complete','owner_released','worker_terminal','source_never_started','exec_terminal','session_count','worker_removed') if k in proof}
             public['effective_memory_max_values']=sorted({r.get('memory.max') for r in raw['failure_cgroup_samples'] if r.get('memory.max')})
             public['observed_oom_kill_max']=max((kv_numbers(r.get('memory.events','')).get('oom_kill',0) for r in raw['failure_cgroup_samples']),default=0)
-            public['actual_enospc_observations']=sum(row['errno']==28 for row in raw['repository_space_samples'])
+            public['actual_enospc_observations']=sum(is_write_enospc(row) for row in raw['repository_space_samples'])
         public['verified']=True
     except Exception as error:
         from run_hosted_acceptance import failure_location

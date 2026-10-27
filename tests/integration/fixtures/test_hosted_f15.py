@@ -504,7 +504,7 @@ class RunnerTests(unittest.TestCase):
     def test_f15_is_named_and_dispatch_does_not_relabel_old_thirteen_cases(self):
         m = importlib.import_module('run_hosted_faults'); v = importlib.import_module('verify_hosted_faults')
         self.assertIn(CASE,v.CASES,'F15 needs a separately named hosted case')
-        self.assertEqual(len(v.CASES),14)
+        self.assertEqual(v.CASES[13],CASE)  # Additive cases must not relabel the original fourteen.
         p = m.FaultProbe.__new__(m.FaultProbe); p.case = CASE; p.result = {}
         p.prepare = Mock(); p.exercise_import_kill = Mock(); p.verify_source_online = Mock()
         p.run(); p.exercise_import_kill.assert_called_once_with(); self.assertTrue(p.result['exercised'])

@@ -3,7 +3,7 @@
 import argparse, datetime, hashlib, json, os
 from pathlib import Path
 from run_resource_probe import Engine, sha, kv_numbers
-from run_resource_failures import assert_failure_proof
+from run_resource_failures import assert_failure_proof, is_write_enospc
 
 def epoch(value):return datetime.datetime.fromisoformat(value.replace('Z','+00:00')).timestamp()
 
@@ -57,10 +57,11 @@ def main():
         assert all(x.get('memory.max')=='536870912' for x in rows)
         proofspace=r['enospc_proof'];assert proofspace['worker_repository_source']==proofspace['repository_mountpoint']
         assert r['bounded_repository']['requested_bytes']==8388608
-        direct=r['enospc_direct_write_before_release'];assert direct['errno']==28 and direct['capacity_bytes']==8388608 and direct['available_bytes']==0
+        direct=r['enospc_direct_write_before_release'];assert is_write_enospc(direct) and direct['capacity_bytes']==8388608 and direct['available_bytes']==0
         end=epoch(r['worker_terminal_before_recovery']['State']['FinishedAt'])
-        relevant=[x for x in r['repository_space_samples'] if x['errno']==28 and epoch(direct['at'])<=epoch(x['at'])<=end]
+        relevant=[x for x in r['repository_space_samples'] if is_write_enospc(x) and epoch(direct['at'])<=epoch(x['at'])<=end]
         assert relevant and all(x['capacity_bytes']==8388608 and x['available_bytes']==0 for x in relevant)
+        assert is_write_enospc(r['repository_full_after_exact_terminal_proof'])
     for cid,value in r['cleanup']['containers_absent'].items():assert value and e.inspect(cid,missing=True) is None
     for vol,value in r['cleanup']['volumes_absent'].items():assert value and e.call('GET','/volumes/'+vol,missing=True) is None
     assert r['cleanup']['private_paths_absent'] and all(not (a.runtime/d).exists() for d in ['private','state','fresh-state','backend','bin'])

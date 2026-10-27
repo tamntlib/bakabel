@@ -10,6 +10,7 @@ import json
 import math
 from pathlib import Path
 import re
+from verify_hosted_native_faults import NATIVE_CASES, verify_native_case
 
 CASES = (
     'producer-failure-after-output',
@@ -26,7 +27,8 @@ CASES = (
     'scheduler-restart-original-deadline',
     'dump-persisted-before-start-worker-SIGKILL',
     'restore-active-import-worker-SIGKILL',
-)
+    'restore-reader-failure-importer-zero',
+) + NATIVE_CASES
 CREATE_GAPS = ('dump-create-response-loss', 'restore-create-response-loss')
 STREAMING = ('producer-failure-after-output', 'streaming-worker-SIGKILL', 'docker-stream-drop', 'docker-stream-drop-status-unavailable-recovery')
 
@@ -55,7 +57,12 @@ def verify_case(row):
         demand(isinstance(mapping, dict) and bool(mapping) and all(value is True for value in mapping.values()), 'exact owned cleanup missing')
     demand(cleanup.get('private_paths_absent') is True, 'credential cleanup missing')
     proof = row.get('proof', {})
-    if name == 'dump-persisted-before-start-worker-SIGKILL':
+    if name == 'restore-reader-failure-importer-zero':
+        from verify_hosted_f14 import verify_f14
+        verify_f14(row)
+    elif name in NATIVE_CASES:
+        verify_native_case(row)
+    elif name == 'dump-persisted-before-start-worker-SIGKILL':
         verify_persisted_start(row)
     elif name == 'restore-active-import-worker-SIGKILL':
         verify_import_kill(row)

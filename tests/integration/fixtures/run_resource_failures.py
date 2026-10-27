@@ -90,21 +90,110 @@ def source_dump_exec_seen(events):
     return any('pg_dump' in str(e.get('Action','')) or 'pg_dump' in str(e.get('Actor',{}).get('Attributes',{}).get('execCommand','')) for e in events)
 
 
+def space_probe_row(stat):
+    return {'at':utc(),'capacity_bytes':stat.f_blocks*stat.f_frsize,
+            'available_bytes':stat.f_bavail*stat.f_frsize,'free_bytes':stat.f_bfree*stat.f_frsize,
+            'errno':0,'create_errno':0,'write_errno':None,'write_attempted':False,'attempt_bytes':0,'stage':'create'}
+
+
+def is_write_enospc(row):
+    return (isinstance(row,dict) and row.get('stage') == 'write' and row.get('write_attempted') is True and
+            type(row.get('attempt_bytes')) is int and row['attempt_bytes'] == 1 and
+            type(row.get('create_errno')) is int and row['create_errno'] == 0 and
+            type(row.get('write_errno')) is int and row['write_errno'] == 28 and
+            type(row.get('errno')) is int and row['errno'] == 28)
+
+
+class OwnedSpaceProbe:
+    """Pin a zero-length owned file BEFORE pressure; serialize repeated writes.
+
+    Failed O_EXCL never confers deletion authority. A pinned directory and
+    entry incarnation guard cleanup against pathname replacement/collisions.
+    """
+    def __init__(self,directory):
+        self.directory=os.dup(directory) if type(directory) is int else os.open(directory,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+        self.path=None if type(directory) is int else os.fspath(directory)
+        self.fd=None; self.unlinked=False; self.lock=threading.Lock()
+        try:
+            for _ in range(8):
+                self.name='.owned-space-probe-'+secrets.token_hex(12)
+                try:
+                    self.fd=os.open(self.name,os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600,dir_fd=self.directory)
+                    break
+                except FileExistsError: continue
+            if self.fd is None: raise FileExistsError(17,'bounded probe name collision')
+            self.identity=os.fstat(self.fd)
+        except BaseException:
+            if self.fd is not None: os.close(self.fd)
+            os.close(self.directory); raise
+
+    def unlink_while_open(self):
+        """Retain only our inode FD so strict-empty restore sees no probe entry.
+
+        This requires the exclusively owned fixture directory: stat/unlink is
+        not an atomic defense against a hostile concurrent root administrator.
+        """
+        with self.lock:
+            if self.fd is None: raise ValueError('probe is closed')
+            if self.unlinked: raise ValueError('probe already unlinked')
+            def identity(stat): return stat.st_dev,stat.st_ino,stat.st_mode
+            if self.path is not None and identity(os.stat(self.path,follow_symlinks=False)) != identity(os.fstat(self.directory)):
+                raise ValueError('owned probe directory changed')
+            current=os.stat(self.name,dir_fd=self.directory,follow_symlinks=False)
+            pinned=os.fstat(self.fd)
+            if identity(current) != identity(self.identity) or identity(pinned) != identity(self.identity) or pinned.st_nlink != 1:
+                raise ValueError('owned probe entry changed')
+            os.unlink(self.name,dir_fd=self.directory)
+            self.unlinked=True
+            if os.fstat(self.fd).st_nlink != 0: raise ValueError('owned probe remains linked')
+
+    def sample(self):
+        with self.lock:
+            if self.fd is None: raise ValueError('probe is closed')
+            if self.unlinked and os.fstat(self.fd).st_nlink != 0: raise ValueError('owned probe relinked')
+            # Successful prior samples must not reserve a writable block and
+            # turn later full-filesystem writes into false negatives.
+            os.ftruncate(self.fd,0); os.lseek(self.fd,0,os.SEEK_SET)
+            row=space_probe_row(os.fstatvfs(self.directory))
+            row.update(stage='write',write_attempted=True,attempt_bytes=1,write_errno=0)
+            try:
+                if os.write(self.fd,b'x') != 1: raise ValueError('one byte write incomplete')
+            except OSError as exc:
+                row.update(errno=exc.errno,write_errno=exc.errno)
+                if exc.errno != 28: raise
+            finally: os.ftruncate(self.fd,0)
+            return row
+
+    def close(self):
+        with self.lock:
+            if self.fd is None: return
+            try:
+                if self.unlinked:
+                    if os.fstat(self.fd).st_nlink != 0: raise ValueError('owned probe relinked')
+                    return # Never acquire deletion authority over a replacement name.
+                try: current=os.stat(self.name,dir_fd=self.directory,follow_symlinks=False)
+                except FileNotFoundError: current=None
+                pinned=os.fstat(self.fd)
+                if current is not None:
+                    if ((current.st_dev,current.st_ino,current.st_mode) !=
+                            (self.identity.st_dev,self.identity.st_ino,self.identity.st_mode) or pinned.st_nlink != 1):
+                        raise ValueError('owned probe entry changed')
+                    os.unlink(self.name,dir_fd=self.directory)
+            finally:
+                os.close(self.fd); self.fd=None; os.close(self.directory)
+
+    def __enter__(self): return self
+    def __exit__(self,*args): self.close()
+
+
 def minimal_space_probe(directory):
-    stat=os.statvfs(directory)
-    row={'at':utc(),'capacity_bytes':stat.f_blocks*stat.f_frsize,'available_bytes':stat.f_bavail*stat.f_frsize,'free_bytes':stat.f_bfree*stat.f_frsize,'errno':0,'attempt_bytes':1}
-    path=Path(directory)/('.owned-space-probe-'+str(os.getpid())+'-'+str(threading.get_ident()))
-    fd=None
-    try:
-        fd=os.open(path,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
-        assert os.write(fd,b'x')==1
+    try: probe=OwnedSpaceProbe(directory)
     except OSError as exc:
-        row['errno']=exc.errno
-        if exc.errno!=28:raise
-    finally:
-        if fd is not None:os.close(fd)
-        path.unlink(missing_ok=True)
-    return row
+        if exc.errno != 28: raise
+        row=space_probe_row(os.statvfs(directory))
+        row.update(errno=exc.errno,create_errno=exc.errno)
+        return row
+    with probe: return probe.sample()
 
 
 def assert_failure_proof(p):
@@ -399,7 +488,7 @@ class FailureProbe(Probe):
             deadline=time.monotonic()+1
             try:
                 if self.args.mode=='enospc' and getattr(self,'repository_probe_path',None):
-                    self.result['repository_space_samples'].append(minimal_space_probe(self.repository_probe_path))
+                    self.result['repository_space_samples'].append(self.repository_space_probe.sample())
                 path=self.root/'state/owner.json'
                 if not path.exists():continue
                 owner=json.loads(path.read_text());cid=owner.get('workerContainerID')
@@ -463,6 +552,7 @@ class FailureProbe(Probe):
         cp=self.root/'config.yaml'
         cp.write_text(cp.read_text()+('worker_resources:\n  cpus: 2\n  memory_mib: '+str(self.args.memory_mib)+'\n' if self.args.mode=='oom' else 'worker_resources:\n  cpus: 0\n  memory_mib: 0\n'))
         self.lock(pg)
+        self.repository_space_probe=OwnedSpaceProbe(self.repository_probe_path) if self.args.mode == 'enospc' else None
         observer_stop=threading.Event();observer=threading.Thread(target=self.observe_fast,args=(observer_stop,),daemon=True)
         self._failure_observers=[(observer_stop,observer)];observer.start()
         try:
@@ -515,8 +605,8 @@ class FailureProbe(Probe):
                             assert exc.errno==28;break
                     else:raise AssertionError('bounded tmpfs did not reach ENOSPC')
                 self.result['enospc_filler_bytes']=filled
-                direct=minimal_space_probe(self.repository_probe_path)
-                assert direct['errno']==28 and direct['capacity_bytes']==size and direct['available_bytes']==0
+                direct=self.repository_space_probe.sample()
+                assert is_write_enospc(direct) and direct['capacity_bytes']==size and direct['available_bytes']==0
                 self.result['enospc_direct_write_before_release']=direct
                 self.unlock(pg)
             terminal=self.wait_failure_terminal(active)
@@ -542,13 +632,13 @@ class FailureProbe(Probe):
                 oom=assert_oom_proof(rows,terminal['State'])
                 self.result['oom_kill_max']=oom
             else:
-                full=[r for r in self.result['repository_space_samples'] if r['errno']==28]
+                full=[r for r in self.result['repository_space_samples'] if is_write_enospc(r)]
                 assert full and all(r['capacity_bytes']==size and r['available_bytes']==0 for r in full), 'No real same-repository ENOSPC observed in backup window'
                 self.result['enospc_proof']={'observations':len(full),'first':full[0],'last':full[-1],'worker_repository_source':next(m['Source'] for m in terminal['Mounts'] if m['Destination']=='/repository'),'repository_mountpoint':mount['Source']}
                 assert self.result['enospc_proof']['worker_repository_source']==mount['Source']
             if self.args.mode!='oom-active':
-                self.result['repository_full_after_exact_terminal_proof']=minimal_space_probe(self.repository_probe_path)
-                assert self.result['repository_full_after_exact_terminal_proof']['errno']==28
+                self.result['repository_full_after_exact_terminal_proof']=self.repository_space_probe.sample()
+                assert is_write_enospc(self.result['repository_full_after_exact_terminal_proof'])
                 (self.repository_probe_path/'.owned-enospc-filler').unlink()
                 self.result['pressure_released_after_exact_terminal_proof_at']=utc()
             self.final_readback(keeper,pg,identity)
@@ -558,6 +648,7 @@ class FailureProbe(Probe):
             self.result['failure_diagnostics']['failure_code']=None
         finally:
             self.stop_failure_observers()
+            if self.repository_space_probe is not None: self.repository_space_probe.close()
 
     def final_readback(self,keeper,pg,identity):
             self.result['bounded_repository']['filesystem_after']=self.e.exec(keeper,['sh','-c','stat -f -c "%T %S %b %a" /repository; df -k /repository; du -sk /repository'])
