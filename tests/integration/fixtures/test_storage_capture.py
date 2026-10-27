@@ -498,6 +498,42 @@ class RelayPathOwnershipTests(unittest.TestCase):
 
 
 class TraceDiagnosticTests(unittest.TestCase):
+    def test_native_deleted_fd_suffix_is_a_literal_enospc_write_receipt(self):
+        from hosted_storage_trace import WriteStream
+        # Sanitized strace 6.8 owned-file format: deletion is OUTSIDE <path>.
+        # Real owned-file control returned EBADF; this ENOSPC fixture is parser
+        # regression input, never temporary-filesystem pressure evidence.
+        s=WriteStream(10,lambda path:'temp_pack' if path=='/tmp/restic-temp-pack-PRIVATE' else None)
+        row=s.feed('[pid 11] write(6</tmp/restic-temp-pack-PRIVATE>(deleted), ""..., 4096) = -1 ENOSPC (No space left on device)')
+        self.assertEqual(s.failure,{'pid':11,'syscall':'write','fd':6,'errno':28,'path_kind':'temp_pack','stage':'write'})
+        self.assertEqual(row,{'pid':11,'syscall':'write','fd':6,'errno':28,'path_kind':'temp_pack'})
+        self.assertNotIn('PRIVATE',json.dumps(row))
+        s.finish()
+
+    def test_deleted_fd_suffix_keeps_syscall_pairing_and_rejection_boundaries(self):
+        from hosted_storage_trace import WriteStream
+        classify=lambda path:'temp_pack' if path=='/tmp/restic-temp-pack-PRIVATE' else None
+        for syscall,args in (('write','""..., 4096'),('pwrite64','""..., 4096, 0'),('writev','[...], 2')):
+            for prefix,pid in (('',10),('[pid 11] ',11),('11 ',11)):
+                with self.subTest(syscall=syscall,prefix=prefix):
+                    s=WriteStream(10,classify)
+                    row=s.feed(prefix+syscall+'(6</tmp/restic-temp-pack-PRIVATE>(deleted), '+args+') = -1 ENOSPC (No space left on device)')
+                    self.assertEqual(row,{'pid':pid,'syscall':syscall,'fd':6,'errno':28,'path_kind':'temp_pack'})
+                    s.finish()
+        s=WriteStream(10,classify)
+        self.assertIsNone(s.feed('[pid 11] write(6</tmp/restic-temp-pack-PRIVATE>(deleted), ""..., 4096 <unfinished ...>'))
+        self.assertEqual(s.feed('[pid 11] <... write resumed>) = -1 ENOSPC (No space left on device)')['pid'],11)
+        s.finish()
+        base='write(6</tmp/restic-temp-pack-PRIVATE>(deleted), ""..., 4096) = -1 ENOSPC (No space left on device)'
+        for line in (base.replace('(deleted)','(other)'),base.replace('(deleted)','(deleted)(deleted)'),
+                     base.replace('/tmp/restic-temp-pack-PRIVATE','/private/PRIVATE'),
+                     base.replace('ENOSPC (No space left on device)','EIO (I/O error)'),
+                     base.replace('No space left on device','CONTROL-OTHER-REASON'),
+                     'openat(AT_FDCWD, "/tmp/restic-temp-pack-PRIVATE", O_RDWR|O_CREAT, 0600) = -1 ENOSPC (No space left on device)'):
+            s=WriteStream(10,classify)
+            self.assertIsNone(s.feed(line))
+            self.assertNotIn('PRIVATE',json.dumps(s.diagnostics))
+
     def test_setup_unfinished_pairs_and_trace_bounds_fail_closed_without_payload(self):
         from hosted_storage_trace import WriteStream
         s=WriteStream(10,lambda path:'temp_pack')

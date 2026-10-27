@@ -206,7 +206,9 @@ def project_failure(line, *, root_pid, path_kind):
 
 
 def project_write(line, *, root_pid, path_kind):
-    match = re.fullmatch(r'(?:\[pid\s+(\d+)\]\s+|(\d+)\s+)?(write|pwrite64|writev)\((\d+)<([^\n]+)>,.*\)\s+= -1 ENOSPC \(No space left on device\)',line.strip())
+    # strace -yy marks unlinked regular files as <path>(deleted), not only
+    # <path (deleted)>. The marker is FD metadata, not part of the path.
+    match = re.fullmatch(r'(?:\[pid\s+(\d+)\]\s+|(\d+)\s+)?(write|pwrite64|writev)\((\d+)<([^\n]+)>(?:\(deleted\))?,.*\)\s+= -1 ENOSPC \(No space left on device\)',line.strip())
     if not match: return None
     first, second, syscall, fd, path = match.groups()
     kind = path_kind(path.removesuffix(' (deleted)'))
