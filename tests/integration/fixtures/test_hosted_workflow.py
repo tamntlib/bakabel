@@ -57,9 +57,148 @@ class WorkflowContract(unittest.TestCase):
                     self.assertEqual(json.loads((root/('bakabel-public/faults-'+f13+'.json')).read_text())['case'],f13)
                     self.assertEqual(json.loads((root/('bakabel-public/faults-'+f15+'.json')).read_text())['case'],f15)
 
+    def test_remaining_gates_have_seven_exclusive_matrix_vms_without_legacy_jobs(self):
+        import json
+        text = (ROOT/'.github/workflows/acceptance.yaml').read_text()
+        trigger = text.split('permissions:',1)[0]
+        for item in ('scope:', 'type: choice', 'default: all', '- all', '- remaining-faults'):
+            self.assertIn(item, trigger)
+        matrix = text.split('      matrix:',1)[1].split('    env:',1)[0]
+        self.assertIn("inputs.scope == 'remaining-faults'", matrix)
+        arrays = [json.loads(value) for value in re.findall(r"'(\[.*?\])'", matrix)]
+        self.assertEqual(len(arrays),2)
+        selected, default = arrays
+        self.assertEqual(default, [{'suite':s,'case':'all'} for s in ('core-resources','capacity','faults')])
+        self.assertEqual(selected, [
+            {'suite':'native','case':'restic-native-exit3'},
+            {'suite':'native','case':'unknown-commit-before-finalize-worker-SIGKILL'},
+            {'suite':'native','case':'finalized-before-report-worker-SIGKILL'},
+            {'suite':'storage','case':'temp-pack-ENOSPC'},
+            {'suite':'storage','case':'restore-output-ENOSPC'},
+            {'suite':'native','case':'file-truncate-during-native-read'},
+            {'suite':'storage','case':'restore-missing-extension-binary-prerequisites'}])
+        self.assertEqual(len({entry['case'] for entry in selected}),7)
+        self.assertNotIn('needs:',text)
+        self.assertNotIn('continue-on-error',text)
+        self.assertIn('fail-fast: false',text)
+        self.assertIn('ACCEPTANCE_SCOPE: ${{ inputs.scope || \'all\' }}',text)
+        self.assertIn('ACCEPTANCE_CASE: ${{ matrix.case }}',text)
+        self.assertIn("'scope':os.environ['ACCEPTANCE_SCOPE']",text)
+        self.assertIn("'case':os.environ['ACCEPTANCE_CASE']",text)
+        self.assertIn('name: acceptance-${{ matrix.suite }}-${{ github.sha }}-${{ github.run_attempt }}-${{ env.ACCEPTANCE_SCOPE }}-${{ matrix.case }}',text)
+
+    def test_real_remaining_shell_selects_one_case_and_stops_after_failure(self):
+        import json
+        import textwrap
+        text = (ROOT/'.github/workflows/acceptance.yaml').read_text()
+        marker = '      - name: Independent remaining fault gate on fresh VM'
+        self.assertIn(marker, text, 'independent case runner step is missing')
+        block = text.split(marker,1)[1].split('      - name:',1)[0]
+        self.assertIn("if: inputs.scope == 'remaining-faults'", block)
+        script = textwrap.dedent(block.split('        run: |\n',1)[1])
+        matrix = text.split('      matrix:',1)[1].split('    env:',1)[0]
+        entries = json.loads(re.findall(r"'(\[.*?\])'", matrix)[0])
+        for entry in entries:
+            for runner_exit, verifier_exit in ((0,0),(7,0),(0,8)):
+                with self.subTest(entry=entry, runner_exit=runner_exit, verifier_exit=verifier_exit), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory); tools = root/'tools'; tools.mkdir()
+                    sudo = tools/'sudo'
+                    sudo.write_text('#!/bin/sh\ncase "$1" in --preserve-env=*) shift;; esac\nexec "$@"\n'); sudo.chmod(0o700)
+                    observer = tools/'strace'; observer.write_text('#!/bin/sh\nexit 99\n'); observer.chmod(0o700)
+                    python = tools/'python3'
+                    python.write_text('#!'+sys.executable+'\n'+textwrap.dedent('''\
+                        import json,os,sys
+                        from pathlib import Path
+                        if sys.argv[1] == '-c':
+                            exec(sys.argv[2]); raise SystemExit(0)
+                        with open(os.environ['CALL_LOG'],'a') as out:
+                            out.write(json.dumps({'args':sys.argv[1:],'cpus':sorted(os.sched_getaffinity(0))})+'\\n')
+                        if Path(sys.argv[1]).name.startswith('run_'):
+                            raise SystemExit(int(os.environ['RUNNER_EXIT']))
+                        if Path(sys.argv[1]).name != 'verify_hosted_selection.py': raise SystemExit(99)
+                        raise SystemExit(int(os.environ['VERIFIER_EXIT']))
+                    ''')); python.chmod(0o700)
+                    (root/'bakabel-candidate.json').write_text(json.dumps({'source_sha256':'1'*64,'image_id':'sha256:'+'2'*64}))
+                    log = root/'calls.jsonl'
+                    env = {**os.environ, 'PATH':str(tools)+os.pathsep+os.environ['PATH'],
+                           'RUNNER_TEMP':str(root), 'ENGINE_SOCKET':'/unit-no-engine.sock',
+                           'ACCEPTANCE_SUITE':entry['suite'], 'ACCEPTANCE_CASE':entry['case'],
+                           'ACCEPTANCE_SCOPE':'remaining-faults','CALL_LOG':str(log),
+                           'RUNNER_EXIT':str(runner_exit),'VERIFIER_EXIT':str(verifier_exit)}
+                    cp = subprocess.run(['bash','-eu','-c',script], cwd=ROOT, env=env, capture_output=True, text=True)
+                    self.assertEqual(cp.returncode, runner_exit or verifier_exit, cp.stderr)
+                    calls = [json.loads(line) for line in log.read_text().splitlines()]
+                    self.assertEqual(len(calls), 1 if runner_exit else 2)
+                    runner = 'run_hosted_faults.py' if entry['suite']=='native' else 'run_hosted_storage_prereqs.py'
+                    self.assertEqual(Path(calls[0]['args'][0]).name, runner)
+                    for call in calls:
+                        self.assertEqual(call['cpus'],[0,1])
+                        args = call['args']
+                        self.assertEqual(args.count('--case'),1)
+                        self.assertEqual(args[args.index('--case')+1],entry['case'])
+                    self.assertIn('--exclusive-hosted-daemon',calls[0]['args'])
+                    for flag, expected in (('--source',str(ROOT)),('--image','sha256:'+'2'*64),
+                                           ('--expected-image-id','sha256:'+'2'*64),('--expected-source-sha256','1'*64)):
+                        args = calls[0]['args']; self.assertEqual(args[args.index(flag)+1],expected)
+                    if not runner_exit:
+                        args = calls[1]['args']
+                        self.assertEqual(args[args.index('--suite')+1],entry['suite'])
+                        self.assertEqual(args[args.index('--candidate')+1],str(root/'bakabel-candidate.json'))
+                        self.assertEqual(args[args.index('--source')+1],str(ROOT))
+
+    def test_real_export_shell_includes_allowlisted_scoped_verdict_not_private_data(self):
+        import json
+        import textwrap
+        text = (ROOT/'.github/workflows/acceptance.yaml').read_text()
+        block = text.split('      - name: Export only allowlisted evidence even on failure',1)[1].split('      - uses:',1)[0]
+        script = textwrap.dedent(block.split('        run: |\n',1)[1])
+        for suite, runtime, case in (('native','bakabel-faults','restic-native-exit3'),
+                                     ('storage','bakabel-storage','temp-pack-ENOSPC')):
+            with self.subTest(suite=suite), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); tools = root/'tools'; tools.mkdir()
+                sudo = tools/'sudo'
+                sudo.write_text('#!/bin/sh\ncase "$1" in --preserve-env=*) shift;; esac\nif [ "$1" = chown ]; then exit 0; fi\nexec "$@"\n'); sudo.chmod(0o700)
+                receipt = root/runtime/case/'receipt.json'; receipt.parent.mkdir(parents=True)
+                receipt.write_text(json.dumps({'offline_unit_fixture':True,'case':case}))
+                verdict = {'scope':'remaining-faults','suite':suite,'case':case,
+                           'selected_case_pass':True,'full_plan_acceptance_pass':False}
+                (root/runtime/'selected-verified.json').write_text(json.dumps(verdict))
+                private = root/runtime/'private/receipt.json'; private.parent.mkdir()
+                private.write_text('PRIVATE-CANARY')
+                (root/runtime/'selected-verified-private.log').write_text('PRIVATE-CANARY')
+                cp = subprocess.run(['bash','-eu','-c',script],cwd=ROOT,capture_output=True,text=True,
+                    env={**os.environ,'RUNNER_TEMP':str(root),'PATH':str(tools)+os.pathsep+os.environ['PATH']})
+                self.assertEqual(cp.returncode,0,cp.stderr)
+                public = root/'bakabel-public'
+                expected = ('faults-' if suite=='native' else 'storage-')+case+'.json'
+                self.assertEqual({p.name for p in public.iterdir()}, {expected,suite+'-selected-verified.json'})
+                self.assertEqual(json.loads((public/(suite+'-selected-verified.json')).read_text()),verdict)
+                self.assertNotIn('PRIVATE-CANARY',''.join(p.read_text() for p in public.iterdir()))
+
+    def test_targeted_offline_shell_cannot_rerun_f14_kernel_suite(self):
+        import json
+        import textwrap
+        text = (ROOT/'.github/workflows/acceptance.yaml').read_text()
+        block = text.split('      - name: Offline fixture and documentation tests',1)[1].split('      - name:',1)[0]
+        script = textwrap.dedent(block.split('        run: |\n',1)[1])
+        for scope, pattern in (('all','test_*.py'),('remaining-faults','test_hosted_selection.py')):
+            with self.subTest(scope=scope), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); python = root/'python3'; log = root/'calls'
+                python.write_text('#!'+sys.executable+'\nimport json,os,sys\nwith open(os.environ["CALL_LOG"],"a") as out: out.write(json.dumps(sys.argv[1:])+"\\n")\n')
+                python.chmod(0o700)
+                cp = subprocess.run(['bash','-eu','-c',script],cwd=ROOT,capture_output=True,text=True,
+                    env={**os.environ,'ACCEPTANCE_SCOPE':scope,'CALL_LOG':str(log),'PATH':str(root)+os.pathsep+os.environ['PATH']})
+                self.assertEqual(cp.returncode,0,cp.stderr)
+                calls = [json.loads(line) for line in log.read_text().splitlines()]
+                self.assertEqual(calls, [
+                    ['-m','unittest','discover','-s','tests/integration/fixtures','-p',pattern,'-v'],
+                    ['-m','unittest','discover','-s','tests','-p','test_documentation.py','-v']])
+
     def test_capacity_and_faults_run_on_independent_fresh_vms(self):
         text=(ROOT/'.github/workflows/acceptance.yaml').read_text()
-        self.assertIn('suite: [core-resources, capacity, faults]',text)
+        self.assertIn('[{"suite":"core-resources","case":"all"},{"suite":"capacity","case":"all"},{"suite":"faults","case":"all"}]',text)
+        from verify_hosted_faults import CASES
+        self.assertIn('restore-reader-failure-importer-zero', CASES)
         self.assertIn('fail-fast: false',text)
         for suite,runner in (('capacity','run_hosted_capacity.py'),('faults','run_hosted_faults.py')):
             step=next(block for block in text.split('      - name: ') if runner in block)

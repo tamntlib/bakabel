@@ -30,8 +30,36 @@ This is a **core runtime matrix**, not the entire PLAN acceptance suite. Remaini
 
 - Checkout/setup/upload actions are pinned by commit. Go, Restic and PostgreSQL images are digest-pinned; the candidate records exact checked-out commit, core source fingerprint, ordinary image ID and daemon identity. No historical development image is assumed to exist on the runner.
 - Real, unmodified MinIO source archive `RELEASE.2024-01-18T22-51-28Z` is verified against SHA256 `267c949e03f6d931f3b2da07c067f02483cb2b2604b627e1eb9b96acb0fd9192`, then compiled with the pinned Go image, `CGO_ENABLED=0`, `GOAMD64=v1`. This historical synthetic test backend is not a production MinIO/security recommendation; its development version string is not a release-image claim.
-- The uploaded artifact `acceptance-<commit>-<attempt>` is retained seven days. Only explicit projected receipts/candidate/verifier fields are exported. Raw command output, container specs/Env, state, repositories, private files and raw metrics are **not** uploaded.
+- The uploaded artifact `acceptance-<suite>-<commit>-<attempt>-<scope>-<case>` is retained seven days. Only explicit projected receipts/candidate/verifier fields are exported. Raw command output, container specs/Env, state, repositories, private files and raw metrics are **not** uploaded.
 - Owned fixture cleanup runs in `finally`; successful acceptance requires independent exact absence readback. Upload runs on failure too. An abruptly terminated/timed-out job cannot claim cleanup PASS; setup action teardown and disposal of the entire hosted VM are the final boundary. No broad prune or Docker-context fallback.
+
+## Independent F16–F22 scope
+
+Choose **Run workflow → scope → remaining-faults** for the reviewed revision.
+Default **all** keeps the original three jobs (`core-resources`, `capacity`,
+`faults`), mandatory F14, and the full 19-case fault/3-case storage aggregates.
+`remaining-faults` runs only seven matrix jobs, one fresh disposable VM for each
+F16/F17/F18/F19/F20/F21/F22; it never continues behind F14 on the same daemon.
+All jobs retain fail-fast false, preflight, pinned ordinary-image/tool builds,
+2-CPU limits, deadlines and original cleanup/assertion rules. Targeted offline
+prechecks run selection-verifier and documentation tests, not F14's live kernel
+tracer suite; default all still runs the complete fixture suite.
+
+Each selected runner receives exactly one existing `--case`. A separate
+`verify_hosted_selection.py` invocation checks the exact one-case manifest,
+source fingerprint and candidate image/daemon binding, then invokes the existing
+actual case verifier without weakening it. Candidate metadata and artifact names
+include scope/suite/case; only named receipts and `native-selected-verified.json`
+or `storage-selected-verified.json` are exported. These explicit scoped verdicts
+use `selected_case_pass`, never an aggregate/full-release claim. Original subset
+reports must retain `fault_acceptance_pass: false` or `storage_acceptance_pass:
+false`, and `full_plan_acceptance_pass: false` even when the selected case passes.
+Missing/duplicate/unexpected cases, binding drift and cleanup failure fail closed.
+
+F14 stays **FAILED / closure pending**; even seven green jobs cannot make the
+release ready. No dispatch, new runtime PASS, publication or deployment is
+claimed by this scheduling change. Current retained failure is recorded in the
+[release ledger](RELEASE_GATE_LEDGER.md#current-f14-blocker-and-independent-remaining-gate-scheduling).
 
 ## Current state
 

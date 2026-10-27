@@ -3,6 +3,14 @@ name: Manual acceptance
 # Exclusive disposable VM only. No PR trigger, publication or production secrets.
 on:
   workflow_dispatch:
+    inputs:
+      scope:
+        description: 'all retains every gate; remaining-faults is F16–F22 only, NOT release acceptance'
+        type: choice
+        default: all
+        options:
+          - all
+          - remaining-faults
 
 permissions:
   contents: read
@@ -18,9 +26,12 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        suite: [core-resources, capacity, faults]
+        # One selected case per fresh hosted VM; never append to the all matrix.
+        include: ${{ fromJSON(inputs.scope == 'remaining-faults' && '[{"suite":"native","case":"restic-native-exit3"},{"suite":"native","case":"unknown-commit-before-finalize-worker-SIGKILL"},{"suite":"native","case":"finalized-before-report-worker-SIGKILL"},{"suite":"storage","case":"temp-pack-ENOSPC"},{"suite":"storage","case":"restore-output-ENOSPC"},{"suite":"native","case":"file-truncate-during-native-read"},{"suite":"storage","case":"restore-missing-extension-binary-prerequisites"}]' || '[{"suite":"core-resources","case":"all"},{"suite":"capacity","case":"all"},{"suite":"faults","case":"all"}]') }}
     env:
       ACCEPTANCE_SUITE: ${{ matrix.suite }}
+      ACCEPTANCE_SCOPE: ${{ inputs.scope || 'all' }}
+      ACCEPTANCE_CASE: ${{ matrix.case }}
       GO_IMAGE: golang:1.26.8-bookworm@sha256:dc9ad6c05acc7a88e5b71bde60a5fe3bd4b9f0db209011711b464107438a8107
       RESTIC_IMAGE: restic/restic:0.18.1@sha256:39d9072fb5651c80d75c7a811612eb60b4c06b32ffe87c2e9f3c7222e1797e76
       PG_IMAGE: postgres:18.6-alpine3.24@sha256:83148c0bc09eac4d598b70a61e1404d0212b76c95c504bfd6c81a4c59ec91792
@@ -64,7 +75,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          taskset -c 0,1 python3 -m unittest discover -s tests/integration/fixtures -p 'test_*.py' -v
+          if test "$ACCEPTANCE_SCOPE" = remaining-faults; then
+            # Do not let F14's live tracer regression block unrelated scoped gates.
+            taskset -c 0,1 python3 -m unittest discover -s tests/integration/fixtures -p test_hosted_selection.py -v
+          else
+            taskset -c 0,1 python3 -m unittest discover -s tests/integration/fixtures -p 'test_*.py' -v
+          fi
           taskset -c 0,1 python3 -m unittest discover -s tests -p test_documentation.py -v
       - name: Fetch pinned tools and verified unmodified MinIO source
         shell: bash
@@ -109,7 +125,7 @@ jobs:
           commit=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
           assert commit==os.environ['GITHUB_SHA'], 'checkout does not match workflow SHA'
           image=json.loads(subprocess.check_output(['docker','image','inspect',os.environ['CANDIDATE']],text=True))[0]['Id']
-          report={'commit':commit,'suite':os.environ['ACCEPTANCE_SUITE'],'source_sha256':fingerprint(source),'image_id':image,'daemon':engine.call('GET','/info')['ID'],'minio_source_sha256':os.environ['MINIO_SOURCE_SHA256'],'minio_binary_sha256':hashlib.sha256((Path(os.environ['RUNNER_TEMP'])/'bakabel-tools/minio').read_bytes()).hexdigest(),'docker_version':engine.call('GET','/version')['Version']}
+          report={'commit':commit,'suite':os.environ['ACCEPTANCE_SUITE'],'scope':os.environ['ACCEPTANCE_SCOPE'],'case':os.environ['ACCEPTANCE_CASE'],'source_sha256':fingerprint(source),'image_id':image,'daemon':engine.call('GET','/info')['ID'],'minio_source_sha256':os.environ['MINIO_SOURCE_SHA256'],'minio_binary_sha256':hashlib.sha256((Path(os.environ['RUNNER_TEMP'])/'bakabel-tools/minio').read_bytes()).hexdigest(),'docker_version':engine.call('GET','/version')['Version']}
           (Path(os.environ['RUNNER_TEMP'])/'bakabel-candidate.json').write_text(json.dumps(report,indent=2)+'\n')
           PY
       - name: Real Compose and Swarm local and S3 core CLI matrix
@@ -190,6 +206,27 @@ jobs:
             --image "$image_id" --expected-source-sha256 "$source_hash" --expected-image-id "$image_id"
           sudo taskset -c 0,1 python3 tests/integration/fixtures/verify_hosted_storage_prereqs.py \
             --runtime "$RUNNER_TEMP/bakabel-storage"
+      - name: Independent remaining fault gate on fresh VM
+        if: inputs.scope == 'remaining-faults'
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$ACCEPTANCE_SUITE" in
+            native) runner=run_hosted_faults.py; runtime="$RUNNER_TEMP/bakabel-faults" ;;
+            storage) command -v strace >/dev/null; runner=run_hosted_storage_prereqs.py; runtime="$RUNNER_TEMP/bakabel-storage" ;;
+            *) exit 2 ;;
+          esac
+          source_hash=$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/bakabel-candidate.json"))["source_sha256"])')
+          image_id=$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/bakabel-candidate.json"))["image_id"])')
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP \
+            taskset -c 0,1 python3 "tests/integration/fixtures/$runner" \
+            --socket "$ENGINE_SOCKET" --exclusive-hosted-daemon --case "$ACCEPTANCE_CASE" \
+            --source "$PWD" --runtime "$runtime" \
+            --image "$image_id" --expected-source-sha256 "$source_hash" --expected-image-id "$image_id"
+          sudo taskset -c 0,1 python3 tests/integration/fixtures/verify_hosted_selection.py \
+            --suite "$ACCEPTANCE_SUITE" --case "$ACCEPTANCE_CASE" \
+            --source "$PWD" --candidate "$RUNNER_TEMP/bakabel-candidate.json" \
+            --runtime "$runtime" --output "$runtime/selected-verified.json"
       - name: Export only allowlisted evidence even on failure
         if: always()
         shell: bash
@@ -232,12 +269,15 @@ jobs:
           for case in STORAGE_CASES:
               receipt=storage/case/'receipt.json'
               if receipt.is_file(): shutil.copyfile(receipt,target/('storage-'+case+'.json'))
+          for suite, directory in (('native',faults),('storage',storage)):
+              verified=directory/'selected-verified.json'
+              if verified.is_file(): shutil.copyfile(verified,target/(suite+'-selected-verified.json'))
           PY
           sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/bakabel-public"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: always()
         with:
-          name: acceptance-${{ matrix.suite }}-${{ github.sha }}-${{ github.run_attempt }}
+          name: acceptance-${{ matrix.suite }}-${{ github.sha }}-${{ github.run_attempt }}-${{ env.ACCEPTANCE_SCOPE }}-${{ matrix.case }}
           path: ${{ runner.temp }}/bakabel-public/
           if-no-files-found: warn
           retention-days: 7

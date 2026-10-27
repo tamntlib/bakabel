@@ -33,9 +33,9 @@ The first twelve rows passed on hosted run `40292564391` at commit `c50cf16e9dd8
 | F11 | Backup versus public restore / retention-configured run | §7; §10 | `backup-vs-restore-and-retention`: PASS on `c50cf16`. No standalone maintenance CLI is invented. |
 | F12 | Controller kill and two scheduler restarts preserve original deadline/worker/job and last success | §7; §10 | `scheduler-restart-original-deadline`: PASS on `c50cf16`, run above. |
 | F13 | Kill exactly after persisted exec ID but before start forwarding | §5.2 | `dump-persisted-before-start-worker-SIGKILL`: PASS on `97b9611`, hosted run `40365486870`; exact retained quarantine, **not** terminal exec success, ownership release or production fencing. See the preserved attempt below. |
-| F14 | Restore reader failure with otherwise valid import | §6; §10 | Additive ordinary-public-CLI candidate and offline regressions implemented; hosted runtime **NOT RUN**. See [F14 handoff](F14_PUBLIC_CLI_HANDOFF.md). Historical APP/API evidence remains component-only. |
+| F14 | Restore reader failure with otherwise valid import | §6; §10 | Current `8d7b2b4` evidence **FAILED / closure pending**: hosted `40490097174` failed its control before fault execution. Historical F14 PASS at `865d1db` is retained, not current certification. Tracer race is reproduced; the historical hosted cause remains unknown. |
 | F15 | Worker dies during observable active import; independent import-token terminal recovery | §6; §10 | `restore-active-import-worker-SIGKILL`: actual hosted PASS on `b46b95d`, run `40448351015`, independently audited below. Recovery scope is the original public restore controller, independent of the killed worker, not a fresh-controller restart claim. |
-| F16 | Genuine Restic exit 3: snapshot ID **and** error, partial/unknown refusal | §5.4; §10 | Additive `restic-native-exit3` fixture and offline regressions implemented provisionally; real native read-permission denial, snapshot+error and fresh incomplete-restore refusal still require hosted execution. Runtime **NOT RUN**; no operator retag substitute. See `NATIVE_FAULT_GATES.md`. |
+| F16 | Genuine Restic exit 3: snapshot ID **and** error, partial/unknown refusal | §5.4; §10 | Full gate **pending**: historical `865d1db` reached the functional boundary but failed owned-volume cleanup; `8d7b2b4` did not reach F16. Its owned-volume/Options repair has offline review/tests, not hosted confirmation. No operator retag substitute. See `NATIVE_FAULT_GATES.md`. |
 | F17 | Crash after unknown commit, before finalization | §5.4; §10 | Additive `unknown-commit-before-finalize-worker-SIGKILL` fixture implemented provisionally: hold real committed-snapshot readback, classify exact unknown ID, then actual owned worker kill. Offline proof checks are not crash evidence. Hosted runtime **NOT RUN**. |
 | F18 | Crash after finalization, before report | §5.4; §10 | Additive `finalized-before-report-worker-SIGKILL` fixture implemented provisionally: hold native result-temp create after complete final readback; require actual SIGKILL, exact old/new mapping and fresh complete classification despite failed overall run. Hosted runtime **NOT RUN**. |
 | F19 | Actual temp/buffer storage ENOSPC | §7; §10 | Additive `temp-pack-ENOSPC` fixture and offline regressions implemented; exact owned 64MiB worker `/tmp`, actual traced Restic temp-pack/index write errno28, terminal source/worker proof required. Hosted runtime **NOT RUN**. Repository ENOSPC remains separate; persistent cache is not applicable (`--no-cache`). See `STORAGE_PREREQUISITES_HANDOFF.md`. |
@@ -119,8 +119,9 @@ Independent audit SHA-256:
 The original fourteen-case prefix and its safety assertions remain intact.
 The additive candidate appends F14/F16/F17/F18/F21 to that fault suite and runs
 F19/F20/F22 as a separate mandatory storage/prerequisite suite with its own
-independent verifier and allowlisted export. All eight new gates remain runtime
-**NOT RUN**; offline tests are not hosted receipts. Final independent review
+independent verifier and allowlisted export. At `b46b95d`, all eight new gates
+were runtime **NOT RUN**; later F14/F16 attempts are recorded above and below.
+Offline tests are not hosted receipts. Final independent review
 of the exact integrated candidate (including the requested real Astra review),
 separately authorized hosted execution and exact artifact verification remain
 required. Previous review fingerprints are stale for this changed fixture tree.
@@ -277,6 +278,28 @@ the changed candidate needs fresh exact-source hosted replay.
 | `40265884540` | Footprint fix applied; verifier instead retained `OSError` while reading a cgroup control file. Recorded diagnostics lacked errno, so this historical exception is **not** asserted to have a proven errno. Resource cases skipped. |
 
 The unlink race has a deterministic RED→GREEN regression and explicit missing-observation counters. The earlier cgroup guard handled ENODEV after one confirming inspection and allowed PID-change resolution. The current shared sampler instead settles ENODEV/ENOENT/ESRCH within one absolute second, accepting only exact owned absence/stoppage or complete fresh kernel readback. Live PID or identity drift and unexplained live errors fail. Numeric diagnostics exclude arbitrary messages and locals; these rules do not establish historical exit timing.
+
+## Current F14 blocker and independent remaining-gate scheduling
+
+Retained `8d7b2b45d7154eb23315c5d98dc15a6daaee83bb` runs: CI `40490096248`,
+acceptance `40490097174`. Core/resources and capacity passed, but acceptance
+remains **FAIL**: F14 control failed before F16; F16–F22 were not reached.
+Historical F14 PASS at `865d1db` does not close current F14, and that attempt
+failed F16 cleanup. A reproduced tracer race does not establish the cause of
+the historical hosted failure. Stop consecutive tracer patches; retain F14
+**FAILED / closure pending** and release **NOT READY**.
+
+Manual `scope=remaining-faults` schedules exactly seven independent hosted VMs,
+one each for F16–F22, without F14 or the three default jobs. Each retains fresh
+exclusive rootful preflight, the ordinary pinned build and its original case
+assertions/cleanup stop rules. The independent single-case verifier requires
+an exact selection manifest and candidate/source/image/daemon binding, calls
+the unchanged actual case verifier, and rejects aggregate acceptance claims.
+The subset report keeps its suite aggregate false and `full_plan_acceptance_pass:
+false`; a green scoped job is only that selected gate, never full release PASS.
+The default `scope=all` retains mandatory F14 and both full fault aggregates.
+No new runtime result is credited by this scheduling-only candidate. See
+[manual usage](HOSTED_ACCEPTANCE.md#independent-f16f22-scope).
 
 ## Completion rule
 
