@@ -439,8 +439,21 @@ class FaultProbe(ComposeProbe):
             time.sleep(.05)
         raise TimeoutError('bounded fixture condition: '+label)
 
-    def logs(self, cid):
-        text = super().logs(cid)
+    def logs(self, cid, *, deadline=None):
+        if deadline is None:
+            text = super().logs(cid)
+        else:
+            b = self.e.call('GET','/containers/'+cid+'/logs?stdout=true&stderr=true&tail=16',raw=True,deadline=deadline)
+            if len(b) > 65536: raise ValueError('oversize diagnostic logs')
+            out = []
+            while b:
+                if len(b) < 8 or b[0] not in (1,2) or b[1:4] != b'\0\0\0':
+                    raise ValueError('invalid diagnostic log frame')
+                n = int.from_bytes(b[4:8],'big')
+                if n > len(b)-8: raise ValueError('incomplete diagnostic log frame')
+                out.append(b[8:8+n].decode(errors='replace'))
+                b = b[8+n:]
+            text = ''.join(out)
         if any(secret in text for secret in self.values): raise ValueError('synthetic secret in container logs')
         return text
 
@@ -540,9 +553,84 @@ class FaultProbe(ComposeProbe):
             self.finish(scheduler, expect=1, timeout=45)
             self.assert_quarantine(active)
         else:
-            self.wait(lambda: self.owner() is None, 45, 'fresh CLI terminal recovery')
-            self.stop(scheduler)
-            self.result['fresh_cli_recovery'] = True
+            observer_end = time.monotonic()+45
+            def diagnostic_deadline():
+                now = time.monotonic()
+                return min(observer_end,now+1) if now < observer_end else None
+            observation = {'outcome':'waiting', 'owner':'unavailable', 'controller':'unavailable',
+                           'controller_id':scheduler if isinstance(scheduler,str) and re.fullmatch('[a-f0-9]{64}',scheduler) else None,
+                           'running':None, 'status':None, 'exit_code':None, 'pid':None}
+            # Bounded, typed projections only: no logs, argv, Env or exception text.
+            observations = self.result.setdefault('recovery_observations', [])
+            if len(observations) < 4: observations.append(observation)
+            def owner_state(owner):
+                if owner is None: return 'absent'
+                keys = ('runID','daemonID','workerContainerID','sourceContainerID','execID')
+                return ('matching' if isinstance(owner,dict) and
+                        all(active.get(k) and owner.get(k) == active[k] for k in keys) else 'foreign')
+            def recovered():
+                owner = self.owner()
+                observation['owner'] = owner_state(owner)
+                observation.update(controller='unavailable',running=None,status=None,exit_code=None,pid=None)
+                # Already released: do not spend a nearly exhausted budget on
+                # optional API work. Ordinary success diagnostics stay best effort.
+                if owner is None and observer_end-time.monotonic() < 1: return True
+                try:
+                    deadline = diagnostic_deadline()
+                    obj = self.e.inspect(scheduler,deadline=deadline) if deadline is not None else None
+                    if isinstance(obj,dict) and obj.get('Id') == scheduler:
+                        state = obj.get('State')
+                        observation['controller'] = 'observed' if isinstance(state,dict) else 'malformed'
+                        if isinstance(state,dict):
+                            observation.update(
+                                running=state.get('Running') if type(state.get('Running')) is bool else None,
+                                status=state.get('Status') if state.get('Status') in
+                                    ('created','running','paused','restarting','removing','exited','dead') else None,
+                                exit_code=state.get('ExitCode') if type(state.get('ExitCode')) is int and
+                                    0 <= state['ExitCode'] <= 255 else None,
+                                pid=state.get('Pid') if type(state.get('Pid')) is int and 0 <= state['Pid'] <= 2**31-1 else None)
+                    elif obj is not None: observation['controller'] = 'foreign'
+                except Exception: pass  # Diagnostic failure cannot replace the owner/wait failure.
+                if owner is None: return True
+                if observation['running'] is False and observation['owner'] == 'matching':
+                    # The controller may have released ownership between the
+                    # first owner read and terminal inspect. Causally reread it.
+                    observation['owner'] = owner_state(self.owner())
+                    if observation['owner'] == 'absent': return True
+                    if observation['owner'] == 'matching':
+                        observation['outcome'] = 'controller_terminal'
+                        raise ValueError('fresh recovery controller terminal with retained owner')
+                return False
+            try:
+                self.wait(recovered, 45, 'fresh CLI terminal recovery')
+                observation['outcome'] = 'released'
+                self.stop(scheduler)
+                self.result['fresh_cli_recovery'] = True
+            except TimeoutError:
+                observation['outcome'] = 'timeout'
+                raise
+            except Exception:
+                if observation['outcome'] != 'controller_terminal': observation['outcome'] = 'error'
+                raise
+            finally:
+                observation['run_finished'] = {'count':None,'failed':None,'status':None}
+                deadline = diagnostic_deadline()
+                if observation['controller'] == 'observed' and deadline is not None:
+                    try:
+                        text = self.logs(scheduler,deadline=deadline)  # Transient only; never attach raw logs.
+                        if len(text.encode()) <= 65536:
+                            summary = {'count':0,'failed':None,'status':None}
+                            for line in text.splitlines()[-16:]:
+                                try: event = json.loads(line)
+                                except ValueError: continue
+                                if not isinstance(event,dict) or event.get('event') != 'run_finished': continue
+                                result = event.get('result')
+                                if not isinstance(result,dict) or result.get('runID') != active.get('runID'): continue
+                                summary.update(count=summary['count']+1,
+                                    failed=event.get('failed') if type(event.get('failed')) is bool else None,
+                                    status=result.get('status') if result.get('status') in ('complete','failed','blocked') else None)
+                            observation['run_finished'] = summary
+                    except Exception: pass  # Preserve the initiating error, including timeout.
         if set(self.worker_records) != before: raise ValueError('fresh recovery created replacement worker')
 
     def success_snapshot(self):
@@ -790,6 +878,8 @@ class FaultProbe(ComposeProbe):
         self.result['injection'] = record
         if record.get('stdout_bytes',0) < 65536: raise ValueError('stream drop before partial stdout')
         if unavailable:
+            # Bind only this already observed F04 source/run. Never source commands.
+            self.relay.control_owner = copy.deepcopy(active)
             self.finish(controller,expect=1,timeout=85)
             self.assert_quarantine(active)
             self.fresh_recovery(active,blocked=True)
@@ -1062,6 +1152,43 @@ def is_dump_wrapper(value):
             value.get('AttachStderr') is True and value.get('AttachStdin') is False and value.get('Tty') is False)
 
 
+# Literal public native control contracts, observation only. No argv is retained.
+CONTROL_SCAN = r'''token=$1
+for f in /proc/[0-9]*/environ; do
+ [ -r "$f" ] || continue
+ env=$(tr '\000' '\n' < "$f" 2>/dev/null) || continue
+ case "
+$env
+" in *"
+BAKABEL_RUN_ID=$token
+"*)
+ p=${f%/environ}; p=${p##*/}
+ IFS= read -r stat < /proc/$p/stat || exit 41
+ rest=${stat##*) }; set -- $rest; shift 19; start=$1
+ exe=$(readlink /proc/$p/exe) || exit 43
+ printf '%s|%s|%s\n' "$p" "$start" "$exe"
+ ;; esac
+done'''
+CONTROL_CANCEL = r'''p=$1; expected=$2; token=$3; sig=$4
+case "$p" in ''|*[!0-9]*) exit 40;; esac
+case "$sig" in TERM|KILL) ;; *) exit 49;; esac
+IFS= read -r stat < /proc/$p/stat || exit 41
+rest=${stat##*) }; set -- $rest; shift 19; actual=$1
+[ "$actual" = "$expected" ] || { echo STARTTIME_MISMATCH; exit 42; }
+exe=$(readlink /proc/$p/exe) || exit 43
+[ "$exe" = /usr/local/bin/pg_dump ] || exit 44
+env=$(tr '\000' '\n' < /proc/$p/environ) || exit 45
+case "
+$env
+" in *"
+BAKABEL_RUN_ID=$token
+"*) ;; *) exit 46;; esac
+IFS= read -r stat < /proc/$p/stat || exit 47
+rest=${stat##*) }; set -- $rest; shift 19
+[ "$1" = "$expected" ] || exit 48
+kill -"$sig" "$p"'''
+
+
 class FaultRelay:
     """Byte-preserving, bounded Unix transport. Never generates HTTP replies.
 
@@ -1079,6 +1206,9 @@ class FaultRelay:
         self.errors = []
         self.connections = set()
         self.execs = {}
+        # Separate diagnostic identities can never admit dump/restore starts or cleanup.
+        self.control_owner = None
+        self.control_execs = {}  # At most 64 F04 helper creates.
         self.workers = set()
         self.rule = None
         self.denied_exec = None
@@ -1207,6 +1337,30 @@ class FaultRelay:
             self.restore_bindings[eid]=copy.deepcopy(receipt)
             record['restore_create']=receipt
 
+    def observe_control_response(self, record, raw):
+        """Finite projection of existing response bytes; never transport authority."""
+        if not 200 <= record['status'] < 300: return
+        try:
+            value = json.loads(raw)
+            if not isinstance(value,dict): return
+            with self.lock:
+                if record['control_phase'] == 'create':
+                    eid = value.get('Id')
+                    if (isinstance(eid,str) and re.fullmatch('[a-f0-9]{64}',eid) and
+                            eid not in self.execs and eid not in self.control_execs and len(self.control_execs) < 64):
+                        record['exec_id'] = eid
+                        self.control_execs[eid] = {k:record[k] for k in ('control_role','container_id','control_run_id')}
+                elif record['control_phase'] == 'inspect':
+                    state = record['control_state']
+                    if value.get('ID') != record['exec_id'] or value.get('ContainerID') != record['container_id']:
+                        state['observation'] = 'foreign'
+                        return
+                    state.update(observation='observed',
+                        running=value.get('Running') if type(value.get('Running')) is bool else None,
+                        exit_code=value.get('ExitCode') if type(value.get('ExitCode')) is int and 0 <= value['ExitCode'] <= 255 else None,
+                        pid=value.get('Pid') if type(value.get('Pid')) is int and 0 <= value['Pid'] <= 2**31-1 else None)
+        except Exception: pass  # Never replace forwarding with diagnostic validation.
+
     def classify(self, method, path, body):
         url = urlsplit(path)
         path = re.sub(r'^/v[0-9.]+', '', url.path)
@@ -1243,6 +1397,19 @@ class FaultRelay:
             elif operation == 'exec':
                 cmd = value.get('Cmd') or []
                 if not isinstance(cmd, list) or not all(isinstance(arg, str) for arg in cmd): cmd = []
+                owner = getattr(self,'control_owner',None)
+                role = None
+                if (isinstance(owner,dict) and owner.get('sourceContainerID') == cid and
+                        isinstance(owner.get('runID'),str) and re.fullmatch('[a-f0-9]{32}',owner['runID'])):
+                    token = owner['runID']
+                    if cmd == ['sh','-c',CONTROL_SCAN,'bakabel-scan',token]: role = 'scan_dump'
+                    elif (len(cmd) == 8 and cmd[:4] == ['sh','-c',CONTROL_CANCEL,'bakabel-cancel'] and
+                          re.fullmatch('[0-9]{1,10}',cmd[4]) and re.fullmatch('[0-9]{1,20}',cmd[5]) and
+                          cmd[6] == token and cmd[7] in ('TERM','KILL')):
+                        role = 'signal_term' if cmd[7] == 'TERM' else 'signal_kill'
+                if role:
+                    record.update(control_role=role,control_phase='create',control_run_id=owner['runID'],
+                                  control_state={'observation':'unavailable','running':None,'exit_code':None,'pid':None})
                 tool = Path(cmd[0]).name if cmd else ''
                 if is_dump_wrapper(value) or (tool == 'pg_dump' and '--format=custom' in cmd):
                     # Direct pg_dump recognition is retained for old fixtures;
@@ -1253,6 +1420,10 @@ class FaultRelay:
         match = re.fullmatch(r'/exec/([a-f0-9]{64})/(start|json)', path)
         if match:
             eid, operation = match.groups(); record['exec_id'] = eid
+            binding = getattr(self,'control_execs',{}).get(eid)
+            if binding and ((operation == 'start' and method == 'POST') or (operation == 'json' and method == 'GET')):
+                record.update(binding,control_phase='start' if operation == 'start' else 'inspect')
+                record['control_state'] = {'observation':'unavailable','running':None,'exit_code':None,'pid':None}
             if operation == 'start' and eid == getattr(self,'denied_start',None):
                 record['fault'] = 'start-transport-refused'
             if operation == 'start' and eid in self.execs:
@@ -1558,7 +1729,24 @@ class FaultRelay:
             if record['status'] == 101 and eid and self.observe_streams:
                 return self.observe_stream(front, back, eid, record, diagnostic, rule)
             counter = FrameCounter(stderr_observer=diagnostic.feed if diagnostic is not None else None)
+            # Capture only bounded create/inspect JSON while forwarding the same
+            # bytes immediately. Oversize/truncated/unparsed data stays unknown.
+            control_body = bytearray() if record.get('control_phase') in ('create','inspect') else None
+            control_projected = False
+            def control_complete():
+                nonlocal control_projected
+                if control_body is not None and not control_projected:
+                    self.observe_control_response(record,control_body)
+                    control_projected = True
             def forward(src, dst, data):
+                nonlocal control_body
+                if src is back and control_body is not None:
+                    if len(control_body)+len(data) <= 65536: control_body.extend(data)
+                    else: control_body = None
+                    # Install a create binding before the client can receive its
+                    # final body byte and immediately submit the matching start.
+                    if 'content-length' in fields and control_body is not None and len(control_body) == int(fields['content-length']):
+                        control_complete()
                 dst.sendall(data)
                 if eid:
                     if src is back: counter.feed(data)
@@ -1599,6 +1787,7 @@ class FaultRelay:
                     if not chunk: raise EOFError('truncated response')
                     if not forward(back, front, chunk): return
                     left -= len(chunk)
+                control_complete()
                 return keepalive
             elif fields.get('transfer-encoding','').lower() == 'chunked':
                 def line():
@@ -1613,7 +1802,9 @@ class FaultRelay:
                     if not left:
                         trailer_bytes = 0
                         while True:
-                            trailer = line(); front.sendall(trailer); trailer_bytes += len(trailer)
+                            trailer = line()
+                            if trailer == b'\r\n': control_complete()
+                            front.sendall(trailer); trailer_bytes += len(trailer)
                             if trailer_bytes > 65536: raise ValueError('trailer limit')
                             if trailer == b'\r\n': return keepalive
                     while left:
@@ -1629,6 +1820,7 @@ class FaultRelay:
                     chunk = back.recv(65536)
                     if not chunk: break
                     if not forward(back, front, chunk): return
+                control_complete()
         except (BrokenPipeError, ConnectionResetError, EOFError):
             pass
         except Exception as exc:

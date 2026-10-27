@@ -18,6 +18,7 @@ on:
         default: all
         options:
           - all
+          - docker-stream-drop-status-unavailable-recovery
           - restore-reader-failure-importer-zero
           - restic-native-exit3
           - unknown-commit-before-finalize-worker-SIGKILL
@@ -249,7 +250,7 @@ jobs:
         run: |
           set -euo pipefail
           case "$ACCEPTANCE_SUITE" in
-            native|reader) runner=run_hosted_faults.py; runtime="$RUNNER_TEMP/bakabel-faults" ;;
+            native|reader|recovery) runner=run_hosted_faults.py; runtime="$RUNNER_TEMP/bakabel-faults" ;;
             storage) command -v strace >/dev/null; runner=run_hosted_storage_prereqs.py; runtime="$RUNNER_TEMP/bakabel-storage" ;;
             *) exit 2 ;;
           esac
@@ -306,7 +307,7 @@ jobs:
           for case in STORAGE_CASES:
               receipt=storage/case/'receipt.json'
               if receipt.is_file(): shutil.copyfile(receipt,target/('storage-'+case+'.json'))
-          for suite, directory in (('native',faults),('storage',storage),('reader',faults)):
+          for suite, directory in (('native',faults),('storage',storage),('reader',faults),('recovery',faults)):
               if suite != os.environ.get('ACCEPTANCE_SUITE'): continue
               verified=directory/'selected-verified.json'
               if verified.is_file(): shutil.copyfile(verified,target/(suite+'-selected-verified.json'))

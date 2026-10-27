@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validated dispatch matrix and independent F14/F16–F22 scoped evidence, never release acceptance."""
+"""Validated dispatch matrix and independent F04/F14/F16–F22 scoped evidence, never release acceptance."""
 import argparse
 import json
 from pathlib import Path
@@ -11,8 +11,9 @@ from verify_hosted_native_faults import NATIVE_CASES
 from verify_hosted_storage_prereqs import CASES as STORAGE_CASES, verify_case as verify_storage
 
 
+F04 = 'docker-stream-drop-status-unavailable-recovery'
 F14 = 'restore-reader-failure-importer-zero'
-SCOPED_CASES = {'reader': (F14,), 'native': NATIVE_CASES, 'storage': STORAGE_CASES}
+SCOPED_CASES = {'recovery': (F04,), 'reader': (F14,), 'native': NATIVE_CASES, 'storage': STORAGE_CASES}
 
 
 def plan(scope, case):
@@ -75,7 +76,7 @@ def main(argv=None):
         return 0
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--suite', choices=tuple(SCOPED_CASES), required=True)
-    parser.add_argument('--case', choices=(F14,*NATIVE_CASES,*STORAGE_CASES), required=True, action='append')
+    parser.add_argument('--case', choices=tuple(case for cases in SCOPED_CASES.values() for case in cases), required=True, action='append')
     for name in ('runtime','candidate','source','output'):
         parser.add_argument('--'+name, type=Path, required=True)
     args = parser.parse_args(argv)
