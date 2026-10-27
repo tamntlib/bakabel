@@ -11,6 +11,21 @@ on:
         options:
           - all
           - remaining-faults
+          - single-fault
+      case:
+        description: 'all for bulk scopes; a named case requires single-fault (NOT release acceptance)'
+        type: choice
+        default: all
+        options:
+          - all
+          - restore-reader-failure-importer-zero
+          - restic-native-exit3
+          - unknown-commit-before-finalize-worker-SIGKILL
+          - finalized-before-report-worker-SIGKILL
+          - temp-pack-ENOSPC
+          - restore-output-ENOSPC
+          - file-truncate-during-native-read
+          - restore-missing-extension-binary-prerequisites
 
 permissions:
   contents: read
@@ -20,17 +35,39 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  selection:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Validate manual scope and case
+        id: plan
+        env:
+          REQUESTED_SCOPE: ${{ inputs.scope }}
+          REQUESTED_CASE: ${{ inputs.case }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          matrix=$(taskset -c 0,1 python3 -B tests/integration/fixtures/verify_hosted_selection.py \
+            --plan --scope "$REQUESTED_SCOPE" --case "$REQUESTED_CASE")
+          printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
+
   acceptance:
+    needs: selection
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         # One selected case per fresh hosted VM; never append to the all matrix.
-        include: ${{ fromJSON(inputs.scope == 'remaining-faults' && '[{"suite":"native","case":"restic-native-exit3"},{"suite":"native","case":"unknown-commit-before-finalize-worker-SIGKILL"},{"suite":"native","case":"finalized-before-report-worker-SIGKILL"},{"suite":"storage","case":"temp-pack-ENOSPC"},{"suite":"storage","case":"restore-output-ENOSPC"},{"suite":"native","case":"file-truncate-during-native-read"},{"suite":"storage","case":"restore-missing-extension-binary-prerequisites"}]' || '[{"suite":"core-resources","case":"all"},{"suite":"capacity","case":"all"},{"suite":"faults","case":"all"}]') }}
+        include: ${{ fromJSON(needs.selection.outputs.matrix) }}
     env:
       ACCEPTANCE_SUITE: ${{ matrix.suite }}
-      ACCEPTANCE_SCOPE: ${{ inputs.scope || 'all' }}
+      ACCEPTANCE_SCOPE: ${{ inputs.scope }}
       ACCEPTANCE_CASE: ${{ matrix.case }}
       GO_IMAGE: golang:1.26.8-bookworm@sha256:dc9ad6c05acc7a88e5b71bde60a5fe3bd4b9f0db209011711b464107438a8107
       RESTIC_IMAGE: restic/restic:0.18.1@sha256:39d9072fb5651c80d75c7a811612eb60b4c06b32ffe87c2e9f3c7222e1797e76
@@ -75,7 +112,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if test "$ACCEPTANCE_SCOPE" = remaining-faults; then
+          if test "$ACCEPTANCE_SCOPE" != all; then
             # Do not let F14's live tracer regression block unrelated scoped gates.
             taskset -c 0,1 python3 -m unittest discover -s tests/integration/fixtures -p test_hosted_selection.py -v
           else
@@ -207,12 +244,12 @@ jobs:
           sudo taskset -c 0,1 python3 tests/integration/fixtures/verify_hosted_storage_prereqs.py \
             --runtime "$RUNNER_TEMP/bakabel-storage"
       - name: Independent remaining fault gate on fresh VM
-        if: inputs.scope == 'remaining-faults'
+        if: inputs.scope == 'remaining-faults' || inputs.scope == 'single-fault'
         shell: bash
         run: |
           set -euo pipefail
           case "$ACCEPTANCE_SUITE" in
-            native) runner=run_hosted_faults.py; runtime="$RUNNER_TEMP/bakabel-faults" ;;
+            native|reader) runner=run_hosted_faults.py; runtime="$RUNNER_TEMP/bakabel-faults" ;;
             storage) command -v strace >/dev/null; runner=run_hosted_storage_prereqs.py; runtime="$RUNNER_TEMP/bakabel-storage" ;;
             *) exit 2 ;;
           esac
@@ -251,7 +288,7 @@ jobs:
               sudo cp "$RUNNER_TEMP/bakabel-capacity/$file" "$RUNNER_TEMP/bakabel-public/$file"
             fi
           done
-          sudo --preserve-env=RUNNER_TEMP taskset -c 0,1 python3 - <<'PY'
+          sudo --preserve-env=RUNNER_TEMP,ACCEPTANCE_SUITE taskset -c 0,1 python3 - <<'PY'
           import os, shutil, sys
           from pathlib import Path
           sys.path.insert(0,'tests/integration/fixtures')
@@ -269,7 +306,8 @@ jobs:
           for case in STORAGE_CASES:
               receipt=storage/case/'receipt.json'
               if receipt.is_file(): shutil.copyfile(receipt,target/('storage-'+case+'.json'))
-          for suite, directory in (('native',faults),('storage',storage)):
+          for suite, directory in (('native',faults),('storage',storage),('reader',faults)):
+              if suite != os.environ.get('ACCEPTANCE_SUITE'): continue
               verified=directory/'selected-verified.json'
               if verified.is_file(): shutil.copyfile(verified,target/(suite+'-selected-verified.json'))
           PY

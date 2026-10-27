@@ -108,6 +108,41 @@ def fill_temporary(path, expected):
     finally: os.close(fd)
 
 
+class ExportDiagnostic:
+    """Source-only typed observation; not a Restic/helper exit or PASS proof."""
+    receipt_key='export_diagnostic'
+
+    def __init__(self,run):
+        if re.fullmatch(r'[a-f0-9]{32}',run) is None: raise ValueError('invalid export marker identity')
+        self.marker=b'\0BAKABEL_EXPORT_COMPLETE_V1:'+run.encode()+b'\0'
+        self.tail=bytearray(); self.buffer=bytearray(); self.total=0
+        self.bounded=True; self.dump_error=False; self.any_stderr=False
+
+    def feed_stdout(self,data):
+        self.tail.extend(data); del self.tail[:-len(self.marker)]
+
+    def feed(self,data):
+        self.total+=len(data); self.any_stderr |= bool(data)
+        if self.total>16384:
+            self.bounded=False; self.buffer.clear(); return
+        for byte in data:
+            if not self.bounded: return
+            if byte==10:
+                self.dump_error |= self.buffer.startswith(b'pg_dump: error:')
+                self.buffer.clear()
+            else:
+                self.buffer.append(byte)
+                if len(self.buffer)>1024: self.bounded=False; self.buffer.clear()
+
+    def finish(self):
+        complete=self.bounded and not self.buffer
+        marker=bytes(self.tail)==self.marker
+        self.tail.clear(); self.buffer.clear()
+        return {'cause':'source_dump_error' if complete and self.dump_error else (
+                    'no_stderr' if complete and not self.any_stderr else 'unclassified'),
+                'complete':complete,'completion_marker_seen':marker}
+
+
 class MissingLibraryDiagnostic:
     """Transient bounded stderr classifier; no raw line survives finish()."""
     ERROR=b'pg_restore: error: could not execute query: ERROR:  could not access file "$libdir/hstore": No such file or directory'
@@ -148,6 +183,7 @@ class StorageProbe(FaultProbe):
         self.temp_fd=None; self.output_mount=None
         self.result['attempts']=[]
         self.relay.stderr_classifier_factory=self.import_stderr_classifier
+        self.relay.observe_streams=case in (F19,F22)
 
     def run(self):
         if self.case == F19:
@@ -206,7 +242,7 @@ class StorageProbe(FaultProbe):
                         raise ValueError('Restic ancestry/executable drift')
                 elif os.readlink(f'/proc/{root}/exe') != '/usr/local/bin/bakabel':
                     raise ValueError('worker executable drift')
-        trace=WriteTrace(roots,path_kind,authority=authority); self.traces.append(trace); trace.start()
+        trace=WriteTrace(roots,path_kind,authority=authority,diagnose_setup=getattr(self,'case',None)==F19); self.traces.append(trace); trace.start()
         # Attachment is not permission to rebind an incarnation.
         if self.owned_running(active)['State'] != obj['State']: raise ValueError('worker changed during attachment')
         self.trace_binding={'worker_id':obj['Id'],'worker_pid':pid,'worker_started_at':obj['State']['StartedAt']}
@@ -260,6 +296,7 @@ class StorageProbe(FaultProbe):
         self.removals[run]=record
 
     def finish_attempt(self,controller,expect=1):
+        deadline=time.monotonic()+85
         rows=self.finish(controller,expect=expect,timeout=85)
         if len(rows) != 1: raise ValueError('one public workflow result required')
         result=rows[0]; run=result['runID']; active=self.operations.get(run)
@@ -271,6 +308,7 @@ class StorageProbe(FaultProbe):
         value={'owner':active,'result':result,'cli_exit':expect,'owner_released':True,'worker_absent':True,'last_success_unchanged':True}
         if self.case != F20: value['terminal']=self.removals[run]['terminal_before_remove']
         self.result['attempts'].append(value)
+        if self.case != F20: self.relay.wait_capture(active['execID'],deadline)
         return value
 
     def exercise_temp(self):
@@ -394,6 +432,19 @@ class StorageProbe(FaultProbe):
         return match[1]
 
     def import_stderr_classifier(self,record):
+        if self.case == F19 and self.tracking and record.get('boundary') == 'dump-start':
+            active=record.get('owner_checkpoint',{})
+            binding=self.relay.dump_bindings.get(record.get('exec_id'),{})
+            keys=('runID','daemonID','workerContainerID','workerName','workerStartAuthorized',
+                  'sourceContainerID','sourceStartedAt','targetID','execKind')
+            if (self.owner() != active or active.get('execKind') != 'dump' or
+                    active.get('workerStartAuthorized') is not True or active.get('phase') != 'exec_started' or
+                    active.get('sourceContainerID') != self.source or record.get('container_id') != self.source or
+                    active.get('execID') != record.get('exec_id') or binding.get('run_id') != active.get('runID') or
+                    any(not active.get(k) or active[k] != binding.get('owner_checkpoint',{}).get(k) for k in keys)):
+                raise ValueError('export diagnostic ownership/command mismatch')
+            record['export_contract']='wrapped-dump-v1'
+            return ExportDiagnostic(binding['run_id'])
         if (self.case != F22 or not self.tracking or not getattr(self,'capture_missing_library',False) or
                 record.get('boundary') != 'restore-start'): return None
         active=record.get('owner_checkpoint',{})
@@ -462,16 +513,18 @@ class StorageProbe(FaultProbe):
         starts=[r for r in records if r.get('boundary') == 'restore-start' and r.get('exec_id') == failed['owner']['execID']]
         if len(starts) != 1: raise ValueError('exact diagnostic import missing')
         ext['failure_cause']=starts[0].get('import_diagnostic')
+        # Failure-only readbacks must survive an unknown diagnostic cause. No
+        # prerequisite restoration/retry is allowed until BOTH guards succeed.
+        self.require_fresh_same_database(target,ext)
+        ext.update(target_after_failure=self.target_identity(target),
+            installed_after_failure=int(self.sql(target,"SELECT count(*) FROM pg_extension WHERE extname='hstore'")),
+            payload_after_failure=self.sql(target,"SELECT to_regclass('public.payload') IS NOT NULL") == 't')
         if (type(failed['terminal']['exec_exit_code']) is not int or failed['terminal']['exec_exit_code'] != 1 or
                 ext['failure_cause'] != {'cause':'hstore_binary_load_missing','complete':True,'error_count':1}):
             raise ValueError('exact missing library load failure not observed')
         # The archive may have restored availability_probe before hstore. Do
         # not repair/delete/recreate the DB, restart it or add a transaction to
         # force a pass. A changed baseline is a real failed F22 runtime gate.
-        self.require_fresh_same_database(target,ext)
-        ext.update(target_after_failure=self.target_identity(target),
-            installed_after_failure=int(self.sql(target,"SELECT count(*) FROM pg_extension WHERE extname='hstore'")),
-            payload_after_failure=self.sql(target,"SELECT to_regclass('public.payload') IS NOT NULL") == 't')
         # Only put the exact upstream library back. Do not pre-CREATE EXTENSION:
         # that would violate the production empty-catalog preflight contract.
         ext['library_present_exit']=self.extension_action(target,'prepare',identity)

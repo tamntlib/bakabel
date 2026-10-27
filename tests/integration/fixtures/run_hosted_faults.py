@@ -13,6 +13,7 @@ import re
 import select
 import socket
 import socketserver
+import stat
 import threading
 import hashlib
 import secrets
@@ -944,10 +945,10 @@ class FaultProbe(ComposeProbe):
         # exact Engine object was read back absent. A successful DELETE is not
         # absence proof; ambiguous teardown must remain operator-recoverable.
         if not all(absent.values()) or not all(volabsent.values()): raise ValueError('owned cleanup absence not observed')
+        self.relay.close()
         if hasattr(self, 'before_private_cleanup'): self.before_private_cleanup()
         retained = self.owner() is not None
         self.result['relay'] = self.relay.snapshot()
-        self.relay.close()
         for name in ('private','backend','fresh-state'):
             shutil.rmtree(self.root/name)
         if not retained: shutil.rmtree(self.root/'state')
@@ -994,9 +995,11 @@ def read_exact(conn, count):
 
 class FrameCounter:
     """Docker multiplex stdout byte count; never retains payload or stderr."""
-    def __init__(self, stderr_observer=None):
+    def __init__(self, stderr_observer=None, stdout_observer=None):
         self.header = bytearray(); self.left = 0; self.stream = 0; self.stdout = 0
         self.stderr_observer = stderr_observer
+        self.stdout_observer = stdout_observer
+        self.stderr = 0
 
     def feed(self, data):
         view = memoryview(data)
@@ -1011,9 +1014,13 @@ class FrameCounter:
                 self.left = int.from_bytes(self.header[4:8], 'big'); self.header.clear()
                 if not self.left: continue
             n = min(self.left, len(view)); self.left -= n
-            if self.stream == 2 and self.stderr_observer: self.stderr_observer(view[:n])
+            if self.stream == 2:
+                self.stderr += n
+                if self.stderr_observer: self.stderr_observer(view[:n])
+            if self.stream == 1:
+                self.stdout += n
+                if self.stdout_observer: self.stdout_observer(view[:n])
             view = view[n:]
-            if self.stream == 1: self.stdout += n
 
 
 # Exact internal/platform/docker/dump_command.go contract. Do not parse shell
@@ -1061,6 +1068,8 @@ class FaultRelay:
         self.path = Path(path)
         self.target = str(target)
         self.lock = threading.RLock()
+        self.quiescent = threading.Condition(self.lock)
+        self.active_handlers = 0
         self.records = []
         self.errors = []
         self.connections = set()
@@ -1075,9 +1084,28 @@ class FaultRelay:
         self.closed = False
         self.observer = None
         self.stderr_classifier_factory = None  # Opt-in transient classifier, never raw capture.
+        self.observe_streams = False  # Storage F19/F22 only; original fault semantics unchanged.
+        self.capture_done = {}
         relay = self
         class Server(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
             daemon_threads = True
+            def server_bind(self):
+                super().server_bind()
+                bound = relay.path.lstat()
+                if not stat.S_ISSOCK(bound.st_mode): raise ValueError('relay socket identity missing')
+                relay.socket_identity = (bound.st_dev,bound.st_ino,stat.S_IFMT(bound.st_mode))
+            def process_request(self, request, client_address):
+                # Admission precedes even thread scheduling or user callbacks.
+                if not relay.admit_handler(request):
+                    self.shutdown_request(request)
+                    return
+                try: super().process_request(request, client_address)
+                except BaseException:
+                    relay.retire_handler(request)
+                    raise
+            def process_request_thread(self, request, client_address):
+                try: super().process_request_thread(request, client_address)
+                finally: relay.retire_handler(request)
             def handle_error(self, *args):
                 with relay.lock:
                     relay.errors.append('handler error')
@@ -1087,9 +1115,16 @@ class FaultRelay:
         self.server = Server(str(path), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
 
+    def owns_socket_path(self):
+        try: current = self.path.lstat()
+        except FileNotFoundError: return False
+        return (current.st_dev,current.st_ino,stat.S_IFMT(current.st_mode)) == self.socket_identity
+
     def start(self):
-        self.path.chmod(0o600)
-        self.thread.start()
+        with self.lock:
+            if self.closed or not self.owns_socket_path(): raise ValueError('relay socket identity changed')
+            os.chmod(self.path,0o600,follow_symlinks=False)
+            self.thread.start()
 
     def arm(self, boundary, action, *, after_stdout=65536, deny_status=False, hold_seconds=10):
         if boundary not in ('worker-create', 'worker-start', 'dump-create', 'dump-start', 'restore-create', 'restore-start') or action not in ('response-loss', 'stream-drop', 'hold-before-forward'):
@@ -1187,32 +1222,179 @@ class FaultRelay:
             if self.denied_start is not None: out['denied_start'] = self.denied_start
             return copy.deepcopy(out)
 
+    def wait_capture(self, eid, deadline):
+        with self.lock: done = self.capture_done.get(eid)
+        if done is None: raise ValueError('exact stream capture missing')
+        if not done.wait(max(0,deadline-time.monotonic())):
+            raise TimeoutError('stream capture not quiescent')
+
+    def admit_handler(self, front):
+        with self.quiescent:
+            if self.closed: return False
+            self.active_handlers += 1
+            self.connections.add(front)
+            return True
+
+    def retire_handler(self, front):
+        with self.quiescent:
+            self.connections.discard(front)
+            self.active_handlers -= 1
+            self.quiescent.notify_all()
+
     def close(self):
+        deadline = time.monotonic()+3
         with self.lock:
-            if self.closed: return
+            already_closed = self.closed
             self.closed = True
             if self.hold and self.hold['record']['hold_state'] == 'held':
                 self.hold['record']['hold_state'] = 'closed'
                 self.hold['done'].set()
-        self.server.shutdown()
+        if not already_closed and self.thread.ident is not None:
+            self.server.shutdown()
+            self.thread.join(max(0,deadline-time.monotonic()))
         self.server.server_close()
-        with self.lock:
+        with self.quiescent:
             for conn in list(self.connections):
                 try: conn.shutdown(socket.SHUT_RDWR)
                 except OSError: pass
-        self.thread.join(3)
-        self.path.unlink(missing_ok=True)
+            while self.active_handlers:
+                remaining = deadline-time.monotonic()
+                if remaining <= 0: raise TimeoutError('relay handlers not quiescent')
+                self.quiescent.wait(remaining)
+            captures = list(self.capture_done)
+        for eid in captures: self.wait_capture(eid,deadline)
+        if self.owns_socket_path(): self.path.unlink(missing_ok=True)
+
+    def observe_stream(self, front, back, eid, record, diagnostic, rule):
+        """Opt-in storage observation; forwarding counts still mean successful sends.
+
+        An input EPIPE does not imply output EOF. Retire input and allow at most
+        one second/64KiB of upstream observation, inside the original deadline.
+        No synthetic EOF, HTTP response, stream retry, or payload retention.
+        """
+        done = threading.Event()
+        capture = {'state':'armed','stop_reason':None,'input_stop':None,
+                   'output_stop':None,'stderr_bytes':0,'stdout_observed_bytes':0}
+        with self.lock:
+            record['capture'] = capture
+            self.capture_done[eid] = done
+        deadline = time.monotonic()+180
+        draining = False; drained = 0; output_open = True
+        observed = FrameCounter(stderr_observer=diagnostic.feed if diagnostic is not None else None,
+                                stdout_observer=getattr(diagnostic,'feed_stdout',None))
+        forwarded = FrameCounter()
+        readers = [front, back]
+        reason = 'closed'
+        def remaining():
+            value = deadline-time.monotonic()
+            if value <= 0: raise TimeoutError('relay stream deadline')
+            return value
+        def send(dst, data):
+            view = memoryview(data)
+            while view:
+                dst.settimeout(remaining())
+                sent = dst.send(view)
+                if not sent: raise BrokenPipeError('relay send closed')
+                if dst is front:
+                    # Count only bytes the kernel accepted, including a partial
+                    # frame before timeout/EPIPE. Parsing never suppresses bytes.
+                    try: forwarded.feed(view[:sent])
+                    except ValueError: pass
+                    with self.lock:
+                        self.execs[eid]['stdout_bytes'] = forwarded.stdout
+                        record['stdout_bytes'] = forwarded.stdout
+                else:
+                    with self.lock: self.execs[eid]['stdin_bytes'] += sent
+                view = view[sent:]
+        try:
+            while readers:
+                ready, _, _ = select.select(readers, [], [], remaining())
+                if not ready:
+                    reason = 'drain_timeout' if draining else 'timeout'; break
+                for src in ready:
+                    limit = min(65536,65536-drained) if src is back and draining else 65536
+                    if not limit: reason = 'drain_bound'; return
+                    try:
+                        src.settimeout(remaining())
+                        data = src.recv(limit)
+                    except ConnectionResetError:
+                        if src is back: reason = 'recv_back_reset'; return
+                        capture['input_stop'] = 'recv_front_reset'; data = b''
+                    if not data:
+                        readers.remove(src)
+                        if src is back:
+                            reason = 'closed' if self.closed else ('frame_incomplete' if observed.header or observed.left else 'upstream_eof')
+                            try: front.shutdown(socket.SHUT_WR)
+                            except OSError: pass
+                            if reason != 'upstream_eof': return
+                            continue
+                        capture['input_stop'] = capture['input_stop'] or 'client_eof'
+                        try: back.shutdown(socket.SHUT_WR)
+                        except OSError: pass
+                        continue
+                    if src is back:
+                        parse_failed = False
+                        try: observed.feed(data)  # Observe before a failing output send.
+                        except ValueError: parse_failed = True  # Still forward this original chunk.
+                        capture['stdout_observed_bytes'] = observed.stdout
+                        capture['stderr_bytes'] = observed.stderr
+                        if draining: drained += len(data)
+                        if output_open:
+                            try: send(front,data)
+                            except (BrokenPipeError, ConnectionResetError) as exc:
+                                capture['output_stop'] = 'send_front_broken_pipe' if isinstance(exc,BrokenPipeError) else 'send_front_reset'
+                                output_open = False
+                                if front in readers: readers.remove(front)
+                                try: back.shutdown(socket.SHUT_WR)
+                                except OSError: pass
+                                draining = True; deadline = min(deadline,time.monotonic()+1)
+                        if rule and rule['action'] == 'stream-drop' and forwarded.stdout >= rule['after_stdout']:
+                            with self.lock:
+                                record['fault'] = 'stream-drop'
+                                if rule['deny_status']: self.denied_exec = eid
+                            self.hit.set(); reason = 'fault_stream_drop'; return
+                        if parse_failed: reason = 'frame_invalid'; return
+                    else:
+                        try: send(back,data)
+                        except (BrokenPipeError, ConnectionResetError) as exc:
+                            capture['input_stop'] = 'send_back_broken_pipe' if isinstance(exc,BrokenPipeError) else 'send_back_reset'
+                            readers.remove(front)
+                            try: back.shutdown(socket.SHUT_WR)
+                            except OSError: pass
+                            draining = True; deadline = min(deadline,time.monotonic()+1)
+        except TimeoutError:
+            reason = 'drain_timeout' if draining else 'timeout'
+        except ValueError:
+            reason = 'frame_invalid'
+        finally:
+            with self.lock:
+                capture['stop_reason'] = reason
+                capture['state'] = 'finalized' if reason == 'upstream_eof' else 'aborted'
+                if reason in ('frame_invalid','frame_incomplete'): self.errors.append('ValueError')
+                elif reason == 'timeout': self.errors.append('TimeoutError')
+            if diagnostic is not None:
+                # Classifier callbacks may block; never lend them the close lock.
+                value = diagnostic.finish()
+                if reason != 'upstream_eof':
+                    value.update(cause='unclassified',complete=False)
+                if reason != 'upstream_eof' and 'completion_marker_seen' in value:
+                    value['completion_marker_seen'] = None
+                key = getattr(diagnostic,'receipt_key','import_diagnostic')
+                if key not in ('import_diagnostic','export_diagnostic'): raise ValueError('invalid diagnostic projection')
+                with self.lock: record[key] = value
 
     def handle(self, front):
         while self.exchange_one(front):
             pass
 
     def exchange_one(self, front):
-        back = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        front.settimeout(180); back.settimeout(180)
-        with self.lock:
-            self.connections.update((front, back))
+        # Direct offline callers share the same barrier as server admissions.
+        if not self.admit_handler(front): return
+        back = None
         try:
+            back = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            front.settimeout(180); back.settimeout(180)
+            with self.lock: self.connections.add(back)
             head, line, headers = read_headers(front)
             method, path, _ = line.split(' ')
             if headers.get('transfer-encoding'):
@@ -1304,13 +1486,15 @@ class FaultRelay:
                 return keepalive
             eid = record.get('exec_id') if record['boundary'].endswith('-start') else None
             diagnostic = self.stderr_classifier_factory(record) if eid and record['status'] == 101 and self.stderr_classifier_factory else None
+            if record['status'] == 101 and eid and self.observe_streams:
+                return self.observe_stream(front, back, eid, record, diagnostic, rule)
             counter = FrameCounter(stderr_observer=diagnostic.feed if diagnostic is not None else None)
             def forward(src, dst, data):
                 dst.sendall(data)
                 if eid:
+                    if src is back: counter.feed(data)
                     with self.lock:
                         if src is back:
-                            counter.feed(data)
                             self.execs[eid]['stdout_bytes'] = counter.stdout
                             record['stdout_bytes'] = counter.stdout
                         else:
@@ -1334,7 +1518,8 @@ class FaultRelay:
                         else:
                             if src is back and diagnostic is not None:
                                 if counter.header or counter.left: raise ValueError('incomplete diagnostic frame')
-                                with self.lock: record['import_diagnostic'] = diagnostic.finish()
+                                value = diagnostic.finish()
+                                with self.lock: record['import_diagnostic'] = value
                             readers.remove(src)
                             try: dst.shutdown(socket.SHUT_WR)
                             except OSError: pass
@@ -1381,9 +1566,12 @@ class FaultRelay:
             with self.lock:
                 self.errors.append(type(exc).__name__)
         finally:
-            with self.lock:
-                self.connections.discard(front); self.connections.discard(back)
-            back.close()
+            if back is not None:
+                back.close()
+                with self.lock: self.connections.discard(back)
+            if 'record' in locals() and 'capture' in record:
+                self.capture_done[record['exec_id']].set()
+            self.retire_handler(front)
 
 
 def probe_class_for_case(case):

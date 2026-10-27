@@ -61,6 +61,28 @@ release ready. No dispatch, new runtime PASS, publication or deployment is
 claimed by this scheduling change. Current retained failure is recorded in the
 [release ledger](RELEASE_GATE_LEDGER.md#current-f14-blocker-and-independent-remaining-gate-scheduling).
 
+## Isolated manual fault recheck
+
+Choose **scope → single-fault** and exactly one named **case** to run only that
+case on a fresh VM. For the pending independent rechecks, use
+`restore-reader-failure-importer-zero` (F14, suite `reader`), `temp-pack-ENOSPC`
+(F19), or `restore-missing-extension-binary-prerequisites` (F22). The selector
+also permits the other five F16–F22 cases. A small validation-only job checks
+scope/case before any Engine setup, fetch or build; it does not run fault gates.
+Invalid combinations fail closed: bulk scopes require `case: all`, and
+`single-fault` requires a named case. Default `all/all` and
+`remaining-faults/all` preserve the original three/seven acceptance VM matrices.
+
+The reader suite passes its single `--case` to the unchanged fault runner and
+actual `verify_hosted_faults.verify_case`, including all F14 assertions. It does
+not invoke the full fault or storage suites. Its allowlisted receipt is
+`faults-restore-reader-failure-importer-zero.json`, with
+`reader-selected-verified.json`; scope/suite/case remain in metadata/artifact
+identity. All scoped prechecks avoid the live F14 tracer test suite, but the
+selected F14 runtime gate itself is mandatory, not waived. Scoped aggregate and
+full-plan flags remain false. This selector is not runtime PASS evidence and
+does not close F14 or authorize publication/deployment.
+
 ## Current state
 
 The authorized source repository is public at [tamntlib/bakabel](https://github.com/tamntlib/bakabel). The [first successful hosted run](https://github.com/tamntlib/bakabel/actions/runs/40236034625), commit `64725f740c3c512e9edaefa58a9d994c28ea508d`, passed 21 Compose and 23 Swarm required gates plus independent cleanup readback. Its downloaded artifact digest, source/image/daemon bindings, gate completeness, worker defaults and cleanup receipts were checked again by the parent; see [results and preserved failures](HOSTED_ACCEPTANCE_RESULT.md). CI also passed at that commit. No image publication, release or production deployment was performed; remaining PLAN fault/capacity certification is still pending.

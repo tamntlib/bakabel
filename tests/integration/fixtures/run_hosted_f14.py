@@ -13,7 +13,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from hosted_f14_reader import find_reader, check_binding
+from hosted_f14_reader import find_reader, check_binding, project_failure, failure_record
 from verify_hosted_f14 import CASE, demand
 
 DATA_SQL = "SELECT json_build_object('rows',count(*),'min',min(g),'max',max(g),'sum',sum(g),'digest',md5(string_agg(md5(g::text||':'||data),'' ORDER BY g)))::text FROM public.payload"
@@ -61,14 +61,32 @@ class F14Mixin:
         demand(json.loads(line) == {'state':'armed'},'host reader tracer refused attachment')
         attempt.update(owner=copy.deepcopy(active),worker_pid=worker_pid)
 
+    def f14_diagnostic(self,phase):
+        attempt=self.f14_attempt
+        if 'diagnostic' not in attempt:
+            attempt['diagnostic']={'mode':attempt['mode'],**dict.fromkeys((
+                'helper_returncode','helper','owner_phase','owner_authorized','import_exit_code',
+                'reader_natural_exit_code','reader_terminal_exit_code','reader_terminal_signal','reader_injected',
+                'worker_running','worker_pid_zero','worker_exit_code','error_type'))}
+            self.result.setdefault('f14_diagnostics',[]).append(attempt['diagnostic'])
+        diagnostic=attempt['diagnostic'];diagnostic['phase']=phase
+        return diagnostic
+
     def finish_reader_tracer(self):
+        diagnostic=self.f14_diagnostic('tracer_finish')
         child=self.f14_tracer
         # Worker termination means reader Wait completed; helper must promptly
         # supply its actual ptrace wait status, not inferred CLI failure.
         output,_=child.communicate(timeout=3)
+        diagnostic['helper_returncode']=child.returncode if type(child.returncode) is int else None
+        if len(output)<=4096:
+            try:rows=[json.loads(x) for x in output.splitlines()]
+            except (ValueError,TypeError):rows=[]
+            if len(rows)==1 and isinstance(rows[0],dict) and rows[0].get('state')=='failed':
+                diagnostic['helper']=project_failure(rows[0])
+        else:rows=[]
         demand(child.returncode == 0 and len(output) <= 4096,'host reader tracer failed')
-        rows=[json.loads(x) for x in output.splitlines()]
-        demand(len(rows) == 1 and rows[0].get('state') == 'terminal','host reader terminal proof missing')
+        demand(len(rows) == 1 and isinstance(rows[0],dict) and rows[0].get('state') == 'terminal','host reader terminal proof missing')
         self.f14_tracer=None
         return rows[0]['reader']
 
@@ -80,26 +98,46 @@ class F14Mixin:
             demand('owner' not in attempt,'duplicate import start')
             self.start_reader_tracer(record['owner_checkpoint'])
         elif record['boundary'] == 'worker-remove' and 'owner' in attempt and record.get('container_id') == attempt['owner']['workerContainerID']:
-            from verify_hosted_faults import verify_nonforce_remove
-            verify_nonforce_remove(record)
-            demand(record.get('forwarded') is False and 'terminal' not in attempt,'duplicate or late removal observation')
-            active=attempt['owner']; current=self.owner(); cid=active['workerContainerID']
-            demand(current and all(current.get(k) == active[k] for k in ('runID','daemonID','workerContainerID','workerName')) and
-                   current.get('workerStartAuthorized') is True and current.get('phase') == 'intent' and current.get('status') == 'active' and
-                   all(not current.get(k) for k in ('sourceContainerID','execID','importRunID')),
-                   'ordinary reader terminal ownership lost before removal')
-            reader=self.finish_reader_tracer()
-            terminal={**self.terminal_proof(active),'import_run_id':active['importRunID']}
-            demand(type(terminal.get('exec_exit_code')) is int and terminal['exec_exit_code'] == 0,
-                   'reader fault did not leave otherwise-valid importer zero')
-            obj=self.e.inspect(cid); self.worker_identity_proof(obj,active)
-            state=obj['State']; expected=1 if attempt['mode'] == 'fault' else 0
-            demand(state.get('Running') is False and type(state.get('Pid')) is int and state['Pid'] == 0 and
-                   type(state.get('ExitCode')) is int and state['ExitCode'] == expected and self.owner() == current,
-                   'ordinary worker falsely succeeded or terminal ownership drifted')
-            record.update(owner_before_remove=current,terminal_before_remove=terminal,reader_before_remove=reader,
-                          worker_before_remove=self.worker_observation(cid,obj,time.monotonic()))
-            attempt.update(reader=reader,terminal=terminal)
+            diagnostic=self.f14_diagnostic('remove_gate')
+            try:
+                from verify_hosted_faults import verify_nonforce_remove
+                verify_nonforce_remove(record)
+                demand(record.get('forwarded') is False and 'terminal' not in attempt,'duplicate or late removal observation')
+                diagnostic['phase']='owner_gate'
+                active=attempt['owner']; current=self.owner(); cid=active['workerContainerID']
+                diagnostic['owner_phase']=current.get('phase') if isinstance(current,dict) and current.get('phase') in ('intent','creating_exec','exec_started','blocked') else None
+                diagnostic['owner_authorized']=current.get('workerStartAuthorized') if isinstance(current,dict) and type(current.get('workerStartAuthorized')) is bool else None
+                demand(current and all(current.get(k) == active[k] for k in ('runID','daemonID','workerContainerID','workerName')) and
+                       current.get('workerStartAuthorized') is True and current.get('phase') == 'intent' and current.get('status') == 'active' and
+                       all(not current.get(k) for k in ('sourceContainerID','execID','importRunID')),
+                       'ordinary reader terminal ownership lost before removal')
+                reader=self.finish_reader_tracer()
+                for key,maximum in (('natural_exit_code',255),('terminal_exit_code',255),('terminal_signal',64)):
+                    value=reader.get(key)
+                    diagnostic['reader_'+key]=value if type(value) is int and 0<=value<=maximum else None
+                diagnostic['reader_injected']=reader.get('injected') if type(reader.get('injected')) is bool else None
+                diagnostic['phase']='import_terminal'
+                terminal={**self.terminal_proof(active),'import_run_id':active['importRunID']}
+                diagnostic['import_exit_code']=terminal.get('exec_exit_code') if type(terminal.get('exec_exit_code')) is int else None
+                demand(type(terminal.get('exec_exit_code')) is int and terminal['exec_exit_code'] == 0,
+                       'reader fault did not leave otherwise-valid importer zero')
+                diagnostic['phase']='worker_terminal'
+                obj=self.e.inspect(cid); self.worker_identity_proof(obj,active)
+                state=obj['State']
+                diagnostic['worker_running']=state.get('Running') if type(state.get('Running')) is bool else None
+                diagnostic['worker_pid_zero']=state.get('Pid')==0 if type(state.get('Pid')) is int else None
+                diagnostic['worker_exit_code']=state.get('ExitCode') if type(state.get('ExitCode')) is int else None
+                expected=1 if attempt['mode'] == 'fault' else 0
+                demand(state.get('Running') is False and type(state.get('Pid')) is int and state['Pid'] == 0 and
+                       type(state.get('ExitCode')) is int and state['ExitCode'] == expected and self.owner() == current,
+                       'ordinary worker falsely succeeded or terminal ownership drifted')
+                diagnostic['phase']='annotate'
+                record.update(owner_before_remove=current,terminal_before_remove=terminal,reader_before_remove=reader,
+                              worker_before_remove=self.worker_observation(cid,obj,time.monotonic()))
+                attempt.update(reader=reader,terminal=terminal)
+            except Exception as exc:
+                diagnostic['error_type']=failure_record(exc)['type']
+                raise
 
     def exercise_reader_failure(self):
         # Independently freeze the public logical ID; never substitute the

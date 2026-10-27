@@ -69,7 +69,38 @@ class SyscallInfo(ctypes.Structure):
                ('ip',ctypes.c_ulonglong),('sp',ctypes.c_ulonglong),('data',ctypes.c_ulonglong*8)]
 
 
-def trace_exit(pid, validate, ready, *, inject, seconds=20):
+FAILURE_TYPES={'OSError','ProcessLookupError','PermissionError','TimeoutError',
+               'ChildProcessError','ValueError','RuntimeError','FileNotFoundError','OtherError'}
+TRACE_PHASES={'attach','wait','clone','syscall_info','authorize','ready','resume','terminal','detach','unknown'}
+FAILURE_ERRNOS={'ESRCH','EPERM','EACCES','EIO','EINVAL','ECHILD','EINTR','ENOENT','OTHER'}
+
+
+def project_failure(row):
+    """Fixed finite public projection; never retain arbitrary helper stdout."""
+    def integer(key,maximum):
+        value=row.get(key)
+        return value if type(value) is int and 0<=value<=maximum else None
+    def finite(key,allowed,fallback=None):
+        value=row.get(key)
+        return value if type(value) is str and value in allowed else fallback
+    return {'state':'failed','type':finite('type',FAILURE_TYPES,'OtherError'),
+            'errno':finite('errno',FAILURE_ERRNOS),
+            'phase':finite('phase',TRACE_PHASES,'unknown'),
+            'natural_exit_code':integer('natural_exit_code',255),
+            'injected':row.get('injected') if type(row.get('injected')) is bool else None,
+            'owned_tasks':integer('owned_tasks',128),'stopped_tasks':integer('stopped_tasks',128),
+            'detach_verified':row.get('detach_verified') if type(row.get('detach_verified')) is bool else None,
+            'cleanup_failed':row.get('cleanup_failed') is True}
+
+
+def failure_record(exc,diagnostic=None):
+    row=dict(diagnostic or {})
+    row.update(type=type(exc).__name__,errno=errno.errorcode.get(getattr(exc,'errno',None),'OTHER')
+               if isinstance(exc,OSError) else None,cleanup_failed=getattr(exc,'f14_cleanup_failed',False) is True)
+    return project_failure(row)
+
+
+def trace_exit(pid, validate, ready, *, inject, seconds=20, diagnostic=None):
     """Trace an authorized process; callbacks must fail closed. No PID guessing.
 
     ready runs only after every observed thread is stopped and attached. The
@@ -80,10 +111,14 @@ def trace_exit(pid, validate, ready, *, inject, seconds=20):
         raise RuntimeError('F14 requires Linux x86-64 syscall ABI')
     if type(pid) is not int or pid <= 1 or type(inject) is not bool:
         raise ValueError('invalid exact reader selector')
+    diagnostic={} if diagnostic is None else diagnostic
+    diagnostic['phase']='attach'
     libc = ctypes.CDLL(None,use_errno=True)
     libc.ptrace.restype = ctypes.c_long
     libc.ptrace.argtypes = [ctypes.c_uint,ctypes.c_int,ctypes.c_void_p,ctypes.c_void_p]
     def ptrace(request,tid,addr=0,data=0):
+        diagnostic['phase']={0x4206:'attach',0x4207:'attach',0x4201:'clone',
+                             0x420e:'syscall_info',24:'resume',17:'detach'}.get(request,'unknown')
         result = libc.ptrace(request,tid,ctypes.c_void_p(addr),ctypes.c_void_p(data))
         if result == -1:
             code = ctypes.get_errno(); raise OSError(code,os.strerror(code))
@@ -92,6 +127,7 @@ def trace_exit(pid, validate, ready, *, inject, seconds=20):
     tids = set(); stopped = set(); natural = None; injected = False
     fd = os.pidfd_open(pid)
     def wait(tid=-1,deadline=None):
+        diagnostic['phase']='wait'
         deadline=end if deadline is None else deadline
         while time.monotonic() < deadline:
             # A clone's initial stop can be waitable BEFORE its parent's clone
@@ -103,7 +139,7 @@ def trace_exit(pid, validate, ready, *, inject, seconds=20):
             time.sleep(.001)
         raise TimeoutError('bounded F14 reader tracing')
     try:
-        validate()
+        diagnostic['phase']='authorize';validate()
         # Stop each thread immediately. Re-scan until no untraced thread can
         # clone; TRACECLONE covers subsequent births once tracing resumes.
         while True:
@@ -122,7 +158,8 @@ def trace_exit(pid, validate, ready, *, inject, seconds=20):
                     if exc.errno != errno.ESRCH: raise
                     tids.discard(tid)
             if time.monotonic() >= end: raise TimeoutError('bounded reader attachment')
-        validate(); ready()
+        diagnostic['phase']='authorize';validate()
+        diagnostic['phase']='ready';ready()
         for tid in list(stopped): ptrace(24,tid); stopped.discard(tid) # SYSCALL
         while tids:
             tid,status = wait()
@@ -148,11 +185,21 @@ def trace_exit(pid, validate, ready, *, inject, seconds=20):
                 tids.add(child.value)
             elif sig == signal.SIGTRAP|0x80:
                 info = SyscallInfo()
-                size = ptrace(0x420e,tid,ctypes.sizeof(info),ctypes.addressof(info))
+                try:
+                    size = ptrace(0x420e,tid,ctypes.sizeof(info),ctypes.addressof(info))
+                except OSError as exc:
+                    if exc.errno != errno.ESRCH: raise
+                    # A sibling exit_group can invalidate a queued syscall
+                    # stop. ESRCH is NOT terminal proof: retain this admitted
+                    # task and require its actual wait status below. Do not
+                    # keep a stale stopped flag that could deadlock cleanup.
+                    stopped.discard(tid)
+                    continue
                 if size < 24 or info.arch != 0xc000003e: raise ValueError('unknown syscall ABI')
                 if info.op == 1 and info.data[0] == 231: # x86-64 exit_group entry
                     natural = info.data[1]
                     if natural != 0: raise ValueError('reader already failing naturally')
+                    diagnostic['phase']='authorize'
                     validate() # fresh owner + exact executable/argv/incarnation
                     if inject:
                         signal.pidfd_send_signal(fd,signal.SIGKILL)
@@ -166,50 +213,78 @@ def trace_exit(pid, validate, ready, *, inject, seconds=20):
             try: ptrace(24,tid,0,deliver); stopped.discard(tid)
             except OSError as exc:
                 if exc.errno != errno.ESRCH: raise
+                stopped.discard(tid) # Retain ownership until actual terminal wait.
+        diagnostic['phase']='terminal'
         if natural != 0 or result['injected'] != inject: raise ValueError('reader exit boundary not observed')
         return result
     finally:
-        # The operation budget may already be exhausted. Cleanup gets its own
-        # fixed short budget and never waits for/reaps an unrelated child.
+        # Cleanup drains the entire admitted group: a leader terminal wait can
+        # depend on first consuming its siblings' ptrace exit notifications.
+        # Keep the original operation exception even if cleanup also fails.
+        primary=sys.exc_info()[1]
+        failed_phase=diagnostic['phase']
+        diagnostic.update(natural_exit_code=natural,injected=injected,owned_tasks=len(tids),stopped_tasks=len(stopped),detach_verified=False)
         cleanup_end=time.monotonic()+1
         tracer_tid=threading.get_native_id()
-        failures=[]
+        failures=[];interrupted=set();detach_attempted=set()
+        def attached(tid):
+            try:status=(Path('/proc')/str(tid)/'status').read_text()
+            except (FileNotFoundError,ProcessLookupError):
+                # procfs may open status while a detached task still exists,
+                # then return ESRCH from read after it exits. That task cannot
+                # retain our tracer; unlike ptrace ESRCH, this is procfs absence.
+                return False
+            tracer=next(line.split(':',1)[1].strip() for line in status.splitlines() if line.startswith('TracerPid:'))
+            return tracer==str(tracer_tid)
         try:
-            while tids:
-                tid=min(tids)
-                try:
-                    if tid not in stopped:
-                        ptrace(0x4207,tid)
-                        _,status=wait(tid,deadline=cleanup_end)
-                        if os.WIFEXITED(status) or os.WIFSIGNALED(status):
-                            tids.discard(tid);continue
-                        if not os.WIFSTOPPED(status):raise RuntimeError('unknown reader cleanup wait state')
-                        stopped.add(tid)
-                        if status >> 16 == 3:
-                            # A clone event can race the operation timeout.
-                            child=ctypes.c_ulonglong()
+            while tids and time.monotonic()<cleanup_end:
+                for tid in sorted(tids.copy()):
+                    if tid in stopped and tid not in detach_attempted:
+                        detach_attempted.add(tid)
+                        try:ptrace(17,tid) # DETACH resumes only this admitted task.
+                        except OSError as exc:
+                            if exc.errno!=errno.ESRCH:failures.append(exc)
+                        if not attached(tid):
+                            tids.discard(tid);stopped.discard(tid)
+                    elif tid not in stopped and tid not in interrupted:
+                        interrupted.add(tid)
+                        try:ptrace(0x4207,tid)
+                        except OSError as exc:
+                            if exc.errno!=errno.ESRCH:failures.append(exc)
+                if not tids:break
+                try:tid,status=wait(deadline=cleanup_end)
+                except (OSError,TimeoutError,ChildProcessError) as exc:
+                    failures.append(exc);break
+                if os.WIFEXITED(status) or os.WIFSIGNALED(status):
+                    tids.discard(tid);stopped.discard(tid)
+                elif os.WIFSTOPPED(status):
+                    stopped.add(tid);detach_attempted.discard(tid)
+                    if status >> 16 == 3:
+                        child=ctypes.c_ulonglong()
+                        try:
                             ptrace(0x4201,tid,0,ctypes.addressof(child))
                             if child.value<=1 or len(tids)>=128:raise RuntimeError('reader cleanup clone bound')
                             tids.add(child.value)
-                    ptrace(17,tid) # DETACH resumes the owned task.
-                except (OSError,TimeoutError,ChildProcessError) as exc:
-                    # ESRCH alone is not proof: a live running tracee can also
-                    # reject DETACH. Verify proc attachment before accepting it.
-                    try:
-                        status=(Path('/proc')/str(tid)/'status').read_text()
-                        tracer=next(line.split(':',1)[1].strip() for line in status.splitlines() if line.startswith('TracerPid:'))
-                        if tracer==str(tracer_tid):failures.append(exc)
-                    except FileNotFoundError:pass
-                else:
-                    try:
-                        status=(Path('/proc')/str(tid)/'status').read_text()
-                        if any(line=='TracerPid:\t'+str(tracer_tid) for line in status.splitlines()):
-                            failures.append(RuntimeError('reader still attached after detach'))
-                    except FileNotFoundError:pass
-                finally:
-                    tids.discard(tid);stopped.discard(tid)
-            if failures:raise RuntimeError('F14 owned reader cleanup could not detach/resume') from failures[0]
-        finally:os.close(fd)
+                        except (OSError,RuntimeError) as exc:
+                            failures.append(exc)
+                else:failures.append(RuntimeError('unknown reader cleanup wait state'));break
+            # ESRCH alone never removes authority. Check actual native tracer
+            # ownership, even for failed DETACH or a task whose wait vanished.
+            remaining=[tid for tid in tids if attached(tid)]
+            diagnostic['detach_verified']=not remaining
+            if remaining or failures:
+                cleanup_error=RuntimeError('F14 owned reader cleanup could not detach/resume')
+                if primary is not None:
+                    primary.f14_cleanup_failed=True
+                    primary.add_note('F14 owned reader cleanup could not detach/resume')
+                else:raise cleanup_error from (failures[0] if failures else None)
+        except Exception:
+            if primary is None:raise
+            primary.f14_cleanup_failed=True
+            primary.add_note('F14 owned reader cleanup could not detach/resume')
+        finally:
+            diagnostic['phase']=failed_phase
+            os.close(fd)
 
 
 def authorize(binding, owner_path, engine):
@@ -249,7 +324,11 @@ def main(argv=None):
         authorize(binding,args.owner,engine)
         checks += 1
     def ready(): print(json.dumps({'state':'armed'}),flush=True)
-    result = trace_exit(process['pid'],validate,ready,inject=binding['mode'] == 'fault')
+    diagnostic={}
+    try:result = trace_exit(process['pid'],validate,ready,inject=binding['mode'] == 'fault',diagnostic=diagnostic)
+    except Exception as exc:
+        print(json.dumps(failure_record(exc,diagnostic)),flush=True)
+        return 1
     result.update(pid=process['pid'],ppid=process['ppid'],start_ticks=process['start_ticks'],
                   argv_sha256=hashlib.sha256(json.dumps(process['argv'],separators=(',',':')).encode()).hexdigest(),
                   fresh_authorization_checks=checks)
@@ -261,5 +340,5 @@ if __name__ == '__main__':
     try: raise SystemExit(main())
     except Exception as exc:
         # Finite codes only; no raw exceptions, argv, paths, env or process data.
-        print(json.dumps({'state':'failed','type':type(exc).__name__}),flush=True)
+        print(json.dumps(failure_record(exc)),flush=True)
         raise SystemExit(1)

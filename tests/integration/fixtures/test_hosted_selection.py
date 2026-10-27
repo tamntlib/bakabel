@@ -12,7 +12,9 @@ ROOT = Path(__file__).resolve().parents[3]
 
 
 def fixture(suite):
-    row = synthetic() if suite == 'storage' else native_receipt()
+    from test_hosted_f14 import F14VerifierTests
+    row = (F14VerifierTests().receipt() if suite == 'reader' else
+           synthetic() if suite == 'storage' else native_receipt())
     if suite == 'native':
         row.update(status='pass', exercised=True, ordinary_image=True, request_mutations=[],
                    backend='local', platform='compose', source_unchanged=True,
@@ -23,13 +25,13 @@ def fixture(suite):
             memory_bytes=536870912, nanocpus=2000000000,
             socket={'source':'/unit/relay.sock','destination':'/run/bakabel/docker.sock','read_only':True})
     row['source_sha256'] = fingerprint(ROOT)
-    case = F19 if suite == 'storage' else F16
+    case = row['case']
     report = {'schema':1, 'cases':[{'case':case,'status':'pass'}],
               ('storage_acceptance_pass' if suite == 'storage' else 'fault_acceptance_pass'):False,
               'full_plan_acceptance_pass':False,
               **{k:row[k] for k in ('source_sha256','image_id','daemon')}}
     candidate = {**{k:row[k] for k in ('source_sha256','image_id','daemon')},
-                 'commit':'a'*40, 'scope':'remaining-faults', 'suite':suite, 'case':case}
+                 'commit':'a'*40, 'scope':'single-fault' if suite == 'reader' else 'remaining-faults', 'suite':suite, 'case':case}
     return report, [row], candidate, case
 
 
@@ -39,6 +41,60 @@ class SelectionTests(unittest.TestCase):
             return importlib.import_module('verify_hosted_selection')
         except ModuleNotFoundError:
             self.fail('independent single-case selection verifier is missing')
+
+    def test_manual_plan_preserves_both_bulk_scopes_and_isolates_each_named_case(self):
+        m = self.module()
+        from verify_hosted_native_faults import NATIVE_CASES
+        from verify_hosted_storage_prereqs import CASES as STORAGE_CASES
+        self.assertTrue(hasattr(m, 'plan'), 'validated manual matrix planner is missing')
+        self.assertEqual(m.plan('all', 'all'), [{'suite':s,'case':'all'} for s in
+                                             ('core-resources','capacity','faults')])
+        remaining = m.plan('remaining-faults', 'all')
+        self.assertEqual(len(remaining), 7)
+        self.assertEqual({e['case'] for e in remaining}, set(NATIVE_CASES) | set(STORAGE_CASES))
+        expected = [('reader','restore-reader-failure-importer-zero')]
+        expected += [('native',c) for c in NATIVE_CASES] + [('storage',c) for c in STORAGE_CASES]
+        for suite, case in expected:
+            self.assertEqual(m.plan('single-fault', case), [{'suite':suite,'case':case}])
+        for scope, case in [('single-fault','all'), ('all',F16), ('remaining-faults',F19),
+                            ('remaining-faults','restore-reader-failure-importer-zero'),
+                            ('bad','all'), ('','all'), ('single-fault','bad'),
+                            ('single-fault','$(touch INJECTED)'), ('single-fault',F19+'\n')]:
+            with self.subTest(scope=scope,case=case), self.assertRaises(ValueError):
+                m.plan(scope, case)
+
+    def test_single_fault_verdict_runs_actual_f14_assertions_without_aggregate_claims(self):
+        from test_hosted_f14 import F14VerifierTests
+        m = self.module()
+        row = F14VerifierTests().receipt()
+        case = row['case']; row['source_sha256'] = fingerprint(ROOT)
+        report = {'schema':1, 'cases':[{'case':case,'status':'pass'}],
+                  'fault_acceptance_pass':False,'full_plan_acceptance_pass':False,
+                  **{k:row[k] for k in ('source_sha256','image_id','daemon')}}
+        candidate = {**{k:row[k] for k in ('source_sha256','image_id','daemon')},
+                     'commit':'a'*40,'scope':'single-fault','suite':'reader','case':case}
+        try:
+            result = m.verify_selection(report, [row], candidate, 'reader', case, ROOT)
+        except ValueError as exc:
+            self.fail('F14 single-case verification is missing: '+str(exc))
+        self.assertEqual(result, {'scope':'single-fault','suite':'reader','case':case,
+                                 'selected_case_pass':True,'full_plan_acceptance_pass':False})
+        for mutation in ('semantic', 'duplicate', 'manifest', 'scope', 'head', 'full', 'aggregate', 'cleanup'):
+            r, rows, c = copy.deepcopy((report,[row],candidate))
+            if mutation == 'semantic': rows[0]['proof']['attempts'][1]['terminal']['exec_exit_code'] = 1
+            elif mutation == 'duplicate': rows.append(copy.deepcopy(rows[0]))
+            elif mutation == 'manifest': r['cases'].append(copy.deepcopy(r['cases'][0]))
+            elif mutation == 'scope': c['scope'] = 'remaining-faults'
+            elif mutation == 'head': c['commit'] = 'not-a-head'
+            elif mutation == 'full': r['full_plan_acceptance_pass'] = True
+            elif mutation == 'aggregate': r['fault_acceptance_pass'] = True
+            elif mutation == 'cleanup': rows[0]['cleanup']['private_paths_absent'] = False
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                m.verify_selection(r, rows, c, 'reader', case, ROOT)
+        for suite in ('native','storage'):
+            report, rows, candidate, case = fixture(suite)
+            candidate['scope'] = 'single-fault'
+            self.assertEqual(m.verify_selection(report,rows,candidate,suite,case,ROOT)['scope'], 'single-fault')
 
     def test_actual_native_and_storage_case_verifiers_accept_scoped_selection_only(self):
         m = self.module()
@@ -136,13 +192,13 @@ class SelectionTests(unittest.TestCase):
         import tempfile
         m = self.module()
         self.assertTrue(hasattr(m, 'main'), 'selection verifier CLI is missing')
-        for suite in ('native','storage'):
+        for suite in ('native','storage','reader'):
             report, rows, candidate, case = fixture(suite)
             with self.subTest(suite=suite), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 (root/case).mkdir()
                 (root/case/'receipt.json').write_text(json.dumps(rows[0]))
-                report_path = root/('hosted-faults.json' if suite == 'native' else 'hosted-storage.json')
+                report_path = root/('hosted-storage.json' if suite == 'storage' else 'hosted-faults.json')
                 report_path.write_text(json.dumps(report))
                 binding = root/'candidate.json'; binding.write_text(json.dumps(candidate))
                 output = root/'selected-verified.json'
@@ -152,8 +208,12 @@ class SelectionTests(unittest.TestCase):
                 self.assertEqual(cp.returncode, 0, cp.stderr)
                 self.assertEqual(json.loads(output.read_text()), json.loads(cp.stdout))
                 self.assertIs(json.loads(cp.stdout)['full_plan_acceptance_pass'], False)
+                output.unlink()
+                duplicate = subprocess.run(cmd + ['--case',case], capture_output=True, text=True, env=os.environ)
+                self.assertNotEqual(duplicate.returncode, 0, 'duplicate case flags must fail closed')
+                self.assertFalse(output.exists())
                 report['cases'] = []
-                report_path.write_text(json.dumps(report)); output.unlink()
+                report_path.write_text(json.dumps(report))
                 cp = subprocess.run(cmd, capture_output=True, text=True, env=os.environ)
                 self.assertNotEqual(cp.returncode, 0)
                 self.assertFalse(output.exists())

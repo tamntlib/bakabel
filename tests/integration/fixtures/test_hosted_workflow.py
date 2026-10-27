@@ -10,7 +10,57 @@ import tempfile
 
 ROOT=Path(__file__).resolve().parents[3]
 
+
+def export_sudo_shim(path):
+    """Model env_reset and explicit preservation without executing real sudo."""
+    path.write_text('#!'+sys.executable+'\n'+
+        'import os,sys\n'
+        'args=sys.argv[1:]; keep={"PATH"}\n'
+        'if args and args[0].startswith("--preserve-env="):\n'
+        '    keep.update(args.pop(0).split("=",1)[1].split(","))\n'
+        'if args[0]=="chown": raise SystemExit(0)\n'
+        'env={k:v for k,v in os.environ.items() if k in keep}\n'
+        'os.execvpe(args[0],args,env)\n')
+    path.chmod(0o700)
+
+
 class WorkflowContract(unittest.TestCase):
+    def test_real_selection_shell_validates_before_build_and_never_interpolates_inputs(self):
+        import json
+        import textwrap
+        from verify_hosted_selection import plan
+        text = (ROOT/'.github/workflows/acceptance.yaml').read_text()
+        marker = '      - name: Validate manual scope and case'
+        self.assertIn(marker, text, 'pre-build input validation is missing')
+        block = text.split(marker,1)[1].split('\n  acceptance:',1)[0]
+        self.assertIn('REQUESTED_SCOPE: ${{ inputs.scope }}', block)
+        self.assertIn('REQUESTED_CASE: ${{ inputs.case }}', block)
+        script = textwrap.dedent(block.split('        run: |\n',1)[1])
+        self.assertNotIn('${{',script)
+        self.assertNotIn('${{', text.split('      matrix:\n',1)[1].split('    env:',1)[0].replace('${{ fromJSON(needs.selection.outputs.matrix) }}',''))
+        entries = plan('remaining-faults','all') + plan('single-fault','restore-reader-failure-importer-zero')
+        pairs = [('all','all'),('remaining-faults','all')] + [('single-fault',e['case']) for e in entries]
+        pairs += [('all',entries[0]['case']),('remaining-faults',entries[-1]['case']),
+                  ('single-fault','all'),('bogus','all'),('single-fault','$(touch INJECTED)'),
+                  ('single-fault','x\nextra=true'),('single-fault','../../private')]
+        for scope, case in pairs:
+            with self.subTest(scope=scope,case=case), tempfile.TemporaryDirectory() as directory:
+                output = Path(directory)/'output'; output.touch()
+                cp = subprocess.run(['bash','-eu','-c',script],cwd=ROOT,capture_output=True,text=True,
+                    env={**os.environ,'REQUESTED_SCOPE':scope,'REQUESTED_CASE':case,'GITHUB_OUTPUT':str(output)})
+                try: expected = plan(scope,case)
+                except ValueError:
+                    self.assertNotEqual(cp.returncode,0)
+                    self.assertEqual(output.read_text(),'')
+                else:
+                    self.assertEqual(cp.returncode,0,cp.stderr)
+                    key, value = output.read_text().strip().split('=',1)
+                    self.assertEqual(key,'matrix'); self.assertEqual(json.loads(value),expected)
+                self.assertFalse((ROOT/'INJECTED').exists())
+        for label in ('Real current workflow fault boundaries','Additive bounded storage and extension prerequisite gates'):
+            block = text.split('      - name: '+label,1)[1].split('      - name:',1)[0]
+            self.assertIn("if: matrix.suite == 'faults'",block)
+
     def test_real_export_shell_accepts_each_suite_and_excludes_private_trees(self):
         import json
         import textwrap
@@ -23,7 +73,7 @@ class WorkflowContract(unittest.TestCase):
             with self.subTest(suite=suite),tempfile.TemporaryDirectory() as directory:
                 root=Path(directory);tools=root/'tools';tools.mkdir()
                 sudo=tools/'sudo'
-                sudo.write_text('#!/bin/sh\ncase "$1" in --preserve-env=*) shift;; esac\nif [ "$1" = chown ]; then exit 0; fi\nexec "$@"\n');sudo.chmod(0o700)
+                export_sudo_shim(sudo)
                 (root/'bakabel-candidate.json').write_text(json.dumps({'suite':suite}))
                 if suite=='core-resources':
                     receipt=root/'bakabel-acceptance/compose/receipt.json';receipt.parent.mkdir(parents=True)
@@ -63,11 +113,11 @@ class WorkflowContract(unittest.TestCase):
         trigger = text.split('permissions:',1)[0]
         for item in ('scope:', 'type: choice', 'default: all', '- all', '- remaining-faults'):
             self.assertIn(item, trigger)
-        matrix = text.split('      matrix:',1)[1].split('    env:',1)[0]
-        self.assertIn("inputs.scope == 'remaining-faults'", matrix)
-        arrays = [json.loads(value) for value in re.findall(r"'(\[.*?\])'", matrix)]
-        self.assertEqual(len(arrays),2)
-        selected, default = arrays
+        from verify_hosted_selection import plan
+        matrix = text.split('      matrix:\n',1)[1].split('    env:',1)[0]
+        self.assertIn('fromJSON(needs.selection.outputs.matrix)', matrix)
+        self.assertIn('needs: selection', text)
+        selected, default = plan('remaining-faults','all'), plan('all','all')
         self.assertEqual(default, [{'suite':s,'case':'all'} for s in ('core-resources','capacity','faults')])
         self.assertEqual(selected, [
             {'suite':'native','case':'restic-native-exit3'},
@@ -78,10 +128,10 @@ class WorkflowContract(unittest.TestCase):
             {'suite':'native','case':'file-truncate-during-native-read'},
             {'suite':'storage','case':'restore-missing-extension-binary-prerequisites'}])
         self.assertEqual(len({entry['case'] for entry in selected}),7)
-        self.assertNotIn('needs:',text)
+        self.assertLess(text.index('name: Validate manual scope and case'), text.index('name: Install pinned rootful Engine'))
         self.assertNotIn('continue-on-error',text)
         self.assertIn('fail-fast: false',text)
-        self.assertIn('ACCEPTANCE_SCOPE: ${{ inputs.scope || \'all\' }}',text)
+        self.assertIn('ACCEPTANCE_SCOPE: ${{ inputs.scope }}',text)
         self.assertIn('ACCEPTANCE_CASE: ${{ matrix.case }}',text)
         self.assertIn("'scope':os.environ['ACCEPTANCE_SCOPE']",text)
         self.assertIn("'case':os.environ['ACCEPTANCE_CASE']",text)
@@ -94,10 +144,10 @@ class WorkflowContract(unittest.TestCase):
         marker = '      - name: Independent remaining fault gate on fresh VM'
         self.assertIn(marker, text, 'independent case runner step is missing')
         block = text.split(marker,1)[1].split('      - name:',1)[0]
-        self.assertIn("if: inputs.scope == 'remaining-faults'", block)
+        self.assertIn("if: inputs.scope == 'remaining-faults' || inputs.scope == 'single-fault'", block)
         script = textwrap.dedent(block.split('        run: |\n',1)[1])
-        matrix = text.split('      matrix:',1)[1].split('    env:',1)[0]
-        entries = json.loads(re.findall(r"'(\[.*?\])'", matrix)[0])
+        from verify_hosted_selection import plan
+        entries = plan('remaining-faults','all') + plan('single-fault','restore-reader-failure-importer-zero')
         for entry in entries:
             for runner_exit, verifier_exit in ((0,0),(7,0),(0,8)):
                 with self.subTest(entry=entry, runner_exit=runner_exit, verifier_exit=verifier_exit), tempfile.TemporaryDirectory() as directory:
@@ -123,13 +173,13 @@ class WorkflowContract(unittest.TestCase):
                     env = {**os.environ, 'PATH':str(tools)+os.pathsep+os.environ['PATH'],
                            'RUNNER_TEMP':str(root), 'ENGINE_SOCKET':'/unit-no-engine.sock',
                            'ACCEPTANCE_SUITE':entry['suite'], 'ACCEPTANCE_CASE':entry['case'],
-                           'ACCEPTANCE_SCOPE':'remaining-faults','CALL_LOG':str(log),
+                           'ACCEPTANCE_SCOPE':'single-fault' if entry['suite']=='reader' else 'remaining-faults','CALL_LOG':str(log),
                            'RUNNER_EXIT':str(runner_exit),'VERIFIER_EXIT':str(verifier_exit)}
                     cp = subprocess.run(['bash','-eu','-c',script], cwd=ROOT, env=env, capture_output=True, text=True)
                     self.assertEqual(cp.returncode, runner_exit or verifier_exit, cp.stderr)
                     calls = [json.loads(line) for line in log.read_text().splitlines()]
                     self.assertEqual(len(calls), 1 if runner_exit else 2)
-                    runner = 'run_hosted_faults.py' if entry['suite']=='native' else 'run_hosted_storage_prereqs.py'
+                    runner = 'run_hosted_faults.py' if entry['suite'] in ('native','reader') else 'run_hosted_storage_prereqs.py'
                     self.assertEqual(Path(calls[0]['args'][0]).name, runner)
                     for call in calls:
                         self.assertEqual(call['cpus'],[0,1])
@@ -152,25 +202,28 @@ class WorkflowContract(unittest.TestCase):
         text = (ROOT/'.github/workflows/acceptance.yaml').read_text()
         block = text.split('      - name: Export only allowlisted evidence even on failure',1)[1].split('      - uses:',1)[0]
         script = textwrap.dedent(block.split('        run: |\n',1)[1])
-        for suite, runtime, case in (('native','bakabel-faults','restic-native-exit3'),
-                                     ('storage','bakabel-storage','temp-pack-ENOSPC')):
-            with self.subTest(suite=suite), tempfile.TemporaryDirectory() as directory:
+        from verify_hosted_selection import plan
+        entries = plan('remaining-faults','all') + plan('single-fault','restore-reader-failure-importer-zero')
+        for entry in entries:
+            suite, case = entry['suite'], entry['case']
+            runtime = 'bakabel-storage' if suite == 'storage' else 'bakabel-faults'
+            with self.subTest(suite=suite,case=case), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory); tools = root/'tools'; tools.mkdir()
                 sudo = tools/'sudo'
-                sudo.write_text('#!/bin/sh\ncase "$1" in --preserve-env=*) shift;; esac\nif [ "$1" = chown ]; then exit 0; fi\nexec "$@"\n'); sudo.chmod(0o700)
+                export_sudo_shim(sudo)
                 receipt = root/runtime/case/'receipt.json'; receipt.parent.mkdir(parents=True)
                 receipt.write_text(json.dumps({'offline_unit_fixture':True,'case':case}))
-                verdict = {'scope':'remaining-faults','suite':suite,'case':case,
+                verdict = {'scope':'single-fault' if suite == 'reader' else 'remaining-faults','suite':suite,'case':case,
                            'selected_case_pass':True,'full_plan_acceptance_pass':False}
                 (root/runtime/'selected-verified.json').write_text(json.dumps(verdict))
                 private = root/runtime/'private/receipt.json'; private.parent.mkdir()
                 private.write_text('PRIVATE-CANARY')
                 (root/runtime/'selected-verified-private.log').write_text('PRIVATE-CANARY')
                 cp = subprocess.run(['bash','-eu','-c',script],cwd=ROOT,capture_output=True,text=True,
-                    env={**os.environ,'RUNNER_TEMP':str(root),'PATH':str(tools)+os.pathsep+os.environ['PATH']})
+                    env={**os.environ,'ACCEPTANCE_SUITE':suite,'RUNNER_TEMP':str(root),'PATH':str(tools)+os.pathsep+os.environ['PATH']})
                 self.assertEqual(cp.returncode,0,cp.stderr)
                 public = root/'bakabel-public'
-                expected = ('faults-' if suite=='native' else 'storage-')+case+'.json'
+                expected = ('storage-' if suite=='storage' else 'faults-')+case+'.json'
                 self.assertEqual({p.name for p in public.iterdir()}, {expected,suite+'-selected-verified.json'})
                 self.assertEqual(json.loads((public/(suite+'-selected-verified.json')).read_text()),verdict)
                 self.assertNotIn('PRIVATE-CANARY',''.join(p.read_text() for p in public.iterdir()))
@@ -181,7 +234,8 @@ class WorkflowContract(unittest.TestCase):
         text = (ROOT/'.github/workflows/acceptance.yaml').read_text()
         block = text.split('      - name: Offline fixture and documentation tests',1)[1].split('      - name:',1)[0]
         script = textwrap.dedent(block.split('        run: |\n',1)[1])
-        for scope, pattern in (('all','test_*.py'),('remaining-faults','test_hosted_selection.py')):
+        for scope, pattern in (('all','test_*.py'),('remaining-faults','test_hosted_selection.py'),
+                               ('single-fault','test_hosted_selection.py')):
             with self.subTest(scope=scope), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory); python = root/'python3'; log = root/'calls'
                 python.write_text('#!'+sys.executable+'\nimport json,os,sys\nwith open(os.environ["CALL_LOG"],"a") as out: out.write(json.dumps(sys.argv[1:])+"\\n")\n')
@@ -196,7 +250,8 @@ class WorkflowContract(unittest.TestCase):
 
     def test_capacity_and_faults_run_on_independent_fresh_vms(self):
         text=(ROOT/'.github/workflows/acceptance.yaml').read_text()
-        self.assertIn('[{"suite":"core-resources","case":"all"},{"suite":"capacity","case":"all"},{"suite":"faults","case":"all"}]',text)
+        from verify_hosted_selection import plan
+        self.assertEqual([e['suite'] for e in plan('all','all')], ['core-resources','capacity','faults'])
         from verify_hosted_faults import CASES
         self.assertIn('restore-reader-failure-importer-zero', CASES)
         self.assertIn('fail-fast: false',text)
