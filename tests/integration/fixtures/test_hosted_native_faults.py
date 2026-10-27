@@ -322,26 +322,19 @@ class RunnerBoundaryTests(unittest.TestCase):
         from pathlib import Path
         from types import SimpleNamespace
         from unittest.mock import Mock
+        from test_owned_file_source_volumes import probe_at
         m=self.module()
         with tempfile.TemporaryDirectory() as directory:
-            root=Path(directory);mount=root/'native-volume';mount.mkdir()
-            p=m.NativeFaultProbe.__new__(m.NativeFaultProbe);p.root=root;p.prefix='unit-owned';p.case=F16
-            p.daemon='unit-daemon';p.image='sha256:'+'b'*64;p.volumes=[];p.result={}
-            p.config=Mock();p.restic=Mock();p.create=Mock(return_value='c'*64);p.gate=Mock()
-            p.e=Mock();p.e.call.return_value={'Name':'unit-owned-files','Driver':'local','Scope':'local',
-                'Options':{},'Labels':{'probe.bakabel.owner':'unit-owned'},'Mountpoint':str(mount)}
-            p.e.inspect.return_value={'Id':'c'*64,'State':{'StartedAt':'unit-start','Running':True},'RestartCount':0}
-            p.call_cli=Mock(return_value={'targets':[{'ID':'unit/logical/files','Kind':'volume','Source':
-                {'DaemonID':'unit-daemon','ContainerID':'c'*64,'StartedAt':'unit-start'}}]})
+            p, raw=probe_at(Path(directory)); p.gate=Mock()
             p.prepare_native()
-            self.assertEqual(p.target,'unit/logical/files')
+            self.assertEqual(p.target,'offline/files')
             self.assertEqual(p.payload.stat().st_size,16777216)
             p.gate.mark.assert_called_once_with(p.payload,0x20000)
-            spec=p.create.call_args.args[1]
+            spec=next(body for method,path,body in raw.calls if method=='POST' and path.startswith('/containers/create'))
             self.assertEqual(spec['Image'],m.PG)
             self.assertEqual(spec['Cmd'],['exec sleep 600'])
-            self.assertEqual(spec['HostConfig']['Mounts'][0]['Source'],'unit-owned-files')
-            self.assertEqual(p.source_before,{'container_id':'c'*64,'started_at':'unit-start','restart_count':0})
+            self.assertEqual(spec['HostConfig']['Mounts'][0]['Source'],p.prefix+'-files')
+            self.assertEqual(p.source_before,{'container_id':p.source,'started_at':'offline-start','restart_count':0})
 
     def test_finish_preserves_real_public_target_fields_and_classifies_from_repository(self):
         from unittest.mock import Mock

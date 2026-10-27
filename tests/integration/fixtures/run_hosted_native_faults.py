@@ -75,10 +75,7 @@ class NativeFaultProbe(FaultProbe):
         with os.fdopen(fd,'wb') as out:
             for _ in range(16):out.write(os.urandom(1048576))
             out.flush();os.fsync(out.fileno())
-        self.source=self.create('files',{'Image':PG,'Entrypoint':['sh','-c'],'Cmd':['exec sleep 600'],
-            'Labels':{'com.docker.compose.project':self.prefix,'com.docker.compose.service':'files',
-                      'bakabel.type':'volume','bakabel.paths':'/data'},
-            'HostConfig':{'Mounts':[{'Type':'volume','Source':name,'Target':'/data','ReadOnly':False}]}},role='source-files')
+        self.source=self.create_file_source(name,600)
         obj=self.e.inspect(self.source)
         self.source_before={'container_id':obj['Id'],'started_at':obj['State']['StartedAt'],'restart_count':obj['RestartCount']}
         plan=self.call_cli('plan')

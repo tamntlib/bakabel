@@ -227,7 +227,9 @@ class SpaceProbeTests(unittest.TestCase):
             obj={'Id':'c'*64,'State':{'Running':True,'StartedAt':'unit'},'RestartCount':0}
             p.e=Mock(); p.e.inspect.return_value=obj; p.e.call.return_value={'Name':'cycle2-owned-files'}
             p.e.exec.side_effect=lambda cid,argv:{'exit':0,'stdout':'1'*64+'  /data/payload\n'} if argv[0]=='sha256sum' else {'exit':0}
-            p.volumes=[]; p.create=lambda *args,**kwargs:'d'*64
+            # This test isolates output/empty-target behavior; the separate
+            # Engine composition regression exercises the real mount helper.
+            p.volumes=[]; p.create_file_source=lambda *args,**kwargs:'d'*64
             p.call_cli=lambda *args:{'targets':[{'ID':'unit/files','Kind':'volume'}]}
             p.plan_projection=lambda target:{'ID':target['ID']}; p.success_snapshot=lambda:'f'*64
             p.snapshot_mapping=lambda snapshot:None; p.mount_output=lambda:None

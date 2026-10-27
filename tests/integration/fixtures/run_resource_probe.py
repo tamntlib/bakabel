@@ -136,7 +136,7 @@ class Probe:
         self.result['gates'].append({'name':name,'time':utc(),**kw}); print('PASS '+name,flush=True); self.save()
     def save(self):
         (self.root/'receipt.json').write_text(json.dumps(self.result,indent=2))
-    def create(self, suffix, spec, role=None, start=True):
+    def create(self, suffix, spec, role=None, start=True, *, record_image_volumes=True):
         name=self.prefix+'-'+suffix
         spec.setdefault('Labels',{})['probe.bakabel.owner']=self.prefix
         h=spec.setdefault('HostConfig',{});h.setdefault('NanoCpus',2000000000);h.setdefault('NetworkMode','none');h.setdefault('RestartPolicy',{'Name':'no'});h.setdefault('AutoRemove',False)
@@ -147,10 +147,11 @@ class Probe:
         if start:
             self.e.call('POST','/containers/'+cid+'/start')
             self.pin_container(cid)
-        # Record inherited anonymous image volumes as exact owned resources too.
+        # Legacy probes record inherited image volumes. Strict fault fixtures
+        # opt out and verify their explicit mounts before starting the container.
         obj=self.e.inspect(cid)
         for m in obj['Mounts']:
-            if m['Type']=='volume' and m['Name'] not in self.volumes:self.volumes.append(m['Name'])
+            if record_image_volumes and m['Type']=='volume' and m['Name'] not in self.volumes:self.volumes.append(m['Name'])
         return cid
     def bind(self, src, dst, ro=False): return {'Type':'bind','Source':str(src),'Target':dst,'ReadOnly':ro}
     def pin_container(self,cid):

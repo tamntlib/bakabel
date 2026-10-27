@@ -28,6 +28,8 @@ from run_hosted_capacity import CapacityEngine
 
 # Reviewed completion-protocol candidate; never infer admission from CLI input.
 FROZEN_SOURCE = 'c143839dbdf75e409e927d087575c4ebd6201eb521594ed5dced7d6a8bb18293'
+PG_FIXTURE_PIN = 'postgres:18.6-alpine3.24@sha256:83148c0bc09eac4d598b70a61e1404d0212b76c95c504bfd6c81a4c59ec91792'
+PG_FIXTURE_VOLUMES = {'/var/lib/postgresql': {}}
 
 
 def relay_path(root, case):
@@ -49,6 +51,53 @@ def socket_binding_proof(mounts, source):
 
 
 class FaultProbe(ComposeProbe):
+    def create_file_source(self, volume, sleep_seconds):
+        # The pinned PG image is also our sleep/file fixture. Container labels
+        # do NOT label image-inherited volumes; create the declared mount first.
+        intent = ('file-source-mounts', self.prefix+'-files')
+        self.unresolved_creates.add(intent)
+        image = self.e.call('GET', '/images/'+quote(PG, safe='')+'/json')
+        pinned = self.e.call('GET', '/images/'+quote(PG_FIXTURE_PIN, safe='')+'/json')
+        if (image.get('Id') != pinned.get('Id') or not isinstance(image.get('Id'), str) or
+                re.fullmatch(r'sha256:[a-f0-9]{64}', image['Id']) is None or
+                image.get('Config', {}).get('Volumes') != PG_FIXTURE_VOLUMES or
+                pinned.get('Config', {}).get('Volumes') != PG_FIXTURE_VOLUMES):
+            raise ValueError('pinned file fixture image volumes changed')
+        name = self.prefix+'-files-image-data'
+        created = self.e.call('POST', '/volumes/create', {'Name': name, 'Driver': 'local', 'DriverOpts': {},
+            'Labels': {'probe.bakabel.owner': self.prefix}})
+        if ('Options' not in created or not (created['Options'] is None or
+                (type(created['Options']) is dict and not created['Options']))):
+            raise ValueError('exact owned file fixture image volume unavailable')
+        obj = self.e.call('GET', '/volumes/'+quote(name, safe=''))
+        if (obj.get('Name') != name or obj.get('Driver') != 'local' or obj.get('Scope') != 'local' or
+                'Options' not in obj or not (obj['Options'] is None or
+                    (type(obj['Options']) is dict and not obj['Options'])) or
+                (obj.get('Labels') or {}).get('probe.bakabel.owner') != self.prefix):
+            raise ValueError('exact owned file fixture image volume unavailable')
+        expected = {('/data', volume), ('/var/lib/postgresql', name)}
+        self.strict_file_source_volumes = getattr(self, 'strict_file_source_volumes', set())
+        self.strict_file_source_volumes.add(name)
+        cid = self.create('files', {'Image': PG, 'Entrypoint': ['sh', '-c'], 'Cmd': ['exec sleep '+str(sleep_seconds)],
+            'Labels': {'com.docker.compose.project': self.prefix, 'com.docker.compose.service': 'files',
+                       'bakabel.type': 'volume', 'bakabel.paths': '/data'},
+            'HostConfig': {'Mounts': [{'Type': 'volume', 'Source': source, 'Target': target, 'ReadOnly': False}
+                                    for target, source in sorted(expected)]}},
+            role='source-files', start=False, record_image_volumes=False)
+        obj = self.e.inspect(cid)
+        mounts = obj.get('Mounts')
+        if (obj.get('Image') != image['Id'] or not isinstance(mounts, list) or len(mounts) != len(expected) or
+                any(not isinstance(m, dict) or m.get('Type') != 'volume' or m.get('RW') is not True or
+                    (m.get('Destination'), m.get('Name')) not in expected for m in mounts) or
+                {(m['Destination'], m['Name']) for m in mounts} != expected):
+            # Do not adopt unexpected volumes, nor let v=true delete them as an
+            # implicit side effect. Ambiguous mounts retain the ENTIRE plan.
+            raise ValueError('file fixture mount identity mismatch')
+        self.unresolved_creates.remove(intent)
+        self.e.call('POST', '/containers/'+cid+'/start')
+        self.pin_container(cid)
+        return cid
+
     def __init__(self, args, case):
         # No source/private volume reads and no Engine writes in construction.
         self.args = args; self.case = case; self.root = args.runtime
@@ -844,10 +893,41 @@ class FaultProbe(ComposeProbe):
             elif obj.get('Id') != cid or obj.get('Name') != '/'+name or (obj.get('Config',{}).get('Labels') or {}).get('probe.bakabel.owner') != self.prefix:
                 raise ValueError('cleanup fixture identity mismatch')
         for name in dict.fromkeys(self.volumes):
-            obj = self.e.call('GET','/volumes/'+quote(name,safe=''),missing=True)
-            if obj is not None and (obj.get('Name') != name or
+            # One bounded mismatch projection, never an inspect/error dump.
+            # Unknown readbacks remain null, not a fabricated failed predicate.
+            check = {'volume': name if isinstance(name, str) and
+                     re.fullmatch(r'(?:bakabel-fault-[a-f0-9]{12}-[a-z0-9][a-z0-9_.-]{0,63}|[a-f0-9]{64})', name) else None,
+                     'observation': 'unavailable', 'name_matches': None, 'owner_matches': None,
+                     'driver_local': None, 'options_empty': None, 'before_delete': True}
+            try:
+                obj = self.e.call('GET','/volumes/'+quote(name,safe=''),missing=True)
+            except Exception:
+                self.result.setdefault('cleanup', {})['volume_identity_mismatch'] = check
+                raise
+            if obj is None: continue
+            if isinstance(obj, dict):
+                check.update(observation='observed',
+                    name_matches=obj['Name'] == name if isinstance(obj.get('Name'), str) else None,
+                    owner_matches=(obj['Labels'].get('probe.bakabel.owner') == self.prefix
+                                   if isinstance(obj.get('Labels'), dict) else False if 'Labels' in obj and obj['Labels'] is None else None),
+                    driver_local=obj['Driver'] == 'local' if isinstance(obj.get('Driver'), str) else None,
+                    options_empty=(obj['Options'] is None or obj['Options'] == {}) if 'Options' in obj else None)
+            else: check['observation'] = 'malformed'
+            # Preserve the existing owner/Name/local/Options deletion guard;
+            # malformed/unavailable identity also refuses, never grants authority.
+            try:
+                mismatch = (obj.get('Name') != name or
                     (obj.get('Labels') or {}).get('probe.bakabel.owner') != self.prefix or
-                    obj.get('Driver') != 'local' or obj.get('Options')):
+                    obj.get('Driver') != 'local' or obj.get('Options'))
+            except (AttributeError, TypeError): mismatch = True
+            if name in getattr(self, 'strict_file_source_volumes', set()):
+                options_known_empty = (isinstance(obj, dict) and 'Options' in obj and
+                    (obj['Options'] is None or (type(obj['Options']) is dict and not obj['Options'])))
+                if isinstance(obj, dict) and 'Options' in obj:
+                    check['options_empty'] = options_known_empty
+                mismatch = mismatch or not options_known_empty
+            if mismatch:
+                self.result.setdefault('cleanup', {})['volume_identity_mismatch'] = check
                 raise ValueError('cleanup volume identity mismatch')
         absent = {}
         # Source removal is post-gate fixture teardown, NEVER cancellation proof

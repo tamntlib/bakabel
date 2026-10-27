@@ -327,9 +327,7 @@ class StorageProbe(FaultProbe):
         created=self.e.call('POST','/volumes/create',{'Name':volume,'Labels':{'probe.bakabel.owner':self.prefix}})
         if created.get('Name') != volume: raise ValueError('owned file volume identity missing')
         self.volumes.append(volume)
-        files=self.create('files',{'Image':PG,'Entrypoint':['sh','-c'],'Cmd':['exec sleep 900'],
-            'Labels':{'com.docker.compose.project':self.prefix,'com.docker.compose.service':'files','bakabel.type':'volume','bakabel.paths':'/data'},
-            'HostConfig':{'Mounts':[{'Type':'volume','Source':volume,'Target':'/data','ReadOnly':False}]}},role='source-files')
+        files=self.create_file_source(volume,900)
         seed=self.e.exec(files,['sh','-c','dd if=/dev/urandom of=/data/payload bs=1048576 count=32 2>/dev/null && chmod 640 /data/payload'])
         if seed['exit'] != 0: raise ValueError('bounded file corpus seed failed')
         digest=self.e.exec(files,['sha256sum','/data/payload'])
