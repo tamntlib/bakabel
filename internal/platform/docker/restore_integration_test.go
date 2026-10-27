@@ -76,8 +76,10 @@ func TestRestoreRealExactPIDStartAndKillEscalation(t *testing.T) {
 	}
 	reader, writer := io.Pipe()
 	defer writer.Close()
+	streamCtx, streamCancel := context.WithCancel(ctx)
+	defer streamCancel()
 	finished := make(chan error, 1)
-	go func() { _, e := c.StreamRestoreExec(ctx, d, reader); finished <- e }()
+	go func() { _, e := c.StreamRestoreExec(streamCtx, d, reader); finished <- e }()
 	var processes []dumpProcess
 	for {
 		state, e := c.PollExec(ctx, d.ExecID)
@@ -121,6 +123,9 @@ func TestRestoreRealExactPIDStartAndKillEscalation(t *testing.T) {
 	if e != nil || proof.ExecExitCode == nil || *proof.ExecExitCode != 137 || !proof.NoProcesses || !proof.NoSessions {
 		t.Fatal("real KILL escalation", proof, e)
 	}
+	// Only after independent remote proof, abort this caller's local stream.
+	// This ordering preserves the native KILL oracle, not a universal API order.
+	streamCancel()
 	select {
 	case e := <-finished:
 		if e == nil {
@@ -128,6 +133,9 @@ func TestRestoreRealExactPIDStartAndKillEscalation(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("stream did not join", ctx.Err())
+	}
+	if ctx.Err() != nil {
+		t.Fatal("outer deadline expired at stream join", ctx.Err())
 	}
 	final, e := c.InspectContainer(ctx, target.ContainerID)
 	if e != nil || !final.State.Running || final.State.StartedAt != target.StartedAt || final.RestartCount != 0 {

@@ -107,6 +107,11 @@ func (c *Client) VerifyUnstartedRestoreExec(ctx context.Context, d RestoreExec) 
 // checkpoint, NEVER the former source DB or scheduler memory. Signal only an
 // exact run-token/executable/PID-start identity. Failure means keep ownership
 // quarantined. It never kills a container or drops the partial destination.
+// Remote terminal proof does not close or join a caller's local producer or
+// stream. The caller owns stopping and joining them; canceling a dedicated stream
+// context aborts both input and transport (input Close must unblock Read).
+// Local abort is not remote terminal proof. No universal ordering is required:
+// failure unwind may abort locally before independently proving remote death.
 func (c *Client) CancelRestoreExec(ctx context.Context, d RestoreExec) (TerminalProof, error) {
 	var proof TerminalProof
 	if _, e := restoreArgs(d); e != nil {

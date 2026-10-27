@@ -28,7 +28,7 @@ from run_hosted_acceptance import require_hosted_daemon, failure_location
 from run_hosted_capacity import CapacityEngine
 
 # Reviewed completion-protocol candidate; never infer admission from CLI input.
-FROZEN_SOURCE = 'c143839dbdf75e409e927d087575c4ebd6201eb521594ed5dced7d6a8bb18293'
+FROZEN_SOURCE = '0873e40c576383bbe3a19fa698c7706e010918918edae18496a24e3bd96bf6e5'
 PG_FIXTURE_PIN = 'postgres:18.6-alpine3.24@sha256:83148c0bc09eac4d598b70a61e1404d0212b76c95c504bfd6c81a4c59ec91792'
 PG_FIXTURE_VOLUMES = {'/var/lib/postgresql': {}}
 
@@ -1000,6 +1000,7 @@ class FrameCounter:
         self.stderr_observer = stderr_observer
         self.stdout_observer = stdout_observer
         self.stderr = 0
+        self.native_framing_valid = True  # Additional native-only restrictions; original parser unchanged.
 
     def feed(self, data):
         view = memoryview(data)
@@ -1009,9 +1010,12 @@ class FrameCounter:
                 self.header.extend(view[:n]); view = view[n:]
                 if len(self.header) < 8: break
                 if self.header[0] not in (0, 1, 2) or self.header[1:4] != b'\0\0\0':
+                    self.native_framing_valid = False
                     raise ValueError('not a Docker multiplex stream')
                 self.stream = self.header[0]
                 self.left = int.from_bytes(self.header[4:8], 'big'); self.header.clear()
+                if self.stream not in (1,2) or not 0 < self.left <= 65536:
+                    self.native_framing_valid = False
                 if not self.left: continue
             n = min(self.left, len(view)); self.left -= n
             if self.stream == 2:
@@ -1061,8 +1065,9 @@ def is_dump_wrapper(value):
 class FaultRelay:
     """Byte-preserving, bounded Unix transport. Never generates HTTP replies.
 
-    Ephemeral request parsing is classification only; bodies/Env/argv/stream
-    content are never recorded. Not related to cli_relay's nested CPU rewrite.
+    Request parsing is classification only unless an explicit private validator
+    is opted in. Bodies/Env/argv/stream content are never recorded. Not related
+    to cli_relay's nested CPU rewrite.
     """
     def __init__(self, path, target):
         self.path = Path(path)
@@ -1080,6 +1085,11 @@ class FaultRelay:
         self.hit = threading.Event()
         self.denied_start = None
         self.dump_bindings = {}
+        self.restore_validator = None  # F22-only transient request contract.
+        self.restore_pending = {}
+        self.restore_bindings = {}
+        self.restore_tokens = set()
+        self.restore_starts = set()
         self.hold = None
         self.closed = False
         self.observer = None
@@ -1160,6 +1170,42 @@ class FaultRelay:
         with self.lock:
             self.denied_exec = None
             self.rule = None
+
+    def validate_restore_request(self,record,body):
+        if self.restore_validator is None or record['boundary'] not in ('restore-create','restore-start'): return
+        def unique(pairs):
+            value={}
+            for key,item in pairs:
+                if key in value: raise ValueError('duplicate private request field')
+                value[key]=item
+            return value
+        spec=json.loads(body,object_pairs_hook=unique)
+        if record['boundary'] == 'restore-create':
+            receipt=self.restore_validator('create',record,spec,None)
+            token=receipt['import_run_id']
+            with self.lock:
+                if token in self.restore_tokens or id(record) in self.restore_pending:
+                    raise ValueError('replayed restore create')
+                self.restore_tokens.add(token)
+                self.restore_pending[id(record)]=copy.deepcopy(receipt)
+        else:
+            eid=record['exec_id']
+            with self.lock:
+                if eid not in self.restore_bindings or eid in self.restore_starts: raise ValueError('unbound or replayed restore start')
+                binding=copy.deepcopy(self.restore_bindings[eid])
+                self.restore_starts.add(eid) # Failed admission cannot be retried.
+            if json.dumps(spec,sort_keys=True) != json.dumps({'Detach':False,'Tty':False},sort_keys=True):
+                raise ValueError('nonproduction restore start')
+            record['restore_start']=self.restore_validator('start',record,spec,binding)
+
+    def bind_restore_response(self,record,eid):
+        with self.lock:
+            if eid in self.restore_bindings or eid in self.execs: raise ValueError('duplicate real create identity')
+            receipt=self.restore_pending.pop(id(record),None)
+            if receipt is None or re.fullmatch('[a-f0-9]{64}',eid or '') is None: raise ValueError('unvalidated restore create response')
+            receipt['exec_id']=eid
+            self.restore_bindings[eid]=copy.deepcopy(receipt)
+            record['restore_create']=receipt
 
     def classify(self, method, path, body):
         url = urlsplit(path)
@@ -1375,6 +1421,26 @@ class FaultRelay:
             if diagnostic is not None:
                 # Classifier callbacks may block; never lend them the close lock.
                 value = diagnostic.finish()
+                if getattr(diagnostic,'observe_import_message',False):
+                    # Finite observed native message != complete diagnostic
+                    # stream. Preserve this evidence before the fail-closed
+                    # transport projection below. F22 consumes it only together
+                    # with private create/start provenance and terminal proof.
+                    observation = {'cause':value['cause'],
+                        'message_complete':value['complete'] is True and value['cause'] == 'hstore_binary_load_missing',
+                        'observed_error_count':value['error_count'],
+                        'transport_complete':reason == 'upstream_eof'}
+                    with self.lock: record['import_observation'] = observation
+                    template = getattr(diagnostic,'native_template',None)
+                    framing_consumed = not observed.header and not observed.left
+                    native = {'schema':1,'template':template,'observed_bytes':observed.stderr,
+                        'observed_error_count':value['error_count'],
+                        'framing_valid':observed.native_framing_valid,'framing_consumed':framing_consumed,
+                        'reset_candidate':bool(template and observed.native_framing_valid and framing_consumed and
+                            reason == 'recv_back_reset' and capture['output_stop'] is None and
+                            capture['input_stop'] in (None,'client_eof','send_back_broken_pipe') and
+                            observed.stdout == 0 and not rule and not self.closed)}
+                    with self.lock: record['native_fatal_observation'] = native
                 if reason != 'upstream_eof':
                     value.update(cause='unclassified',complete=False)
                 if reason != 'upstream_eof' and 'completion_marker_seen' in value:
@@ -1417,6 +1483,7 @@ class FaultRelay:
                     rule = self.rule; self.rule = None
                     if rule['action'] == 'hold-before-forward': self.denied_start = record['exec_id']
             if self.observer: self.observer('request',record)
+            self.validate_restore_request(record,body)
             if rule and rule['action'] == 'hold-before-forward':
                 # Never connect, send, or synthesize a reply on this path. A
                 # retry is denied from the instant the exact hold is installed.
@@ -1464,6 +1531,8 @@ class FaultRelay:
                     if record['boundary'] == 'worker-create':
                         record['container_id'] = identity; self.workers.add(identity)
                     else:
+                        if self.restore_validator and record['boundary'] == 'restore-create':
+                            self.bind_restore_response(record,identity)
                         record['exec_id'] = identity
                         self.execs[identity] = {'kind': record['boundary'].removesuffix('-create'), 'container_id': record['container_id'], 'stdout_bytes': 0, 'stdin_bytes': 0}
                         spec = json.loads(body)

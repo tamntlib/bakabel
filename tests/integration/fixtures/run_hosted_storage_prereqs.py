@@ -23,7 +23,7 @@ from run_hosted_acceptance import require_hosted_daemon, failure_location
 from run_resource_probe import Engine, PG, utc
 from run_resource_failures import OwnedSpaceProbe
 from verify_hosted_faults import verify_nonforce_remove
-from verify_hosted_storage_prereqs import CASES, F19, F20, F22, verify_case, verify_report, restore_contract
+from verify_hosted_storage_prereqs import CASES, F19, F20, F22, verify_case, verify_report, restore_contract, same_json, verify_f22_first_failure
 
 PG_PIN='postgres:18.6-alpine3.24@sha256:83148c0bc09eac4d598b70a61e1404d0212b76c95c504bfd6c81a4c59ec91792'
 _FAILURE_KINDS=('AssertionError','ValueError','RuntimeError','OSError','FileNotFoundError','PermissionError','TimeoutError','ConnectionError','JSONDecodeError')
@@ -145,14 +145,32 @@ class ExportDiagnostic:
 
 class MissingLibraryDiagnostic:
     """Transient bounded stderr classifier; no raw line survives finish()."""
+    observe_import_message=True
     ERROR=b'pg_restore: error: could not execute query: ERROR:  could not access file "$libdir/hstore": No such file or directory'
     COMMAND=b'Command was: CREATE EXTENSION IF NOT EXISTS hstore WITH SCHEMA public;'
+    # Exact finite block observed on the pinned PG18 image. Its server error
+    # uses "hstore" (not "$libdir/hstore") and includes multi-line SQL CONTEXT.
+    # Keep the old two-line contract separate; do not skip arbitrary context.
+    NATIVE=(b'pg_restore: error: could not execute query: ERROR:  could not access file "hstore": No such file or directory\n'
+            b'CONTEXT:  SQL statement "CREATE FUNCTION hstore_in(cstring)\n'
+            b'RETURNS hstore\n'
+            b"AS '$libdir/hstore'\n"
+            b'LANGUAGE C STRICT IMMUTABLE PARALLEL SAFE"\n'
+            b'extension script file "hstore--1.4.sql", near line 8\n'
+            b'Command was: CREATE EXTENSION IF NOT EXISTS hstore WITH SCHEMA public;\n\n\n')
+    # The production pgEnv fixes PGPASSFILE=/dev/null. libpq's exact warning
+    # precedes the native error even on trust auth; do not accept arbitrary text.
+    NATIVE_WARNING=b'WARNING: password file "/dev/null" is not a plain file\n'+NATIVE
 
     def __init__(self):
         self.buffer=bytearray(); self.total=0; self.errors=0
         self.load=False; self.command=False; self.previous_load=False; self.bounded=True
+        self.native_offset=0; self.native_exact=True; self.native_warning_exact=True
 
     def feed(self,data):
+        self.native_exact &= self.NATIVE[self.native_offset:self.native_offset+len(data)] == data
+        self.native_warning_exact &= self.NATIVE_WARNING[self.native_offset:self.native_offset+len(data)] == data
+        self.native_offset+=len(data)
         self.total+=len(data)
         if self.total>16384:
             self.bounded=False; self.buffer.clear(); return
@@ -171,8 +189,13 @@ class MissingLibraryDiagnostic:
 
     def finish(self):
         complete=self.bounded and not self.buffer
+        native=((self.native_exact and self.native_offset == len(self.NATIVE)) or
+                (self.native_warning_exact and self.native_offset == len(self.NATIVE_WARNING)))
+        self.native_template=('pg18-hstore-devnull-429-v1' if self.native_warning_exact and
+            self.native_offset == len(self.NATIVE_WARNING) else 'pg18-hstore-374-v1' if
+            self.native_exact and self.native_offset == len(self.NATIVE) else None)
         self.buffer.clear()
-        return {'cause':'hstore_binary_load_missing' if complete and self.load and self.command and self.errors == 1 else 'unclassified',
+        return {'cause':'hstore_binary_load_missing' if complete and (native or (self.load and self.command)) and self.errors == 1 else 'unclassified',
                 'complete':complete,'error_count':self.errors}
 
 
@@ -184,6 +207,7 @@ class StorageProbe(FaultProbe):
         self.result['attempts']=[]
         self.relay.stderr_classifier_factory=self.import_stderr_classifier
         self.relay.observe_streams=case in (F19,F22)
+        if case == F22: self.relay.restore_validator=self.restore_validator
 
     def run(self):
         if self.case == F19:
@@ -281,7 +305,10 @@ class StorageProbe(FaultProbe):
         if self.case != F20:
             active=self.operations.get(run)
             if active is None: raise ValueError('exact execution checkpoint missing')
+            native_tracking=(self.case == F22 and getattr(getattr(self,'relay',None),'restore_validator',None) == self.restore_validator)
+            if native_tracking: self.relay.wait_capture(active['execID'],self.attempt_deadline)
             terminal=self.terminal_proof(active)
+            if native_tracking: self.finish_native_capture(active,terminal)
             record.update(execution_owner=active,terminal_before_remove=terminal)
         else:
             self.operations[run]=copy.deepcopy(a)
@@ -297,6 +324,7 @@ class StorageProbe(FaultProbe):
 
     def finish_attempt(self,controller,expect=1):
         deadline=time.monotonic()+85
+        self.attempt_deadline=deadline
         rows=self.finish(controller,expect=expect,timeout=85)
         if len(rows) != 1: raise ValueError('one public workflow result required')
         result=rows[0]; run=result['runID']; active=self.operations.get(run)
@@ -431,6 +459,173 @@ class StorageProbe(FaultProbe):
         if response['exit'] != 0 or match is None: raise ValueError('pinned upstream extension library unavailable')
         return match[1]
 
+    def startpg(self,suffix,marked):
+        if self.case == F22 and suffix == 'extension-target' and not marked: return self.start_extension_target()
+        return super().startpg(suffix,marked)
+
+    def start_extension_target(self):
+        # F22's unmarked target needs no startup-gate bind mount. Native image
+        # entrypoint and a pre-start cpuset retain the same two-CPU boundary.
+        volume=self.prefix+'-extension-target-data'
+        created=self.e.call('POST','/volumes/create',{'Name':volume,'Labels':{'probe.bakabel.owner':self.prefix}})
+        if created.get('Name') != volume: raise ValueError('extension volume creation mismatch')
+        self.volumes.append(volume); self.extension_volume=volume
+        cid=self.create('extension-target',{'Image':PG_PIN,
+            'Env':['POSTGRES_HOST_AUTH_METHOD=trust','POSTGRES_DB=fixture','POSTGRES_USER=postgres'],
+            'HostConfig':{'CpusetCpus':'0,1','Mounts':[{'Type':'volume','Source':volume,'Target':'/var/lib/postgresql','ReadOnly':False}]}},role='restore-pg')
+        if os.sched_getaffinity(self.e.inspect(cid)['State']['Pid']) != {0,1}: raise ValueError('target startup affinity changed')
+        self.wait(lambda:self.e.exec(cid,['pg_isready','-h','127.0.0.1','-U','postgres','-d','fixture'])['exit']==0,30,'PG readiness')
+        self.extension_target=cid; self.extension_hidden=False
+        return cid
+
+    def restore_target_provenance(self):
+        target=self.target_identity(self.extension_target)
+        if target != self.result['extension']['target_before']: raise ValueError('native target incarnation drift')
+        volume=self.extension_volume
+        v=self.e.call('GET','/volumes/'+volume)
+        if (volume not in self.volumes or v.get('Name') != volume or v.get('Driver') != 'local' or
+                (v.get('Labels') or {}).get('probe.bakabel.owner') != self.prefix or 'Options' not in v or
+                not (v['Options'] is None or type(v['Options']) is dict and v['Options'] == {})):
+            raise ValueError('unowned or external target volume')
+        image=self.e.call('GET','/images/'+PG_PIN.split('@')[1]+'/json')
+        self.validate_restore_target(self.e.inspect(self.extension_target),image,volume,
+            self.e.call('GET','/containers/'+self.extension_target+'/changes'),self.extension_hidden)
+        if self.e.call('GET','/info')['ID'] != self.daemon: raise ValueError('native provenance daemon drift')
+        return target
+
+    @staticmethod
+    def validate_restore_exec(execution,eid,cid):
+        expected={'entrypoint':'/usr/local/bin/pg_restore','arguments':['--no-password','--exit-on-error','--dbname',
+            "host='/var/run/postgresql' port='5432' user='postgres' dbname='fixture'"],
+            'tty':False,'privileged':False,'user':'0'}
+        if (execution.get('ID') != eid or execution.get('ContainerID') != cid or
+                not same_json(execution.get('ProcessConfig'),expected) or
+                any(execution.get(k) is not True for k in ('OpenStdin','OpenStdout','OpenStderr')) or
+                execution.get('Running') is not False or type(execution.get('Pid')) is not int or
+                execution['Pid'] != 0 or execution.get('ExitCode') is not None):
+            raise ValueError('independent unstarted exec differs from create')
+
+    def restore_validator(self,phase,record,spec,binding):
+        if not self.tracking or record.get('method') != 'POST': raise ValueError('restore outside tracked attempt')
+        active=record.get('owner_checkpoint',{})
+        if self.owner() != active or record.get('container_id') != self.extension_target:
+            raise ValueError('restore create/start owner changed')
+        token=(next((v.split('=',1)[1] for v in spec.get('Env',[]) if isinstance(v,str) and v.startswith('PGAPPNAME=')),'')) if phase == 'create' else binding['import_run_id']
+        if phase == 'create': self.validate_restore_create(spec,token)
+        target=self.restore_target_provenance()
+        job=json.loads((self.root/'state/workflow/job.json').read_text())
+        snapshot=self.result['mapping']['snapshot']['snapshotID']
+        self.validate_restore_checkpoint(active,job,phase,token,self.target,snapshot,target,self.daemon)
+        worker=self.owned_running(active)
+        receipt={'schema':1,'contract':'f22-native-provenance-v1','run_id':active['runID'],'import_run_id':token,
+            'daemon':self.daemon,'worker_id':worker['Id'],'worker_image':worker['Image'],
+            'worker_started_at':worker['State']['StartedAt'],'target':target,'target_image':PG_PIN.split('@')[1],
+            'logical_target':self.target,'snapshot_id':snapshot,'profile':'pg18.6-fixture-pgEnv-v1',
+            'create_exact':True,'effective_environment':True,'mounts_owned':True,'native_layer':True}
+        if phase == 'start':
+            eid=record['exec_id']
+            if not same_json(binding,{**receipt,'exec_id':eid}): raise ValueError('create/start provenance mismatch')
+            self.validate_restore_exec(self.e.call('GET','/exec/'+eid+'/json'),eid,self.extension_target)
+            receipt.update(exec_id=eid,inspect_agrees=True)
+        return receipt
+
+    def finish_native_capture(self,active,terminal):
+        # Called while the exact terminal worker is still owned, after capture
+        # quiescence and before its ordinary nonforce DELETE is forwarded.
+        target=self.restore_target_provenance()
+        sessions=int(self.sql(self.extension_target,"SELECT count(*) FROM pg_stat_activity WHERE backend_type='client backend' AND pid<>pg_backend_pid()"))
+        response=self.e.exec(self.extension_target,['sh','-c',
+            'n=0; for p in /proc/[0-9]*; do x=$(readlink "$p/exe" 2>/dev/null) || continue; [ "$x" != /usr/local/bin/pg_restore ] || n=$((n+1)); done; printf "%s\\n" "$n"'])
+        if response['exit'] or re.fullmatch('[0-9]+\\n?',response['stdout']) is None:
+            raise ValueError('all-import process proof unavailable')
+        processes=int(response['stdout'])
+        if sessions or processes: raise ValueError('target retains other client/import activity')
+        with self.relay.lock:
+            starts=[r for r in self.relay.records if r.get('boundary') == 'restore-start' and r.get('exec_id') == active['execID']]
+            if len(starts) != 1 or 'restore_start' not in starts[0]: raise ValueError('unique validated native start missing')
+            start=starts[0]
+            start['native_terminal']={'schema':1,'exec_id':active['execID'],'import_run_id':active['importRunID'],
+                'capture_quiescent':True,'target_after':target,'native_layer_after':True,
+                'all_client_sessions':sessions,'all_import_processes':processes,'terminal':terminal}
+            native=start.get('native_fatal_observation',{})
+            if (native.get('reset_candidate') is True and native.get('template') == 'pg18-hstore-devnull-429-v1' and
+                    type(terminal.get('exec_exit_code')) is int and terminal['exec_exit_code'] == 1):
+                start['native_fatal_witness']={'schema':1,'exec_id':active['execID'],'import_run_id':active['importRunID'],
+                    'stderr_complete':False,'total_error_count':None}
+
+    @staticmethod
+    def validate_restore_checkpoint(active,job,phase,token,logical,snapshot,target,daemon):
+        run=active.get('runID',''); worker=active.get('workerContainerID','')
+        targets=job.get('targets',[])
+        if (phase not in ('create','start') or re.fullmatch('[a-f0-9]{32}',run) is None or
+                re.fullmatch('[a-f0-9]{64}',worker) is None or active.get('workerName') != 'bakabel-worker-'+run or
+                active.get('workerStartAuthorized') is not True or active.get('daemonID') != daemon or
+                active.get('status') != 'active' or active.get('execKind') != 'restore' or
+                active.get('phase') != ('creating_exec' if phase == 'create' else 'exec_started') or
+                active.get('sourceContainerID') != target['container_id'] or active.get('sourceStartedAt') != target['started_at'] or
+                active.get('targetID') != hashlib.sha256(logical.encode()).hexdigest() or job.get('runID') != run or
+                not isinstance(targets,list) or len(targets) != 1 or targets[0].get('ID') != logical or
+                targets[0].get('Kind') != 'postgres' or targets[0].get('Database') != 'fixture' or
+                targets[0].get('Source') != {'DaemonID':daemon,'ContainerID':target['container_id'],'StartedAt':target['started_at']} or
+                job.get('restore') != {'snapshotID':snapshot,'postgresContainer':target['container_id'],'database':'fixture','user':'postgres'}):
+            raise ValueError('restore owner/frozen job mismatch')
+        if phase == 'create':
+            if active.get('execID') or active.get('importRunID'): raise ValueError('create already persisted')
+        elif (re.fullmatch('[a-f0-9]{64}',active.get('execID','')) is None or active.get('importRunID') != token):
+            raise ValueError('start lacks persisted actual exec/token')
+
+    @staticmethod
+    def validate_restore_target(obj,image,volume,changes,hidden):
+        # Engine image-by-digest inspection is trusted only on the exclusively
+        # owned fixture daemon. Full inherited Env is compared transiently.
+        pinned=PG_PIN.split('@')[1]
+        def env(values):
+            if not isinstance(values,list) or not all(isinstance(v,str) and '=' in v for v in values):
+                raise ValueError('invalid inherited environment')
+            pairs=[v.split('=',1) for v in values]
+            if len({p[0] for p in pairs}) != len(pairs): raise ValueError('duplicate inherited environment')
+            return dict(pairs)
+        upstream=image.get('Config',{}); config=obj.get('Config',{}); host=obj.get('HostConfig',{})
+        inherited=env(upstream.get('Env'))
+        fixture={'POSTGRES_HOST_AUTH_METHOD':'trust','POSTGRES_DB':'fixture','POSTGRES_USER':'postgres'}
+        if (image.get('Id') != pinned or obj.get('Image') != pinned or
+                set(inherited) & set(fixture) or env(config.get('Env')) != {**inherited,**fixture} or
+                upstream.get('Entrypoint') != ['docker-entrypoint.sh'] or upstream.get('Cmd') != ['postgres'] or
+                config.get('Entrypoint') != upstream['Entrypoint'] or config.get('Cmd') != upstream['Cmd'] or
+                config.get('User') != '' or config.get('WorkingDir') != upstream.get('WorkingDir') or
+                config.get('Tty') is not False or host.get('Privileged') is not False or
+                any(host.get(k) for k in ('Binds','Tmpfs','Devices','VolumesFrom'))):
+            raise ValueError('untrusted native target configuration')
+        mounts=obj.get('Mounts')
+        if (not isinstance(mounts,list) or len(mounts) != 1 or
+                any(mounts[0].get(k) != v for k,v in {'Type':'volume','Name':volume,
+                    'Destination':'/var/lib/postgresql','Driver':'local'}.items()) or mounts[0].get('RW') is not True):
+            raise ValueError('target executable or external mount')
+        # Fixed pinned-native PG socket changes, plus exactly the owned hstore
+        # rename. Never learn a broader allowlist from a modified target.
+        base={('/run',0),('/run/postgresql',0),('/run/postgresql/.s.PGSQL.5432',1),('/run/postgresql/.s.PGSQL.5432.lock',1)}
+        parents={('/usr',0),('/usr/local',0),('/usr/local/lib',0),('/usr/local/lib/postgresql',0)}
+        expected=base | parents | {('/usr/local/lib/postgresql/hstore.so',2),('/usr/local/lib/postgresql/hstore.so.bakabel-f22-owned',1)} if hidden else base
+        if (not isinstance(changes,list) or any(not isinstance(c,dict) or set(c) != {'Path','Kind'} or
+                not isinstance(c['Path'],str) or type(c['Kind']) is not int for c in changes)):
+            raise ValueError('untrusted root layer changes')
+        actual={(c['Path'],c['Kind']) for c in changes}
+        if len(actual) != len(changes) or actual != expected:
+            raise ValueError('untrusted root layer changes')
+
+    @staticmethod
+    def validate_restore_create(spec,token):
+        # Exact production CreateRestoreExec/pgEnv, transient only. No argv/Env
+        # is copied into any receipt, including on validation failure.
+        if not isinstance(token,str) or re.fullmatch('restore_[a-f0-9]{48}',token) is None:
+            raise ValueError('invalid import token')
+        expected={'User':'0','Cmd':['/usr/local/bin/pg_restore','--no-password','--exit-on-error','--dbname',
+            "host='/var/run/postgresql' port='5432' user='postgres' dbname='fixture'"],
+            'Env':['PGAPPNAME='+token,'BAKABEL_RUN_ID='+token,'PGHOSTADDR=','PGPASSWORD=',
+                   'PGPASSFILE=/dev/null','PGSERVICEFILE=/dev/null','PGOPTIONS=','PGCONNECT_TIMEOUT=10'],
+            'AttachStdin':True,'AttachStdout':True,'AttachStderr':True,'Tty':False}
+        if not same_json(spec,expected): raise ValueError('nonproduction restore create')
+
     def import_stderr_classifier(self,record):
         if self.case == F19 and self.tracking and record.get('boundary') == 'dump-start':
             active=record.get('owner_checkpoint',{})
@@ -478,6 +673,17 @@ class StorageProbe(FaultProbe):
                 ext['catalog_before'] != baseline or ext['catalog_after_failure'] != baseline):
             raise ValueError('failed import changed full target baseline; retry forbidden')
 
+    def require_extension_failure(self,failed,start):
+        if type(failed['terminal']['exec_exit_code']) is not int or failed['terminal']['exec_exit_code'] != 1:
+            raise ValueError('exact missing library load failure not observed')
+        if same_json(start.get('import_diagnostic'),{'cause':'hstore_binary_load_missing','complete':True,'error_count':1}):
+            return # Original EOF route, unchanged.
+        if 'native_fatal_witness' not in start:
+            raise ValueError('exact missing library load failure not observed')
+        self.verify_source_online()
+        row={**self.result,'relay':self.relay.snapshot()}
+        verify_f22_first_failure(row,start,failed)
+
     def exercise_extension(self):
         self.sql(self.source,"CREATE EXTENSION hstore; CREATE ROLE fixture_owner; CREATE ROLE fixture_reader; ALTER TABLE payload ADD COLUMN attrs hstore; UPDATE payload SET attrs=hstore('key',g::text); ALTER TABLE payload OWNER TO fixture_owner; GRANT SELECT ON payload TO fixture_reader")
         expected=self.sql(self.source,"SELECT count(*),sum(g),md5(string_agg(g::text||':'||data||':'||attrs::text,',' ORDER BY g)) FROM payload")
@@ -505,6 +711,7 @@ class StorageProbe(FaultProbe):
         if ext['catalog_before'] != baseline: raise ValueError('initial full target baseline differs')
         self.extension_target=target; self.capture_missing_library=True
         ext['library_missing_exit']=self.extension_action(target,'hide',identity)
+        self.extension_hidden=True
         self.tracking=True
         argv=('restore','--snapshot',snapshot,'--postgres-container',target,'--database','fixture','--user','postgres')
         failed=self.finish_attempt(self.controller(*argv))
@@ -519,15 +726,14 @@ class StorageProbe(FaultProbe):
         ext.update(target_after_failure=self.target_identity(target),
             installed_after_failure=int(self.sql(target,"SELECT count(*) FROM pg_extension WHERE extname='hstore'")),
             payload_after_failure=self.sql(target,"SELECT to_regclass('public.payload') IS NOT NULL") == 't')
-        if (type(failed['terminal']['exec_exit_code']) is not int or failed['terminal']['exec_exit_code'] != 1 or
-                ext['failure_cause'] != {'cause':'hstore_binary_load_missing','complete':True,'error_count':1}):
-            raise ValueError('exact missing library load failure not observed')
+        self.require_extension_failure(failed,starts[0])
         # The archive may have restored availability_probe before hstore. Do
         # not repair/delete/recreate the DB, restart it or add a transaction to
         # force a pass. A changed baseline is a real failed F22 runtime gate.
         # Only put the exact upstream library back. Do not pre-CREATE EXTENSION:
         # that would violate the production empty-catalog preflight contract.
         ext['library_present_exit']=self.extension_action(target,'prepare',identity)
+        self.extension_hidden=False
         ext['library_after_sha256']=self.library_hash(target)
         ext['target_after_prepare']=self.target_identity(target)
         ext['database_before_retry']=self.database_identity(target)

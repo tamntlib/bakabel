@@ -46,30 +46,41 @@ func (c *Client) startRestoreInput(ctx context.Context, id string, input io.Read
 		return errors.New("Docker restore requires full-duplex upgrade")
 	}
 	conn.SetDeadline(time.Time{})
-	sent := make(chan error, 1)
+	type sendResult struct{ copyErr, closeErr error }
+	sent := make(chan sendResult, 1)
 	go func() {
 		var buf [32 * 1024]byte
-		_, e := io.CopyBuffer(conn, input, buf[:])
-		if closeErr := conn.(*net.UnixConn).CloseWrite(); e == nil {
-			e = closeErr
+		_, copyErr := io.CopyBuffer(conn, input, buf[:])
+		var closeErr error
+		if copyErr == nil {
+			closeErr = conn.(*net.UnixConn).CloseWrite()
 		}
-		sent <- e
+		// Either sender failure must wake Demux even if peer output stays open.
+		if copyErr != nil || closeErr != nil {
+			conn.Close()
+		}
+		sent <- sendResult{copyErr, closeErr}
 	}()
 	streamErr := Demux(br, io.Discard, io.Discard)
-	// pg_restore can exit early; unblock a backpressured reader and writer then join.
-	input.Close()
-	conn.Close()
+	// Valid output EOF does not prove the producer has reached its own EOF.
+	// Only failed output aborts input; cancellation remains armed through join.
+	if streamErr != nil {
+		input.Close()
+		conn.Close()
+	}
 	inputErr := <-sent
+	input.Close()
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	var result error
 	if streamErr != nil {
-		return errors.New("Docker restore output stream failed")
+		result = errors.New("Docker restore output stream failed")
 	}
-	if inputErr != nil {
-		return errors.New("Docker restore input stream failed")
+	if inputErr.copyErr != nil || inputErr.closeErr != nil {
+		result = errors.Join(result, errors.New("Docker restore input stream failed"))
 	}
-	return nil
+	return result
 }
 
 // StreamRestoreExec starts only an already persisted checkpoint. The caller MUST

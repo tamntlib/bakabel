@@ -204,6 +204,113 @@ def restore_contract():
     return json.loads(value('restoreBaseline')),value('restoreInventorySQL')
 
 
+def verify_restore_provenance(row,start,attempt):
+    a=attempt['owner']; records=row['relay']['records']; ext=row['extension']; eid=a['execID']
+    creates=[r for r in records if r.get('boundary') == 'restore-create' and
+             (r.get('exec_id') == eid or r.get('owner_checkpoint',{}).get('runID') == a['runID'])]
+    demand(len(creates) == 1,'unique actual restore create missing')
+    create=creates[0]
+    owner={**a,'phase':'creating_exec'}; owner.pop('execID',None); owner.pop('importRunID',None)
+    removals=[r for r in records if r.get('boundary') == 'worker-remove' and r.get('container_id') == a['workerContainerID']]
+    demand(len(removals) == 1,'unique native terminal removal missing')
+    removed=removals[0]
+    expected={'schema':1,'contract':'f22-native-provenance-v1','run_id':a['runID'],'import_run_id':a['importRunID'],
+        'daemon':row['daemon'],'worker_id':a['workerContainerID'],'worker_image':row['image_id'],
+        'worker_started_at':removed.get('worker_before_remove',{}).get('started_at'),
+        'target':ext['target_before'],'target_image':'sha256:83148c0bc09eac4d598b70a61e1404d0212b76c95c504bfd6c81a4c59ec91792',
+        'logical_target':row['mapping']['plan']['ID'],'snapshot_id':row['mapping']['snapshot']['snapshotID'],
+        'profile':'pg18.6-fixture-pgEnv-v1','create_exact':True,'effective_environment':True,
+        'mounts_owned':True,'native_layer':True,'exec_id':eid}
+    demand(bool(expected['worker_started_at']) and create.get('method') == 'POST' and create.get('forwarded') is True and
+        type(create.get('status')) is int and create['status'] == 201 and create.get('exec_id') == eid and
+        'fault' not in create and 'fault' not in start and
+        create.get('container_id') == a['sourceContainerID'] and same_json(create.get('owner_checkpoint'),owner) and
+        same_json(create.get('restore_create'),expected) and start.get('method') == 'POST' and
+        start.get('container_id') == a['sourceContainerID'] and start.get('exec_id') == eid and
+        same_json(start.get('owner_checkpoint'),a) and start.get('forwarded') is True and
+        type(start.get('status')) is int and start['status'] == 101 and
+        records.index(create) < records.index(start) < records.index(removed) and
+        same_json(start.get('restore_start'),{**expected,'inspect_agrees':True}), 'native create/persisted start provenance mismatch')
+    terminal={'schema':1,'exec_id':eid,'import_run_id':a['importRunID'],'capture_quiescent':True,
+        'target_after':ext['target_before'],'native_layer_after':True,'all_client_sessions':0,'all_import_processes':0,
+        'terminal':attempt['terminal']}
+    demand(same_json(start.get('native_terminal'),terminal),'native terminal/capture/target binding missing')
+
+
+def verify_f22_first_failure(row,start,first):
+    # Also used by the runner BEFORE library preparation. No future retry or
+    # cleanup result is assumed here; those remain separate final obligations.
+    ext=row['extension']; a=first['owner']; term=first['terminal']; records=row['relay']['records']
+    diagnostic=start.get('import_diagnostic')
+    demand(type(term.get('exec_exit_code')) is int and term['exec_exit_code'] == 1 and
+        same_json(ext.get('failure_cause'),diagnostic) and start.get('import_contract') == 'pg_restore-fixture-exit-on-error-v1' and
+        start.get('container_id') == ext['target_before']['container_id'],'exact finite missing-library exec cause absent')
+    expected={'cause':'hstore_binary_load_missing','complete':True,'error_count':1}
+    if same_json(diagnostic,expected):
+        demand('native_fatal_witness' not in start,'conflicting complete/native failure routes')
+        # Legacy EOF receipts remain valid; any additional transport projection
+        # must agree rather than let a rewritten summary erase an observed reset.
+        if 'capture' in start:
+            capture=start['capture']
+            demand(isinstance(capture,dict) and capture.get('state') == 'finalized' and
+                capture.get('stop_reason') == 'upstream_eof','complete cause contradicts stream capture')
+        if 'import_observation' in start:
+            demand(isinstance(start['import_observation'],dict) and
+                start['import_observation'].get('transport_complete') is True,'complete cause contradicts observed transport')
+        if 'native_fatal_observation' in start:
+            demand(isinstance(start['native_fatal_observation'],dict) and
+                start['native_fatal_observation'].get('reset_candidate') is False,'complete cause contradicts native reset')
+        return
+    demand(row.get('case') == F22 and row.get('source_unchanged') is True and row.get('relay',{}).get('errors') == [] and
+        row.get('attempts',[None])[0] == first,'native route outside first failed F22 import')
+    verify_restore_provenance(row,start,first)
+    expected_native={'schema':1,'template':'pg18-hstore-devnull-429-v1','observed_bytes':429,'observed_error_count':1,
+        'framing_valid':True,'framing_consumed':True,'reset_candidate':True}
+    demand(same_json(start.get('native_fatal_observation'),expected_native) and
+        same_json(diagnostic,{'cause':'unclassified','complete':False,'error_count':1}) and
+        same_json(start.get('import_observation'),{'cause':'hstore_binary_load_missing','message_complete':True,
+            'observed_error_count':1,'transport_complete':False}) and
+        same_json(start.get('native_fatal_witness'),{'schema':1,'exec_id':a['execID'],'import_run_id':a['importRunID'],
+            'stderr_complete':False,'total_error_count':None}), 'native message/framing/unknown-tail receipt absent')
+    capture=start.get('capture',{})
+    demand(set(capture) == {'state','stop_reason','input_stop','output_stop','stderr_bytes','stdout_observed_bytes'} and
+        capture.get('state') == 'aborted' and capture.get('stop_reason') == 'recv_back_reset' and
+        capture.get('input_stop') in (None,'client_eof','send_back_broken_pipe') and capture.get('output_stop') is None and
+        type(capture.get('stderr_bytes')) is int and capture['stderr_bytes'] == 429 and
+        type(capture.get('stdout_observed_bytes')) is int and capture['stdout_observed_bytes'] == 0 and
+        'fault' not in start,'native reset transport exclusions not met')
+    removed=next(r for r in records if r.get('boundary') == 'worker-remove' and r.get('container_id') == a['workerContainerID'])
+    verify_nonforce_remove(removed)
+    demand(first.get('cli_exit') == 1 and type(first.get('cli_exit')) is int and
+        first.get('owner_released') is True and first.get('worker_absent') is True and first.get('last_success_unchanged') is True and
+        first.get('result',{}).get('runID') == a['runID'] and first['result'].get('status') == 'failed' and
+        removed.get('execution_owner') == a and removed.get('terminal_before_remove') == term and
+        removed.get('forwarded') is True and type(removed.get('status')) is int and removed['status'] == 204 and
+        all(type(term.get(k)) is int and term[k] == 0 for k in ('sessions','processes')) and
+        term.get('daemon') == row['daemon'] and term.get('exec_id') == a['execID'] and
+        term.get('container_id') == a['sourceContainerID'] and term.get('started_at') == a['sourceStartedAt'], 'native failed result/retirement missing')
+    before=removed.get('owner_before_remove',{}); worker=removed.get('worker_before_remove',{})
+    demand(all(before.get(k) == a.get(k) for k in ('runID','daemonID','workerContainerID','workerName','workerStartAuthorized')) and
+        before.get('workerStartAuthorized') is True and worker.get('container_id') == a['workerContainerID'] and
+        worker.get('running') is False and type(worker.get('pid')) is int and worker['pid'] == 0 and
+        number(worker.get('exit_code'),1),'native terminal worker not strictly owned')
+    target=first['result'].get('targets',[])
+    demand(len(target) == 1 and target[0].get('targetID') == row['mapping']['plan']['ID'] and
+        target[0].get('snapshotID') == row['mapping']['snapshot']['snapshotID'] and
+        target[0].get('status') in ('unknown','partial') and bool(target[0].get('error')),'native public failure identity missing')
+    baseline,_=restore_contract(); database=ext.get('database_before',{})
+    demand(isinstance(database,dict) and set(database) == {'cluster_id','database_oid','database'} and
+        database.get('database') == 'fixture' and all(isinstance(database.get(k),str) and
+        re.fullmatch('[1-9][0-9]{0,19}',database[k]) for k in ('cluster_id','database_oid')) and
+        same_json(ext.get('catalog_before'),baseline) and same_json(ext.get('catalog_after_failure'),baseline) and
+        ext.get('database_after_failure') == database and ext.get('target_after_failure') == ext['target_before'] and
+        all(type(ext.get(k)) is int and ext[k] == 0 for k in ('installed_before','installed_after_failure')) and
+        ext.get('control_present') is True and type(ext.get('library_missing_exit')) is int and ext['library_missing_exit'] == 1 and
+        ext.get('roles_prepared_before_failure') is True and ext.get('role_oids_differ') is True and
+        ext.get('operator_action') == 'restore-owned-hidden-library' and ext.get('payload_after_failure') is False,
+        'native failed baseline guard missing')
+
+
 def verify_extension(row):
     verify_snapshot(row,'postgres'); ext=row.get('extension',{})
     demand(ext.get('name') == 'hstore' and ext.get('source_major') == ext.get('target_major') == 18 and
@@ -236,13 +343,13 @@ def verify_extension(row):
            'same cluster/database OID readbacks missing')
     first=row['attempts'][0]; active=first['owner']
     start=next(r for r in row['relay']['records'] if r.get('boundary') == 'restore-start' and r.get('exec_id') == active['execID'])
-    expected={'cause':'hstore_binary_load_missing','complete':True,'error_count':1}
-    diagnostic=start.get('import_diagnostic')
-    demand(type(first['terminal']['exec_exit_code']) is int and first['terminal']['exec_exit_code'] == 1 and
-           isinstance(diagnostic,dict) and set(diagnostic) == set(expected) and diagnostic.get('cause') == expected['cause'] and
-           diagnostic.get('complete') is True and type(diagnostic.get('error_count')) is int and diagnostic['error_count'] == 1 and
-           same_json(ext.get('failure_cause'),diagnostic) and start.get('import_contract') == 'pg_restore-fixture-exit-on-error-v1' and
-           start.get('container_id') == target['container_id'],'exact finite missing-library exec cause absent')
+    verify_f22_first_failure(row,start,first)
+    for key in ('importRunID','execID','workerContainerID'):
+        demand(len({a['owner'][key] for a in row['attempts']}) == 2,'restore identity reused across attempts')
+    second=row['attempts'][1]
+    retry=next(r for r in row['relay']['records'] if r.get('boundary') == 'restore-start' and r.get('exec_id') == second['owner']['execID'])
+    demand('native_fatal_witness' not in retry,'native failure witness cannot satisfy retry success')
+    if 'native_fatal_witness' in start: verify_restore_provenance(row,retry,second)
     data=ext.get('source_data')
     demand(isinstance(data,str) and re.fullmatch(r'300000\|45000150000\|[a-f0-9]{32}',data) and ext.get('target_data') == data and
         ext.get('table_owner') == 'fixture_owner' and ext.get('reader_select') is True and ext.get('database_owner') == 'postgres' and

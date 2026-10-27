@@ -83,6 +83,52 @@ selected F14 runtime gate itself is mandatory, not waived. Scoped aggregate and
 full-plan flags remain false. This selector is not runtime PASS evidence and
 does not close F14 or authorize publication/deployment.
 
+## F22 native-fatal evidence semantics
+
+The original complete-EOF/exact-diagnostic route remains valid. A separate,
+first-failed-import-only route can prove that the ordinary native `pg_restore
+--exit-on-error` **encountered a fatal missing-hstore prerequisite**, not that it
+was the sole cause of failure. It requires the actual private create request's
+exact production command/User/attach/non-TTY/duplicate-free pgEnv contract,
+controlled full pinned-image plus fixture Env inheritance, and the unique real
+create ID bound to the persisted owner/import token/frozen job before the actual
+start. Independent Engine inspect must agree. Both attempts retain distinct
+exec/token/worker identities and the same snapshot/database/target incarnation.
+
+F22's unmarked disposable target uses the same pinned image's native entrypoint,
+with only its owned local PostgreSQL data volume (no startup-gate or executable
+bind mount), and a pre-start CPUs 0/1 cpuset. The producer checks the full actual
+image/container Env and exact mount ownership transiently; none is exported.
+Fixed root-layer checks permit only the native `/run/postgresql` directory/socket
+changes, plus precisely the owned hstore hide while missing. After replacing the
+exact library, only the original socket changes are permitted. The allowed diff
+is not learned from a modified target. This relies on the already required
+exclusive trusted fixture VM/no other writers and existing identity/read-to-use
+assumptions; it is not proof against a hostile host/root writer.
+
+The alternate route admits only the entire observed **429-byte production
+/dev/null-warning plus exact native SQL/context block** on fully consumed valid
+positive bounded Docker frames, zero observed stdout, observed upstream reset,
+and no injected fault, output-forward failure, timeout, exhausted drain, forced
+close or framing error. The 374-byte no-warning and legacy two-line templates
+are ineligible. Capture stays `aborted/recv_back_reset`; the original diagnostic
+stays `unclassified/complete:false`, with original input/output stop reasons.
+The versioned witness explicitly records `stderr_complete:false` and
+`total_error_count:null`: one **observed** error is not one total error.
+
+Capture quiescence, exact native terminal integer exit 1, zero token-bound and
+all-other target client/import activity, terminal owned worker before nonforce
+removal, failed public result, released ownership, source continuity and full
+unchanged same-database/catalog readbacks are required before library preparation.
+Only the owned hidden library is restored; no database repair, pre-CREATE or
+restart is allowed. The ordinary public retry's reader/import/terminal success,
+300000-row digest, object owner/SELECT ACL, database owner/ACL, extension
+version/function and exact cleanup gates remain independent and unchanged. The
+witness cannot satisfy retry success or another fault gate. Historical run
+40560935594 remains FAIL: its retained byte count is not retained native bytes,
+and no retry occurred. Offline socket controls and bounded rootless PostgreSQL
+protocol probes are not hosted F22 PASS or release evidence.
+
 ## Current state
 
 The authorized source repository is public at [tamntlib/bakabel](https://github.com/tamntlib/bakabel). The [first successful hosted run](https://github.com/tamntlib/bakabel/actions/runs/40236034625), commit `64725f740c3c512e9edaefa58a9d994c28ea508d`, passed 21 Compose and 23 Swarm required gates plus independent cleanup readback. Its downloaded artifact digest, source/image/daemon bindings, gate completeness, worker defaults and cleanup receipts were checked again by the parent; see [results and preserved failures](HOSTED_ACCEPTANCE_RESULT.md). CI also passed at that commit. No image publication, release or production deployment was performed; remaining PLAN fault/capacity certification is still pending.
