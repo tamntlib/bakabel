@@ -34,7 +34,7 @@ The first twelve rows passed on hosted run `40292564391` at commit `c50cf16e9dd8
 | F12 | Controller kill and two scheduler restarts preserve original deadline/worker/job and last success | §7; §10 | `scheduler-restart-original-deadline`: PASS on `c50cf16`, run above. |
 | F13 | Kill exactly after persisted exec ID but before start forwarding | §5.2 | `dump-persisted-before-start-worker-SIGKILL`: PASS on `97b9611`, hosted run `40365486870`; exact retained quarantine, **not** terminal exec success, ownership release or production fencing. See the preserved attempt below. |
 | F14 | Restore reader failure with otherwise valid import | §6; §10 | Current reader/import exit-status unit/API coverage retained; current public fault experiment still missing. |
-| F15 | Worker dies during observable active import; independent import-token terminal recovery | §6; §10 | Current orchestration experiment still missing; retain existing API cancellation evidence. |
+| F15 | Worker dies during observable active import; independent import-token terminal recovery | §6; §10 | Fixture implemented provisionally; final review and hosted runtime pending. Recovery scope is the original public restore controller, independent of the killed worker, not a fresh-controller restart claim. |
 | F16 | Genuine Restic exit 3: snapshot ID **and** error, partial/unknown refusal | §5.4; §10 | Historical real exit-3 and current status tests retained; current-workflow generated partial receipt still missing. Operator retagging is not this case. |
 | F17 | Crash after unknown commit, before finalization | §5.4; §10 | Fresh-state repository classification and exact snapshot IDs required; wrapper/tag failure is not a process crash. |
 | F18 | Crash after finalization, before report | §5.4; §10 | Fresh-state complete classification and old/new ID mapping required; not yet exercised as a current-workflow crash. |
@@ -49,16 +49,16 @@ Source-task replacement, wrong credentials, wrong repository password, missing r
 
 | ID | Requirement | Current implementation / acceptance boundary |
 |---|---|---|
-| R01 | Real scheduling, restart/adoption, original deadline, readonly failed/overdue health | `run_hosted_resources.py --case scheduler`, eight named verifier gates; hosted replay pending. |
-| R02 | Active-export OOM failure safety | `--case oom-active`, actual 16MiB injection; hosted replay pending. |
-| R03 | Configured small-cap early OOM | `--case oom`, fixed configured16MiB replacement candidate; **UNPROVEN**, before-source failure safety only. Actual hosted attempt and independent verification pending; historical32 failures remain failed. |
-| R04 | Actual repository ENOSPC | `--case enospc`, 8MiB bounded repository; hosted replay pending. Does not close F19/F20. |
-| C01 | Larger mixed repository and distinct index entries | `run_hosted_capacity.py`: declared 1GiB/8192-file corpus plus 400000 PG rows; actual decoded index/stats and repository check. Hosted run pending. |
-| C02 | Unchanged backup selects exact parent, zero new file data | Independent second worker, full identity/summary assertions; hosted run pending. |
-| C03 | Changed backup adds actual distinct data/index growth | Third worker, 1024 replaced files / 128MiB changed payload; hosted run pending. |
-| C04 | Entire original and changed file versions read back | Both full checksum sets streamed without local archive staging; hosted run pending. |
-| C05 | Fresh-target PG readback and source/restore CPU, logical I/O and WAL | Full ordered payload/owner/ACL checks and bounded before/after windows; hosted run pending. |
-| C06 | Source remains online and identity unchanged | Read/write during lock wait and unchanged StartedAt/RestartCount; hosted run pending. |
+| R01 | Real scheduling, restart/adoption, original deadline, readonly failed/overdue health | PASS on `e886bef`, run `40379260708`: eight named scheduler verifier gates. |
+| R02 | Active-export OOM failure safety | PASS on `e886bef`, same run: actual 512→16MiB injection with accepted zero-swap limits, positive kernel counter and terminal/recovery proof. |
+| R03 | Configured small-cap early OOM | PASS on `e886bef`, same run: first fixed configured16MiB before-source attempt. Historical32 failures remain failed; no active-export sizing claim. |
+| R04 | Actual repository ENOSPC | PASS on `e886bef`, same run: 8MiB bounded repository. Does not close F19/F20. |
+| C01 | Larger mixed repository and distinct index entries | PASS on `e886bef`, same run: declared 1GiB/8192-file corpus plus 400000 PG rows; actual decoded index/stats and repository check. |
+| C02 | Unchanged backup selects exact parent, zero new file data | PASS on `e886bef`: independent second worker, full identity/summary assertions. |
+| C03 | Changed backup adds actual distinct data/index growth | PASS on `e886bef`: third worker, 1024 replaced files / 128MiB changed payload. |
+| C04 | Entire original and changed file versions read back | PASS on `e886bef`: both full checksum sets streamed without local archive staging. |
+| C05 | Fresh-target PG readback and source/restore CPU, logical I/O and WAL | PASS on `e886bef`: full ordered payload/owner/ACL checks and bounded before/after windows. |
+| C06 | Source remains online and identity unchanged | PASS on `e886bef`: read/write during lock wait and unchanged StartedAt/RestartCount. |
 
 Capacity reports must retain worker/scheduler/source/restore scope separately, actual image/binary/helper-image overhead, sampled tmp/state/log footprints, persistent S3/source/target storage and exact cleanup. Missing counters and exit-race observations are not zero measurements. Host physical-device attribution, continuous process-birth affinity, arbitrary repository size, universal 512MiB sufficiency, scheduler-128MiB sufficiency and universal RTO are **not** requirements or promises established by these fixtures. PLAN §8 explicitly forbids invented premeasurement RAM thresholds.
 
@@ -74,8 +74,8 @@ contract review of `3ca6aec9c42115980902be98ee3f939734b21d21` accepted16 only
 as an unproved candidate. This correction does not reinterpret historical32
 attempts, the R3 evidence above or the B4 handoff.
 
-Configured16 remains **UNPROVEN** pending one fixed hosted attempt on the exact
-reviewed revision and independent source/image/daemon/artifact-bound verification.
+Configured16 was **UNPROVEN** when selected. The first fixed hosted attempt and
+independent bound audit subsequently passed on `e886bef`, as recorded below.
 All substantive gates remain: positive exact-worker kernel `oom_kill` plus
 terminal OOMKilled=true/Running=false/PID0; legitimate monotonic prebinding to
 exact bound intent-only owner history; no source/exec identity or pg_dump event;
@@ -86,7 +86,35 @@ ordinary image/core,2CPU,200000-row corpus, fresh empty128MiB repository,
 ordinary swap policy and20s controller/3s terminal/45s job windows. Active
 512→16 and ENOSPC are unchanged separate cases. No cap ladder, automatic retry,
 corpus/deadline relaxation or gate weakening is permitted. If16 fails, R03
-stays red; a future16 PASS would not relabel32 or establish production sizing.
+stays red; the scoped16 PASS does not relabel32 or establish production sizing.
+
+## Current bounded hosted PASS
+
+CI `40379259970` and all three jobs of acceptance `40379260708` passed at
+`e886befa2134ea8bae8c9f460e757e5541bad1a8`, tree
+`d4c224c904db0d4a03d744347e8bba3d99058f78`, core
+`c143839dbdf75e409e927d087575c4ebd6201eb521594ed5dced7d6a8bb18293`.
+The independent frozen-source audit verified all three ZIP digests, extracted
+bytes and commit/image/daemon bindings; core's 44 public criteria and hosted
+independent record; all six capacity gates with recomputed summary and runner
+hashes; and all 13 fault cases, aggregate and frozen verifier CLI.
+
+All four resource cases emitted verified results. The first fixed configured16
+attempt retained 18 cgroup samples at the sole sampled cap16777216, positive
+`oom_kill` maximum1, OOMKilled=true and historical Running=false/PID0. Its
+matching owner projection remained intent-only without source/exec identifiers;
+the hosted verifier required the full owner history, no source execution,
+sessions0, failed-not-complete, empty snapshots, online source and exact cleanup.
+The active512→16 case separately retained accepted limits/effective swap0 and
+kernel kill maximum2. Repository ENOSPC retained 6,403 errno28 observations.
+
+Audit SHA-256:
+`b42b4c4e109adf26302dc2687cb16af643b45ccb3e937c39f8f2de02bc257f2a`.
+Offline resource checks cover emitted verification plus typed public consistency;
+private-resource verifier inputs were not uploaded, and no fresh Engine cleanup
+readback was performed by that offline audit. This bounded workflow PASS closes
+R01–R04/C01–C06, not F14–F22 or full PLAN release readiness. No image publication
+or production deployment was performed.
 
 ## Preserved new failed attempts
 

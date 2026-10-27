@@ -5,6 +5,7 @@ PASS is only this named Compose/local fault suite, never the entire PLAN.
 Expected permanent create-gap quarantine is a safety PASS, NOT recovered work.
 """
 import argparse
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -24,6 +25,7 @@ CASES = (
     'backup-vs-restore-and-retention',
     'scheduler-restart-original-deadline',
     'dump-persisted-before-start-worker-SIGKILL',
+    'restore-active-import-worker-SIGKILL',
 )
 CREATE_GAPS = ('dump-create-response-loss', 'restore-create-response-loss')
 STREAMING = ('producer-failure-after-output', 'streaming-worker-SIGKILL', 'docker-stream-drop', 'docker-stream-drop-status-unavailable-recovery')
@@ -55,6 +57,8 @@ def verify_case(row):
     proof = row.get('proof', {})
     if name == 'dump-persisted-before-start-worker-SIGKILL':
         verify_persisted_start(row)
+    elif name == 'restore-active-import-worker-SIGKILL':
+        verify_import_kill(row)
     elif name in CREATE_GAPS:
         demand(proof.get('outcome') == 'quarantined', 'create gap incorrectly claimed recovered')
         for key in ('owner_retained','fresh_cli_blocked','exec_never_started','fault_forwarded'):
@@ -221,6 +225,164 @@ def verify_persisted_start(row):
     demand(cleanup.get('quarantine_state_retained') is True and cleanup.get('source_removed_only_after_gate') is True and
            cleanup['containers_absent'].get(cid) is True and cleanup['containers_absent'].get(owner['sourceContainerID']) is True,
            'cleanup cannot substitute for safe quarantine')
+
+
+def verify_nonforce_remove(record):
+    # RemoveWorker sends DELETE with NO query (worker_remove.go:19); force and
+    # volume removal therefore both default false. Retain explicit canonical
+    # booleans if present, but never infer safety from a path-only label.
+    query = record.get('remove_query')
+    demand(record.get('method') == 'DELETE' and isinstance(query,str) and
+           record.get('remove_query_valid') is True, 'valid removal query evidence missing')
+    options = {}
+    for item in query.split('&') if query else ():
+        match = re.fullmatch(r'(force|v)=(true|false)',item)
+        demand(match is not None and match[1] not in options, 'malformed/duplicate removal query')
+        options[match[1]] = match[2] == 'true'
+    demand(record.get('remove_force') is False and options.get('force',False) is False and
+           type(record.get('remove_volumes')) is bool and record['remove_volumes'] is options.get('v',False),
+           'forced or contradictory removal query')
+
+
+def verify_import_kill(row):
+    proof = row.get('proof',{}); injection = row.get('injection',{})
+    observed = injection.get('active_import',{}); owner = observed.get('owner',{})
+    target = observed.get('target',{}); session = observed.get('session',{})
+    token = owner.get('importRunID',''); cid = owner.get('workerContainerID',''); eid = owner.get('execID','')
+    demand(re.fullmatch('[a-f0-9]{32}',owner.get('runID','')) and re.fullmatch('restore_[a-f0-9]{48}',token) and
+           token != owner['runID'] and owner.get('execKind') == 'restore' and owner.get('phase') == 'exec_started' and
+           owner.get('status') == 'active' and owner.get('workerStartAuthorized') is True and owner.get('daemonID') == row['daemon'],
+           'independent durable import identity missing')
+    for key in ('workerContainerID','sourceContainerID','execID','targetID'):
+        demand(re.fullmatch('[a-f0-9]{64}',owner.get(key,'')), 'exact import/worker checkpoint missing')
+    demand(owner.get('workerName') == 'bakabel-worker-'+owner['runID'] and bool(owner.get('sourceStartedAt')) and
+           target.get('container_id') == owner['sourceContainerID'] and target.get('started_at') == owner['sourceStartedAt'] and
+           type(target.get('restart_count')) is int and target['restart_count'] >= 0 and
+           target['container_id'] != row.get('source',{}).get('container_id'), 'independent target incarnation missing')
+    demand(type(observed.get('exec_pid')) is int and observed['exec_pid'] > 0 and
+           type(observed.get('processes')) is int and observed['processes'] == 1 and
+           type(session.get('pid')) is int and session['pid'] > 0 and bool(session.get('backend_start')) and
+           session.get('application_name') == token and session.get('datname') == 'fixture' and session.get('usename') == 'postgres' and
+           session.get('state') == 'active' and session.get('wait_event') == 'PgSleep' and session.get('copy_active') is True,
+           'live import COPY/session/process missing; reader progress is insufficient')
+    worker = row['workers'].get(cid,{})
+    demand(worker.get('run_id') == owner['runID'] and worker.get('cpu.max') == '200000 100000' and
+           worker.get('memory.max') == '536870912', 'exact killed ordinary worker kernel proof missing')
+    prekill = injection.get('worker_before_kill',{})
+    demand(prekill.get('container_id') == cid and prekill.get('running') is True and
+           type(prekill.get('pid')) is int and prekill['pid'] > 0, 'fresh prekill worker identity missing')
+    demand(re.fullmatch('[a-f0-9]{64}',injection.get('snapshot_id','')) and
+           re.fullmatch('[a-f0-9]{64}',injection.get('controller_id','')) and injection['controller_id'] != cid,
+           'trusted snapshot and independent public controller binding missing')
+    for key in ('owner_released','worker_absent','last_success_unchanged'):
+        demand(proof.get(key) is True, 'failed import ownership/result safety missing')
+    demand(proof.get('outcome') == 'failed' and type(proof.get('cli_exit')) is int and proof['cli_exit'] == 1 and
+           proof.get('recovery_boundary') == 'original public restore CLI controller, independent of killed worker', 'public CLI recovery boundary missing')
+    terminal = proof.get('terminal',{})
+    demand(terminal.get('daemon') == row['daemon'] and terminal.get('container_id') == target['container_id'] and
+           terminal.get('started_at') == target['started_at'] and terminal.get('exec_id') == eid and
+           terminal.get('import_run_id') == token and type(terminal.get('exec_exit_code')) is int and terminal['exec_exit_code'] > 0 and
+           all(type(terminal.get(k)) is int and terminal[k] == 0 for k in ('sessions','processes')), 'exact nonzero import terminal proof missing')
+    partial = proof.get('partial_target',{})
+    demand(all(partial.get(k) == target[k] for k in ('container_id','started_at','restart_count')) and
+           partial.get('payload_exists') is True and type(partial.get('payload_rows')) is int and partial['payload_rows'] == 0,
+           'failed partial destination not retained before cleanup')
+    result = proof.get('restore_result',{}); targets = result.get('targets',[])
+    # Ground the logical identity in separate public plan and exact complete
+    # snapshot readbacks, not in the result or the durable digest under test.
+    mapping = injection.get('target_mapping',{}); plan = mapping.get('plan',{})
+    snapshot = mapping.get('snapshot',{}); metadata = snapshot.get('metadata',{})
+    logical = plan.get('ID'); source = row.get('source',{})
+    demand(isinstance(logical,str) and bool(logical) and plan.get('Kind') == 'postgres' and
+           plan.get('Source') == {'DaemonID':row['daemon'],'ContainerID':source.get('container_id'),
+                                  'StartedAt':source.get('started_at')} and
+           re.fullmatch('[a-f0-9]{64}',source.get('container_id','')) and bool(source.get('started_at')),
+           'frozen planned logical source identity missing')
+    demand(snapshot.get('snapshotID') == injection['snapshot_id'] and snapshot.get('status') == 'complete' and
+           snapshot.get('type') == 'postgres' and snapshot.get('source') == logical and
+           type(metadata.get('version')) is int and metadata['version'] == 1 and
+           metadata.get('kind') == 'postgres' and metadata.get('source') == logical,
+           'exact trusted snapshot logical source differs from plan')
+    demand(hashlib.sha256(logical.encode('utf-8')).hexdigest() == owner['targetID'],
+           'durable target digest differs from trusted logical source')
+    demand(result.get('runID') == owner['runID'] and result.get('status') == 'failed' and isinstance(targets,list) and
+           len(targets) == 1 and targets[0].get('targetID') == logical and
+           targets[0].get('snapshotID') == injection['snapshot_id'] and
+           targets[0].get('status') in ('unknown','partial') and targets[0].get('error') == 'restore failed', 'false restored or wrong public restore result')
+    relay = row.get('relay',{}); records = relay.get('records')
+    demand(isinstance(records,list) and 3 <= len(records) <= 12000 and relay.get('errors') == [], 'bounded actual transport evidence missing')
+    def removal_evidence(record):
+        # Removal-specific evidence cannot become an inspect/start by changing
+        # method or boundary. Field presence matters even when its value is null.
+        return (record.get('method') == 'DELETE' or record.get('boundary') == 'worker-remove' or
+                any(key.startswith('remove_') or key.endswith('_before_remove') for key in record))
+
+    def correlated_removal(record):
+        if record.get('container_id') in (cid,target['container_id']) or record.get('exec_id') == eid:
+            return True
+        for section in ('owner_checkpoint','owner_before_remove'):
+            annotation = record.get(section)
+            if isinstance(annotation,dict) and any(annotation.get(key) == owner[key] for key in
+                    ('runID','workerContainerID','workerName','sourceContainerID','targetID','execID','importRunID')):
+                return True
+        for section,identities in (
+                ('terminal_before_remove',{'exec_id':eid,'container_id':target['container_id'],
+                                          'import_run_id':token,'run_id':owner['runID']}),
+                ('worker_before_remove',{'container_id':cid,'run_id':owner['runID']})):
+            annotation = record.get(section)
+            if isinstance(annotation,dict) and any(annotation.get(key) == value for key,value in identities.items()):
+                return True
+        return False
+
+    creates = [r for r in records if r.get('boundary') == 'restore-create' and r.get('exec_id') == eid]
+    starts = [r for r in records if r.get('boundary') == 'restore-start' and r.get('exec_id') == eid]
+    removes = [r for r in records if removal_evidence(r) and correlated_removal(r)]
+    demand(len(creates) == len(starts) == len(removes) == 1, 'unique actual import create/start/remove missing')
+    created, started, removed = creates[0], starts[0], removes[0]
+    demand(removed.get('boundary') == 'worker-remove' and removed.get('container_id') == cid,
+           'correlated removal not bound to canonical worker boundary')
+    verify_nonforce_remove(removed)
+    execution = relay.get('execs',{}).get(eid,{})
+    demand(execution.get('kind') == 'restore' and execution.get('container_id') == target['container_id'],
+           'durable import not bound to actual relay exec/source')
+    for record in records:
+        # Removal annotations are semantic evidence, not an exemption from the
+        # exec checks below. Actual GET worker inspections have no such fields.
+        checkpoint = record.get('owner_checkpoint',{})
+        if removal_evidence(record):
+            if record.get('container_id') in row['workers']:
+                demand(record.get('boundary') == 'worker-remove', 'noncanonical owned worker removal boundary')
+                verify_nonforce_remove(record)
+            if correlated_removal(record):
+                demand(record is removed, 'contradictory correlated worker removal')
+        exec_operation = ('exec_id' in record or record.get('boundary') in
+                          ('dump-create','dump-start','restore-create','restore-start'))
+        correlated = (record.get('exec_id') == eid or checkpoint.get('runID') == owner['runID'] or
+                      record.get('container_id') == target['container_id'])
+        if not exec_operation or not correlated or record is created or record is started: continue
+        demand(record.get('method') == 'GET' and record.get('boundary') == 'other' and
+               record.get('exec_id') == eid and record.get('container_id',target['container_id']) == target['container_id'] and
+               (not checkpoint or checkpoint == owner) and record.get('forwarded') is True and
+               type(record.get('status')) is int and record['status'] == 200 and not record.get('fault'),
+               'contradictory correlated import exec operation')
+    demand(records.index(created) < records.index(started) < records.index(removed), 'import lifecycle ordering missing')
+    for record,method,status in ((created,'POST',201),(started,'POST',101),(removed,'DELETE',204)):
+        demand(record.get('method') == method and record.get('forwarded') is True and type(record.get('status')) is int and
+               record['status'] == status and not record.get('fault'), 'ordinary actual transport boundary missing')
+    keys = ('runID','daemonID','workerContainerID','workerName','workerStartAuthorized','targetID','sourceContainerID','sourceStartedAt','execKind')
+    create_owner = created.get('owner_checkpoint',{})
+    demand(create_owner.get('phase') == 'creating_exec' and not create_owner.get('execID') and not create_owner.get('importRunID') and
+           all(create_owner.get(k) == owner[k] for k in keys) and created.get('container_id') == target['container_id'] and
+           started.get('container_id') == target['container_id'] and started.get('owner_checkpoint') == owner and
+           removed.get('owner_before_remove') == owner and removed.get('terminal_before_remove') == terminal,
+           'import identity/terminal readback not retained before release')
+    killed = removed.get('worker_before_remove',{})
+    demand(killed.get('container_id') == cid and killed.get('running') is False and type(killed.get('pid')) is int and killed['pid'] == 0 and
+           type(killed.get('exit_code')) is int and killed['exit_code'] == 137, 'exact worker not observed killed before removal')
+    demand(proof.get('events') == ['active-copy-observed','prekill-rechecked','worker-kill-requested','import-terminal-before-worker-remove',
+           'public-restore-failed','partial-target-retained'], 'kill/import terminal/release/partial retention ordering missing')
+    demand(all(row['cleanup']['containers_absent'].get(k) is True for k in (cid,target['container_id'],row.get('source',{}).get('container_id'))),
+           'exact source/worker/destination cleanup missing')
 
 
 def verify_report(report, rows):

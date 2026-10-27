@@ -45,7 +45,7 @@ The mixed runner leaves production worker defaults untouched. Current candidate 
 ## Controlled failures (separate short PG-only fixtures)
 
 ```sh
-# Configured16 replacement candidate: UNPROVEN pending one fixed hosted attempt.
+# Configured16: scoped PASS at e886bef, hosted run40379260708; not sizing advice.
 # Explicit configuration-small-cap diagnostic. It requires observed actual
 # oom_kill and failed-before-source proof; a generic exit1 is NOT accepted.
 # A very small cap may fail for another reason or die before a late barrier.
@@ -95,9 +95,11 @@ zero matching sessions, failed-not-complete, empty snapshots, online read/write
 source identity, fatal observer errors/quiescence and exact cleanup all remain
 mandatory. Existing active512→16 proof is separate. See the [current addendum
 and retained failures](../RELEASE_GATE_LEDGER.md#configured-early-oom-fixture-correction).
-Configured16 remains **UNPROVEN** until a single fixed exact-revision hosted
-attempt and independent artifact/source/image/daemon-bound verification satisfy
-every gate. If it fails, retain the failure and diagnose; do not auto-tune.
+The first fixed configured16 attempt passed on `e886bef`, run `40379260708`,
+with an independent artifact/source/image/daemon-bound audit. This is the
+declared before-source fixture only, not active-export support or a universal
+RAM threshold. Private raw resource inputs remain unavailable for offline
+reverification. Retain any future failed attempt and diagnose; do not auto-tune.
 
 ## Measurement and safety semantics
 

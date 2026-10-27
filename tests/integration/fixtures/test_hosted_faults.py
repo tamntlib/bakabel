@@ -908,7 +908,7 @@ class FixtureContracts(unittest.TestCase):
             events = []
             probe.prepare = lambda: events.append('prepare')
             probe.verify_source_online = lambda: events.append('source-online')
-            for name in ('exercise_stream_fault','exercise_stream_drop','exercise_response_loss','exercise_overlap','exercise_restart','exercise_persisted_start'):
+            for name in ('exercise_stream_fault','exercise_stream_drop','exercise_response_loss','exercise_overlap','exercise_restart','exercise_persisted_start','exercise_import_kill'):
                 setattr(probe, name, lambda name=name: events.append(name))
             probe.run()
             self.assertEqual(events[0], 'prepare'); self.assertEqual(events[-1], 'source-online')

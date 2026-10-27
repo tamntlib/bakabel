@@ -33,8 +33,10 @@ class WorkflowContract(unittest.TestCase):
                     receipt.write_text(json.dumps({'offline_unit_fixture':True}))
                 else:
                     f13='dump-persisted-before-start-worker-SIGKILL'
+                    f15='restore-active-import-worker-SIGKILL'
                     self.assertIn(f13,CASES)
-                    for name in (CASES[0],f13):
+                    self.assertIn(f15,CASES)
+                    for name in (CASES[0],f13,f15):
                         receipt=root/'bakabel-faults'/name/'receipt.json';receipt.parent.mkdir(parents=True)
                         receipt.write_text(json.dumps({'offline_unit_fixture':True,'case':name}))
                     for name in ('unknown-fault','private','proc','tracer','dump-start-private-canary'):
@@ -48,8 +50,9 @@ class WorkflowContract(unittest.TestCase):
                 self.assertEqual(json.loads((root/'bakabel-public/candidate.json').read_text())['suite'],suite)
                 if suite=='faults':
                     exported={path.name for path in (root/'bakabel-public').iterdir()}
-                    self.assertEqual(exported,{'candidate.json','faults-'+CASES[0]+'.json','faults-'+f13+'.json'})
+                    self.assertEqual(exported,{'candidate.json','faults-'+CASES[0]+'.json','faults-'+f13+'.json','faults-'+f15+'.json'})
                     self.assertEqual(json.loads((root/('bakabel-public/faults-'+f13+'.json')).read_text())['case'],f13)
+                    self.assertEqual(json.loads((root/('bakabel-public/faults-'+f15+'.json')).read_text())['case'],f15)
 
     def test_capacity_and_faults_run_on_independent_fresh_vms(self):
         text=(ROOT/'.github/workflows/acceptance.yaml').read_text()

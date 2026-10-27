@@ -22,7 +22,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, quote
 from run_resource_probe import Engine, PG, utc, worker_owned
 from run_compose_pg_acceptance import ComposeProbe, fingerprint
-from verify_hosted_faults import CASES, CREATE_GAPS, verify_case, verify_report
+from verify_hosted_faults import CASES, CREATE_GAPS, verify_case, verify_report, verify_nonforce_remove
 from run_hosted_acceptance import require_hosted_daemon, failure_location
 from run_hosted_capacity import CapacityEngine
 
@@ -263,6 +263,47 @@ class FaultProbe(ComposeProbe):
             return active, sessions[0], count
         return self.wait(streaming, 40, 'live pg_dump after 64KiB stdout')
 
+    def active_import(self, target, controller):
+        # A live reader or stdin byte count alone is not import progress. This
+        # trusted fixture's CHECK function sleeps inside the real COPY backend.
+        if self.e.inspect(controller)['State']['Running'] is not True:
+            raise TimeoutError('public restore exited before active COPY')
+        active = self.owner()
+        if not active or active.get('phase') != 'exec_started': return None
+        token = active.get('importRunID','')
+        if (not re.fullmatch('restore_[a-f0-9]{48}',token) or token == active.get('runID') or
+                active.get('execKind') != 'restore' or active.get('status') != 'active' or
+                active.get('workerStartAuthorized') is not True or
+                active.get('sourceContainerID') != target or target == self.source or
+                active.get('daemonID') != self.daemon or self.e.call('GET','/info')['ID'] != self.daemon):
+            raise ValueError('independent import checkpoint mismatch')
+        obj = self.e.inspect(target)
+        if (obj.get('Id') != target or obj['State'].get('Running') is not True or
+                obj['State'].get('StartedAt') != active.get('sourceStartedAt') or
+                type(obj.get('RestartCount')) is not int):
+            raise ValueError('restore target incarnation changed')
+        execution = self.e.call('GET','/exec/'+active['execID']+'/json')
+        if execution.get('Running') is not True: return None
+        process = execution.get('ProcessConfig',{})
+        if (execution.get('ID') != active['execID'] or execution.get('ContainerID') != target or
+                type(execution.get('Pid')) is not int or execution['Pid'] <= 0 or
+                process.get('entrypoint') != '/usr/local/bin/pg_restore' or process.get('arguments') !=
+                ['--no-password','--exit-on-error','--dbname',"host='/var/run/postgresql' port='5432' user='postgres' dbname='fixture'"]):
+            raise ValueError('exact restore exec command mismatch')
+        sessions = json.loads(self.sql(target,
+            "SELECT coalesce(json_agg(json_build_object('pid',pid,'backend_start',backend_start::text,"
+            "'application_name',application_name,'datname',datname,'usename',usename,'state',state,'wait_event',wait_event,"
+            "'copy_active',query LIKE 'COPY public.payload %')),'[]'::json) FROM pg_stat_activity WHERE application_name='"+token+"'"))
+        if len(sessions) != 1: return None
+        session = sessions[0]
+        if (session.get('application_name') != token or session.get('datname') != 'fixture' or
+                session.get('usename') != 'postgres' or session.get('state') != 'active' or
+                session.get('wait_event') != 'PgSleep' or session.get('copy_active') is not True or
+                type(session.get('pid')) is not int or session['pid'] <= 0 or not session.get('backend_start') or
+                self.process_count(target,token,'pg_restore') != 1): return None
+        return {'owner':active,'session':session,'exec_pid':execution['Pid'],'processes':1,
+                'target':{'container_id':target,'started_at':active['sourceStartedAt'],'restart_count':obj['RestartCount']}}
+
     def run(self):
         if self.case not in CASES: raise ValueError('unknown fault case')
         self.prepare()
@@ -278,6 +319,8 @@ class FaultProbe(ComposeProbe):
             self.exercise_restart()
         elif self.case == 'dump-persisted-before-start-worker-SIGKILL':
             self.exercise_persisted_start()
+        elif self.case == 'restore-active-import-worker-SIGKILL':
+            self.exercise_import_kill()
         self.verify_source_online()
         self.result['exercised'] = True
 
@@ -293,6 +336,9 @@ class FaultProbe(ComposeProbe):
         if target['Kind'] != 'postgres' or target['Source']['DaemonID'] != self.daemon or target['Source']['ContainerID'] != self.source or target['Source']['StartedAt'] != self.source_before['started_at']:
             raise ValueError('public plan source binding mismatch')
         self.target = target['ID']; self.result['source'] = self.source_before
+        if getattr(self,'case',None) == 'restore-active-import-worker-SIGKILL':
+            self.f15_plan = {'ID':target['ID'],'Kind':target['Kind'],
+                'Source':{k:target['Source'][k] for k in ('DaemonID','ContainerID','StartedAt')}}
 
     def finish_failure(self, controller, active):
         rows = self.finish(controller, expect=1, timeout=85)
@@ -387,6 +433,32 @@ class FaultProbe(ComposeProbe):
         self.result['source_unchanged'] = True
 
     def observe_transport(self, phase, record):
+        if record['boundary'] == 'worker-remove':
+            # Existing cases keep their original observation path. For F15 the
+            # real CLI's nonforce removal is after its cancellation proof and
+            # before durable owner release (workflow_controller.go).
+            if getattr(self,'case',None) != 'restore-active-import-worker-SIGKILL': return
+            if phase != 'request': return
+            verify_nonforce_remove(record)
+            if record.get('forwarded') is not False: raise ValueError('removal observation was not pre-forward')
+            if not hasattr(self,'f15_active'): return  # Baseline backup: query gate only.
+            active = self.f15_active
+            if record.get('container_id') != active['workerContainerID']: return
+            if self.owner() != active or hasattr(self,'f15_terminal'):
+                raise ValueError('import ownership lost before terminal observation')
+            obj = self.e.inspect(active['workerContainerID']); self.worker_identity_proof(obj,active)
+            state = obj['State']
+            if (state.get('Running') is not False or type(state.get('ExitCode')) is not int or state['ExitCode'] != 137 or
+                    type(state.get('Pid')) is not int or state['Pid'] != 0):
+                raise ValueError('exact killed worker not terminal before removal')
+            terminal = {**self.terminal_proof(active),'import_run_id':active['importRunID']}
+            if type(terminal.get('exec_exit_code')) is not int or terminal['exec_exit_code'] <= 0 or self.owner() != active:
+                raise ValueError('import terminal not proved while owned')
+            record.update(terminal_before_remove=terminal,owner_before_remove=active,
+                          worker_before_remove=self.worker_observation(active['workerContainerID'],obj,time.monotonic()))
+            self.f15_terminal = terminal
+            self.f15_events.append('import-terminal-before-worker-remove')
+            return
         if record['boundary'] == 'other': return
         if phase == 'request':
             active = self.owner()
@@ -539,6 +611,82 @@ class FaultProbe(ComposeProbe):
             'owner_before_kill':owner_before,'owner_after_kill':owner_after,'owner_quarantine':quarantine,'owner_fresh':fresh,
             'exec_observations':exec_observations,'worker_observations':worker_observations,
             'workers_before_fresh':workers_before,'workers_after_fresh':workers_after,'events':events}
+
+    def exercise_import_kill(self):
+        # Same trusted-dump technique as postgres_cancel_integration_test.go:
+        # no target-side DDL after preflight, extra image tool, or source agent.
+        self.sql(self.source,"CREATE FUNCTION public.f15_check(i integer) RETURNS boolean LANGUAGE plpgsql AS $$ BEGIN IF i=1 AND current_setting('application_name') LIKE 'restore_%' THEN PERFORM pg_sleep(90); END IF; RETURN true; END $$; ALTER TABLE public.payload ADD CHECK (public.f15_check(g))")
+        snapshot = self.success_snapshot()
+        # Public restore uses exact snapshot metadata.Source as its logical ID;
+        # owner.targetID is independently SHA-256(logical UTF-8), never that ID.
+        plan = self.f15_plan
+        if (not isinstance(self.target,str) or not self.target or plan.get('ID') != self.target or
+                plan.get('Kind') != 'postgres' or plan.get('Source') != {
+                    'DaemonID':self.daemon,'ContainerID':self.source,
+                    'StartedAt':self.source_before['started_at']}):
+            raise ValueError('frozen public plan source binding changed')
+        listed = self.call_cli('snapshots')
+        if not isinstance(listed,list) or any(not isinstance(row,dict) for row in listed):
+            raise ValueError('trusted snapshot readback must be a public list')
+        exact = [row for row in listed if row.get('snapshotID') == snapshot]
+        if (len(exact) != 1 or exact[0].get('status') != 'complete' or exact[0].get('type') != 'postgres' or
+                exact[0].get('source') != self.target or type(exact[0].get('metadata',{}).get('version')) is not int or
+                exact[0]['metadata']['version'] != 1 or
+                exact[0]['metadata'].get('kind') != 'postgres' or exact[0]['metadata'].get('source') != self.target):
+            raise ValueError('exact trusted snapshot logical source differs from frozen plan')
+        snap = exact[0]
+        mapping = {'plan':copy.deepcopy(plan),'snapshot':{k:snap[k] for k in ('snapshotID','status','type','source')}}
+        mapping['snapshot']['metadata'] = {k:snap['metadata'][k] for k in ('version','kind','source')}
+        logical = mapping['snapshot']['metadata']['source']
+        target = self.startpg('restore',False)
+        controller = self.controller('restore','--snapshot',snapshot,'--postgres-container',target,'--database','fixture','--user','postgres')
+        observed = self.wait(lambda: self.active_import(target,controller),40,'active restore COPY backend sleep')
+        active = observed['owner']; cid = active['workerContainerID']
+        if active.get('workerStartAuthorized') is not True: raise ValueError('worker start not strictly authorized')
+        if active.get('targetID') != hashlib.sha256(logical.encode('utf-8')).hexdigest():
+            raise ValueError('durable import target digest differs from trusted logical source')
+        self.f15_active = active; self.f15_events = ['active-copy-observed']
+        self.capture_owned_worker(cid)
+        # Reobserve the SAME backend/exec/import token immediately before the
+        # only signal. A reader-only window or drift never authorizes a kill.
+        fresh = self.active_import(target,controller)
+        if fresh != observed or self.owner() != active: raise ValueError('active import changed before worker kill')
+        obj = self.e.inspect(cid); self.worker_identity_proof(obj,active)
+        if obj['State'].get('Running') is not True: raise ValueError('owned worker stopped before injection')
+        prekill = self.worker_observation(cid,obj,time.monotonic())
+        self.result['injection'] = {'active_import':fresh,'worker_before_kill':prekill,'snapshot_id':snapshot,
+            'controller_id':controller,'target_mapping':mapping}
+        final_owner = self.owner()
+        if final_owner != active or not final_owner or final_owner.get('workerStartAuthorized') is not True:
+            raise ValueError('exact strictly authorized owner lost at final kill gate')
+        self.f15_events.extend(('prekill-rechecked','worker-kill-requested'))
+        self.e.call('POST','/containers/'+cid+'/kill?signal=KILL')
+        # The ordinary public restore controller is a separate process from the
+        # killed worker. It performs exact import-token cancellation itself;
+        # the fixture NEVER cancels the import or supplies a successful reply.
+        rows = self.finish(controller,expect=1,timeout=85)
+        if (len(rows) != 1 or rows[0].get('runID') != active['runID'] or rows[0].get('status') != 'failed' or
+                len(rows[0].get('targets',[])) != 1 or any(t.get('status') in ('restored','complete') or
+                t.get('targetID') != logical or t.get('snapshotID') != snapshot for t in rows[0]['targets'])):
+            raise ValueError('public restore falsely succeeded or lost exact snapshot')
+        if not hasattr(self,'f15_terminal') or self.owner() is not None or self.e.inspect(cid,missing=True) is not None:
+            raise ValueError('public CLI did not prove import terminal before ownership release')
+        last = self.last()
+        if (last.get('runID') != active['runID'] or last.get('status') != 'failed' or last.get('operation') != 'restore' or
+                last.get('lastBackupSuccessAt') != self.baseline_success):
+            raise ValueError('failed restore changed last backup success')
+        self.f15_events.append('public-restore-failed')
+        obj = self.e.inspect(target)
+        target_after = {'container_id':obj['Id'],'started_at':obj['State']['StartedAt'],'restart_count':obj['RestartCount']}
+        if (obj['State']['Running'] is not True or target_after != observed['target'] or
+                self.sql(target,"SELECT to_regclass('public.payload') IS NOT NULL") != 't' or
+                self.sql(target,'SELECT count(*) FROM public.payload') != '0'):
+            raise ValueError('partial restore destination removed or unexpectedly complete')
+        self.f15_events.append('partial-target-retained')
+        self.result['proof'] = {'outcome':'failed','owner_released':True,'worker_absent':True,'cli_exit':1,
+            'last_success_unchanged':True,'terminal':self.f15_terminal,'restore_result':rows[0],
+            'partial_target':{**target_after,'payload_exists':True,'payload_rows':0},'events':self.f15_events,
+            'recovery_boundary':'original public restore CLI controller, independent of killed worker'}
 
     def exercise_response_loss(self):
         boundary = self.case.removesuffix('-response-loss')
@@ -894,8 +1042,24 @@ class FaultRelay:
             self.rule = None
 
     def classify(self, method, path, body):
-        path = re.sub(r'^/v[0-9.]+', '', urlsplit(path).path)
+        url = urlsplit(path)
+        path = re.sub(r'^/v[0-9.]+', '', url.path)
         record = {'method': method, 'boundary': 'other', 'forwarded': False}
+        removal = re.fullmatch(r'/containers/([a-f0-9]{64})',path)
+        if method == 'DELETE' and removal and removal[1] in self.workers:
+            record.update(boundary='worker-remove',container_id=removal[1])
+            options = {}; valid = not bool(url.fragment)
+            for item in url.query.split('&') if url.query else ():
+                match = re.fullmatch(r'(force|v)=(true|false)',item)
+                if match is None or match[1] in options:
+                    valid = False
+                else:
+                    options[match[1]] = match[2] == 'true'
+            # Observation only for all other cases: do not change request bytes
+            # or forwarding. F15 checks this before its terminal callback.
+            record.update(remove_query=url.query,remove_query_valid=valid,
+                          remove_force=options.get('force',False) if valid else None,
+                          remove_volumes=options.get('v',False) if valid else None)
         value = json.loads(body) if body else {}
         if not isinstance(value, dict): value = {}
         if method == 'POST' and path == '/containers/create':

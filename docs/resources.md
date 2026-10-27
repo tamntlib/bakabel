@@ -76,7 +76,7 @@ required.
 
 Failed attempts remain failed: one configured 32 MiB run proved early OOM but its harness waited for an unreachable later checkpoint; another had no positive OOM proof. Other failed fixture assertions are recorded, not relabeled as successful application runs. The checked-in-ready reproduction procedures and limits are in [the fixture guide](../tests/integration/fixtures/RESOURCE_PROBE.md) and [the candidate handoff](../tests/integration/B4_RESOURCE_HANDOFF.md).
 
-## Configured early OOM replacement — unproven
+## Configured early OOM replacement — scoped hosted PASS
 
 The current configured-early fixture explicitly replaces32MiB with fixed16MiB
 (16777216 bytes), including standalone default, hosted selection, producer
@@ -88,15 +88,19 @@ Last captured worker Running=true/PID66867 and a separate matched exec_started
 owner are historical, not necessarily simultaneous or direct PG Lock-wait proof.
 Earlier32 failures and their unknowns are preserved in the [release ledger](../tests/integration/RELEASE_GATE_LEDGER.md#configured-early-oom-fixture-correction).
 
-Configured16 is **UNPROVEN**, pending one fixed exact-revision hosted attempt
-and independent bound verification of every unchanged before-source, terminal,
-positive-kernel-counter, failed/empty-snapshot, online-source and cleanup gate.
+Configured16 was unproven at selection. Its first fixed hosted attempt passed
+on `e886bef`, run `40379260708`: 18 emitted samples at16MiB, kernel oom_kill
+maximum1, terminal OOMKilled=true/Running=false/PID0, intent-only ownership and
+no source execution, failed-not-complete/empty snapshots, online source and
+exact cleanup. The independent bound audit verifies artifacts and emitted
+resource consistency; unavailable private raw inputs were not rerun offline.
 The same ordinary image,2CPU/production512MiB defaults,200000-row workload,
 fresh empty native128MiB repository, ordinary swap policy and20s/3s/45s windows
 are unchanged. No cap ladder, retry-until-lucky, injected allocator or weakened
 predicate is introduced. Active512→16 injection and repository ENOSPC remain
-separate unchanged evidence; neither proves configured-early16 or supported
-active-export sizing. No new runtime PASS is claimed by this correction.
+separate unchanged evidence; neither substitutes for the configured-early16
+experiment or proves supported active-export sizing. See the [bounded PASS
+and audit limits](../tests/integration/RELEASE_GATE_LEDGER.md#current-bounded-hosted-pass).
 
 ## Remaining acceptance boundary
 

@@ -46,10 +46,12 @@ All rows below executed on the exact R3 image/core; parent verifiers read back e
 | ENOSPC | Actual same-repository8MiB tmpfs exhaustion; observed errno28 through failed backup; failed-not-complete/terminal proof/bounded recovery; snapshots[] after only owned filler removed | Real disk pressure within owned tmpfs, not host disk exhaustion |
 | Historical configured low-cap OOM | Actual32MiB worker limit and early-intent oom_kill=1/OOMKilled; no source dump/session, failed result/snapshots[] | Historical failure-safety only;32MiB not supported success sizing or active-export proof |
 
-Current fixture addendum: configured-early32→fixed16MiB is an explicit replacement
-candidate, **UNPROVEN** pending one fixed hosted attempt and independent exact
-revision/source/image/daemon/artifact-bound verification. Historical32 attempts
-are not relabeled. Production2CPU/512MiB, active512→16 injection, ENOSPC,
+Current fixture addendum: configured-early32→fixed16MiB was explicitly selected
+as an unproven replacement. Its first fixed hosted attempt passed at `e886bef`,
+run `40379260708`, with independent exact-revision/source/image/daemon/artifact
+audit. Offline resource verification is limited to emitted public evidence,
+not unavailable private raw inputs. Historical32 attempts are not relabeled.
+Production2CPU/512MiB, active512→16 injection, ENOSPC,
 workload, ordinary swap policy, deadlines and substantive proof gates are
 unchanged; see the [current rationale and preserved failures](RELEASE_GATE_LEDGER.md#configured-early-oom-fixture-correction).
 
