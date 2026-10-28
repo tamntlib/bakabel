@@ -68,4 +68,49 @@ def main():
     out={'mode':r['mode'],'verified_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'gates':r['gates'],'source_sha256':core.hexdigest(),'image':image,'failure_proof':proof,'timing':timing,'effective_memory_max_values':sorted({x.get('memory.max') for x in rows}),'restic_effective_GOMAXPROCS':sorted({v for x in env for v in x['GOMAXPROCS']}),'exact_cleanup_readback':True,'files':{n:sha(a.runtime/n) for n in ['receipt.json','metrics.json','executed_failure_probe.py']},'limits':'Physical block I/O unavailable; sampled peaks not universal RAM bounds. Mid-run OOM is explicitly an injected Engine update during source lock-wait; short process birth-to-pin affinity gaps remain.'}
     a.output.write_text(json.dumps(out,indent=2)+'\n');print(json.dumps(out,indent=2))
 
-if __name__=='__main__':main()
+# This vocabulary is diagnostic only. The original verifier above remains the
+# sole acceptance authority; never evaluate it twice to obtain a failure reason.
+DIAGNOSTIC_MARKER='BAKABEL_RESOURCE_VERIFIER_V1 '
+DIAGNOSTIC_PROGRAMS=('run_resource_failures.py','run_resource_probe.py','verify_resource_failures.py')
+DIAGNOSTIC_FUNCTIONS={'verify_resource_failures.py':{'main':(17,69),'epoch':(8,8),'assert_bounded_recovery':(10,15)},
+                      'run_resource_failures.py':{'assert_failure_proof':(199,204),'is_write_enospc':(99,104)}}
+DIAGNOSTIC_ERRORS=('AssertionError','OSError','FileNotFoundError','PermissionError','TimeoutError',
+                   'RuntimeError','ValueError','KeyError','TypeError','IndexError','StopIteration',
+                   'JSONDecodeError','UnicodeDecodeError')
+
+
+def diagnostic_program_sha256():
+    digest=hashlib.sha256()
+    for name in DIAGNOSTIC_PROGRAMS:
+        digest.update(name.encode()+b'\0'+bytes.fromhex(sha(Path(__file__).parent/name)))
+    return digest.hexdigest()
+
+
+def diagnostic_descriptor(error,runtime):
+    frame=None;tb=error.__traceback__;count=0
+    while tb is not None and count<64:
+        code=tb.tb_frame.f_code;count+=1
+        for name,functions in DIAGNOSTIC_FUNCTIONS.items():
+            bounds=functions.get(code.co_name)
+            if code.co_filename==str(Path(__file__).parent/name) and bounds and bounds[0]<=tb.tb_lineno<=bounds[1]:
+                frame={'file':name,'function':code.co_name,'line':tb.tb_lineno}
+        tb=tb.tb_next
+    if tb is not None:frame=None
+    kind=type(error).__name__
+    return {'schema_version':1,'error_class':kind if kind in DIAGNOSTIC_ERRORS else None,'frame':frame,
+            'program_sha256':diagnostic_program_sha256(),'raw_receipt_sha256':sha(runtime/'receipt.json')}
+
+
+def cli():
+    try:main()
+    except Exception as error:
+        try:
+            import sys
+            # Only the parent's fixed CLI shape is needed for the private binding.
+            runtime=Path(sys.argv[sys.argv.index('--runtime')+1])
+            print(DIAGNOSTIC_MARKER+json.dumps(diagnostic_descriptor(error,runtime),separators=(',',':')),file=sys.stderr)
+        except Exception:pass  # A diagnostic must not replace the original error.
+        raise
+
+
+if __name__=='__main__':cli()

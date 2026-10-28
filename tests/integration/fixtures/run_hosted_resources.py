@@ -455,6 +455,44 @@ def verify_cleanup(raw,args,engine):
     assert engine.call('GET','/containers/json?all=true')==[]
 
 
+def public_independent_verifier(result,raw_receipt_sha256,program_sha256):
+    """Closed, bounded diagnostic only. Never copy child text or grant acceptance."""
+    code=result.returncode
+    binding=raw_receipt_sha256 if isinstance(raw_receipt_sha256,str) and re.fullmatch(r'[0-9a-f]{64}',raw_receipt_sha256) else None
+    out={'status':'unavailable','child_exit_code':code if type(code) is int and 0<=code<=255 else None,
+         'program_sha256':program_sha256 if isinstance(program_sha256,str) and re.fullmatch(r'[0-9a-f]{64}',program_sha256) else None,'raw_receipt_sha256':binding,
+         'error_class':None,'frame':None}
+    try:
+        from verify_resource_failures import DIAGNOSTIC_MARKER,DIAGNOSTIC_ERRORS,DIAGNOSTIC_FUNCTIONS,diagnostic_program_sha256
+        if out['program_sha256'] is None or diagnostic_program_sha256()!=out['program_sha256']:return out
+        # This CLI re-raises ordinary Exceptions (Python exit 1), not SystemExit.
+        if type(code) is not int or code!=1 or binding is None:return out
+        stderr=result.stderr;stdout=result.stdout;marker=DIAGNOSTIC_MARKER
+        if (not isinstance(stderr,str) or not isinstance(stdout,str) or
+            len(stderr.encode())>65536 or len(stdout.encode())>65536 or
+            not stderr.startswith(marker) or stderr.count(marker)!=1 or marker in stdout):return out
+        line,separator,_=stderr.partition('\n')
+        if not separator or len(line.encode())>1024:return out
+        def closed_object(pairs):
+            value=dict(pairs)
+            if len(value)!=len(pairs):raise ValueError('duplicate diagnostic key')
+            return value
+        value=json.loads(line[len(marker):],object_pairs_hook=closed_object)
+        if not isinstance(value,dict) or set(value)!={'schema_version','error_class','frame','program_sha256','raw_receipt_sha256'}:return out
+        if type(value['schema_version']) is not int or value['schema_version']!=1:return out
+        if value['program_sha256']!=out['program_sha256'] or value['raw_receipt_sha256']!=raw_receipt_sha256:return out
+        if not isinstance(value['error_class'],str) or value['error_class'] not in DIAGNOSTIC_ERRORS:return out
+        frame=value['frame']
+        if not isinstance(frame,dict) or set(frame)!={'file','function','line'}:return out
+        if not isinstance(frame['file'],str) or not isinstance(frame['function'],str):return out
+        bounds=DIAGNOSTIC_FUNCTIONS.get(frame['file'],{}).get(frame['function'])
+        if not bounds or type(frame['line']) is not int or not bounds[0]<=frame['line']<=bounds[1]<=10000:return out
+        out.update(status='observed',error_class=value['error_class'],frame={k:frame[k] for k in ('file','function','line')})
+    except Exception:pass  # Diagnostic I/O/parsing must not replace the fatal child exit.
+    return out
+
+
+
 def run_case(args,case,engine):
     args=copy.copy(args);args.runtime=args.runtime/case;args.platform='resources-'+case
     for key,value in case_settings(case).items():setattr(args,key,value)
@@ -493,8 +531,16 @@ def run_case(args,case,engine):
         else:verifier='verify_resource_failures.py'
         if verifier:
             command=[sys.executable,str(Path(__file__).parent/verifier),'--runtime',str(directory),'--source',str(args.source),'--output',str(directory/'verified.json'),'--expected-source-sha256',args.expected_source_sha256,'--expected-image-id',args.expected_image_id]
+            program_sha256=None
+            if verifier=='verify_resource_failures.py':
+                try:
+                    from verify_resource_failures import diagnostic_program_sha256
+                    program_sha256=diagnostic_program_sha256()
+                except Exception:pass  # Still run the original verifier exactly once.
             result=subprocess.run(command,text=True,capture_output=True)
             (directory/'verification.log').write_text(result.stdout+result.stderr)
+            if verifier=='verify_resource_failures.py' and result.returncode:
+                public['independent_verifier']=public_independent_verifier(result,public['raw_receipt_sha256'],program_sha256)
             if result.returncode:raise ValueError('independent resource verifier failed')
             public['verifier_sha256']=sha(directory/'verified.json')
         if case!='scheduler':

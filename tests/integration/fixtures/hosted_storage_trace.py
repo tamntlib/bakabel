@@ -1,6 +1,7 @@
 """Host-only numeric syscall receipts. Never persist strace output or payloads."""
 import re
 import os
+import hashlib
 from pathlib import Path
 import signal
 import subprocess
@@ -49,6 +50,37 @@ class WriteStream:
         if self.pending: raise ValueError('trace_incomplete')
 
 
+def reader_failure(error,phase,counters=None):
+    """Finite observer diagnostics only; never makes an uncertain write valid."""
+    kinds={FileNotFoundError:'FileNotFoundError',ProcessLookupError:'ProcessLookupError',
+        PermissionError:'PermissionError',OSError:'OSError',ValueError:'ValueError',
+        StopIteration:'StopIteration',IndexError:'IndexError',TypeError:'TypeError',
+        RuntimeError:'RuntimeError',TimeoutError:'TimeoutError'}
+    number=error.errno if type(error) in (FileNotFoundError,ProcessLookupError,
+        PermissionError,OSError,TimeoutError) else None
+    result={'phase':phase if type(phase) is str and phase in
+        ('read','parse','writer_binding','failure_binding') else None,
+        'kind':kinds.get(type(error)),
+        'errno':number if type(number) is int and 0<=number<=4095 else None,
+        'function':None,'line':None}
+    frame=BaseException.__getattribute__(error,'__traceback__')
+    for _ in range(32):
+        if frame is None:break
+        code=frame.tb_frame.f_code
+        if code.co_filename==__file__ and code.co_name in (
+                'consume','writer_binding','feed','project_write','project_failure'):
+            result['function']=code.co_name
+            result['line']=frame.tb_lineno if 0<frame.tb_lineno<=1000000 else None
+        frame=frame.tb_next
+    try:result['program_sha256']=hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+    except OSError:result['program_sha256']=None
+    values=counters if type(counters) is dict else {}
+    result['counters']={key:values.get(key) if type(values.get(key)) is int and
+        0<=values[key]<=10000 else None for key in ('lines','paired','parsed_failures',
+        'parse_rejected','path_unmatched','setup_failures','write_other_errno')}
+    return result
+
+
 class WriteTrace:
     """Attach only to caller-verified owned PIDs; never signal the tracee.
 
@@ -61,6 +93,7 @@ class WriteTrace:
             raise ValueError('invalid trace identity')
         self.pids=list(dict.fromkeys(pids)); self.path_kind=path_kind
         self.writes=[]; self.errors=[]; self.attached=False; self.proc=None
+        self.reader_failure=None
         self.authority=authority
         self.diagnose_setup=diagnose_setup; self.failures=[]; self.diagnostics={}
         self.identities={p:Path(f'/proc/{p}/stat').read_text().rsplit(')',1)[1].split()[19] for p in self.pids}
@@ -114,8 +147,10 @@ class WriteTrace:
         def consume():
             count=0; projector=WriteStream(self.pids[0],self.path_kind)
             self.diagnostics=projector.diagnostics
+            phase='read'
             try:
                 while True:
+                    phase='read'
                     raw=self.proc.stderr.readline(4097)
                     if not raw:
                         try: projector.finish()
@@ -126,21 +161,26 @@ class WriteTrace:
                         if not self.errors: self.errors.append('trace_bound')
                         continue
                     line=raw.decode('utf-8',errors='replace').strip()
+                    phase='parse'
                     row=projector.feed(line)
                     if row is not None:
+                        phase='writer_binding'
                         row['writer']=self.writer_binding(row['pid'])
                         if len(self.writes)<128: self.writes.append(row)
                         elif not self.errors: self.errors.append('trace_bound')
                     if self.diagnose_setup and projector.failure is not None and row is None:
                         failure=projector.failure
                         if failure['path_kind'] is not None:
+                            phase='failure_binding'
                             failure['writer']=self.writer_binding(failure['pid'])
                             if len(self.failures)<128: self.failures.append(failure)
                             elif not self.errors: self.errors.append('trace_bound')
                     if line.startswith('strace:') and not self.errors:
                         self.errors.append('trace_protocol')
-            except Exception:
+            except Exception as error:
                 self.errors.append('trace_reader')
+                try:self.reader_failure=reader_failure(error,phase,self.diagnostics)
+                except Exception:self.reader_failure=None  # Optional detail cannot erase the fatal error.
         self.thread=threading.Thread(target=consume,name='owned-write-trace',daemon=True); self.thread.start()
         end=time.monotonic()+3
         try:
@@ -178,6 +218,7 @@ class WriteTrace:
         result={'root_pids':self.pids,'start_ticks':self.identities,'attached':self.attached,
                 'errors':self.errors,'writes':self.writes,'quiescent':True}
         if self.diagnose_setup: result.update(diagnostics=self.diagnostics,failures=self.failures)
+        if self.reader_failure is not None:result['reader_failure']=self.reader_failure
         return result
 
 

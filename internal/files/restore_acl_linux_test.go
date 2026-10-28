@@ -174,6 +174,21 @@ func realRootACLRoundTrip(t *testing.T, sourceACL, targetACL bool) {
 		t.Fatal(all, e)
 	}
 	s := all[0]
+	// Allocate the independent empty target while the source inode is still
+	// live. CI's overlayfs may immediately recycle an unlinked source inode,
+	// which the unchanged conservative alias guard must correctly reject.
+	dest := filepath.Join(root, "restore")
+	if e := os.Mkdir(dest, 0700); e != nil {
+		t.Fatal(e)
+	}
+	var emptyTarget syscall.Stat_t
+	if e := syscall.Stat(dest, &emptyTarget); e != nil {
+		t.Fatal(e)
+	}
+	if emptyTarget.Dev == wantStat.Dev && emptyTarget.Ino == wantStat.Ino {
+		t.Fatal("fixture destination is not physically independent")
+	}
+	t.Logf("live source and empty target have distinct identities: source=%d/%d target=%d/%d", wantStat.Dev, wantStat.Ino, emptyTarget.Dev, emptyTarget.Ino)
 	if e := os.RemoveAll(source); e != nil {
 		t.Fatal(e)
 	}
@@ -190,10 +205,6 @@ func realRootACLRoundTrip(t *testing.T, sourceACL, targetACL bool) {
 		}
 	}
 	t.Logf("original source gone; native Restic exact snapshot=%s access=%x default=%x", s.ID, wantAccess, wantDefault)
-	dest := filepath.Join(root, "restore")
-	if e := os.Mkdir(dest, 0700); e != nil {
-		t.Fatal(e)
-	}
 	if targetACL {
 		stale := testACL()
 		aclBinary.LittleEndian.PutUint32(stale[16:], 2222)

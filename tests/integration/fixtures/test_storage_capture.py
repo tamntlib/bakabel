@@ -498,6 +498,118 @@ class RelayPathOwnershipTests(unittest.TestCase):
 
 
 class TraceDiagnosticTests(unittest.TestCase):
+    def test_read_and_parse_failures_report_the_actual_finite_phase(self):
+        import io
+        import os
+        from unittest.mock import Mock,patch
+        import hosted_storage_trace as trace
+        class BrokenRead(io.BytesIO):
+            def readline(self,*args):raise OSError(5,'PRIVATE-READ')
+        for raw,phase,kind,number,function in (
+                (BrokenRead(),'read','OSError',5,'consume'),
+                (io.BytesIO(b'[pid 12] <... write resumed>) = -1 ENOSPC (No space left on device)\n'),
+                 'parse','ValueError',None,'feed')):
+            with self.subTest(phase=phase):
+                t=trace.WriteTrace([os.getpid()],lambda path:'restore_output')
+                proc=Mock(pid=999,stderr=raw);proc.poll.return_value=0;proc.returncode=0
+                with patch.object(trace.subprocess,'Popen',return_value=proc):
+                    with self.assertRaises(ValueError):t.start()
+                value=t.receipt()
+                self.assertEqual(value['errors'],['trace_reader'])
+                self.assertEqual(value['writes'],[])
+                detail=value['reader_failure']
+                self.assertEqual((detail['phase'],detail['kind'],detail['errno'],detail['function']),
+                    (phase,kind,number,function))
+                self.assertNotIn('PRIVATE',json.dumps(value))
+
+    def test_reader_failure_projection_rejects_unknown_and_malformed_numbers(self):
+        import hosted_storage_trace as trace
+        for number in (True,-1,4096,'PRIVATE',None):
+            with self.subTest(number=number):
+                value=trace.reader_failure(OSError(number,'PRIVATE'),True,
+                    {'lines':1,'paired':True,'parsed_failures':-1,'parse_rejected':10001,
+                     'path_unmatched':'PRIVATE','setup_failures':0,'write_other_errno':2,'PRIVATE':'PRIVATE'})
+                self.assertIsNone(value['errno']);self.assertIsNone(value['phase'])
+                self.assertEqual(value['counters'],{'lines':1,'paired':None,'parsed_failures':None,
+                    'parse_rejected':None,'path_unmatched':None,'setup_failures':0,'write_other_errno':2})
+                self.assertEqual(set(value),{'phase','kind','errno','function','line','program_sha256','counters'})
+                self.assertNotIn('PRIVATE',json.dumps(value))
+
+    def test_missing_program_hash_does_not_replace_the_reader_failure(self):
+        from unittest.mock import patch
+        import hosted_storage_trace as trace
+        with patch.object(trace.Path,'read_bytes',side_effect=PermissionError(13,'PRIVATE')):
+            value=trace.reader_failure(FileNotFoundError(2,'PRIVATE'),'writer_binding')
+        self.assertIsNone(value['program_sha256'])
+        self.assertEqual(value['kind'],'FileNotFoundError');self.assertEqual(value['errno'],2)
+        self.assertNotIn('PRIVATE',json.dumps(value))
+
+    def test_reader_failure_detail_does_not_override_storage_rejection(self):
+        import copy
+        from test_hosted_storage_prereqs import synthetic
+        from verify_hosted_storage_prereqs import verify_case
+        baseline=synthetic();verify_case(baseline)
+        row=copy.deepcopy(baseline)
+        row['storage']['trace']['reader_failure']={'phase':'writer_binding','kind':None}
+        verify_case(row)  # Diagnostic fields are not acceptance authority.
+        row['storage']['trace']['errors']=['trace_reader']
+        with self.assertRaises(ValueError):verify_case(row)
+
+    def test_diagnostic_failure_cannot_erase_original_reader_error(self):
+        import io
+        import os
+        from unittest.mock import Mock, patch
+        import hosted_storage_trace as trace
+        t=trace.WriteTrace([os.getpid()],lambda path:'restore_output')
+        t.writer_binding=Mock(side_effect=FileNotFoundError(2,'PRIVATE'))
+        raw=b'pwrite64(4</PRIVATE>, ""..., 1, 0) = -1 ENOSPC (No space left on device)\n'
+        proc=Mock(pid=999,stderr=io.BytesIO(raw));proc.poll.return_value=0;proc.returncode=0
+        with patch.object(trace.subprocess,'Popen',return_value=proc),\
+                patch.object(trace,'reader_failure',side_effect=RuntimeError('PRIVATE-DIAGNOSTIC')):
+            with self.assertRaises(ValueError):t.start()
+        result=t.receipt()
+        self.assertEqual(result['errors'],['trace_reader'])
+        self.assertEqual(result['writes'],[])
+        self.assertNotIn('reader_failure',result)
+
+    def test_reader_failure_has_bound_program_and_finite_counters(self):
+        import hashlib
+        import hosted_storage_trace as trace
+        class PrivateError(Exception):
+            def __str__(self):raise AssertionError('private text must not be inspected')
+        value=trace.reader_failure(PrivateError('PRIVATE'), 'PRIVATE')
+        self.assertIsNone(value['phase']);self.assertIsNone(value['kind'])
+        self.assertIsNone(value['errno']);self.assertIsNone(value['function'])
+        self.assertIsNone(value['line'])
+        self.assertEqual(value.get('program_sha256'),hashlib.sha256(Path(trace.__file__).read_bytes()).hexdigest())
+        self.assertEqual(value.get('counters'),dict.fromkeys(('lines','paired','parsed_failures',
+            'parse_rejected','path_unmatched','setup_failures','write_other_errno')))
+        self.assertLess(len(json.dumps(value)),1024)
+        self.assertNotIn('PRIVATE',json.dumps(value))
+
+    def test_reader_failure_keeps_fatal_error_and_safe_phase(self):
+        import io
+        import os
+        from unittest.mock import Mock, patch
+        import hosted_storage_trace as trace
+        t=trace.WriteTrace([os.getpid()],lambda path:'restore_output')
+        t.writer_binding=Mock(side_effect=FileNotFoundError(2,'PRIVATE-MESSAGE','/PRIVATE-PATH'))
+        raw=b'pwrite64(4</PRIVATE-PATH>, ""..., 1, 0) = -1 ENOSPC (No space left on device)\n'
+        proc=Mock(pid=999,stderr=io.BytesIO(raw));proc.poll.return_value=0;proc.returncode=0
+        with patch.object(trace.subprocess,'Popen',return_value=proc):
+            with self.assertRaises(ValueError):t.start()  # Protocol-only control, not native attachment.
+        result=t.receipt()
+        self.assertIn('trace_reader',result['errors'])
+        self.assertEqual(result['writes'],[])
+        self.assertIn('reader_failure',result,'reader exception was discarded')
+        detail=result['reader_failure']
+        self.assertEqual(detail['phase'],'writer_binding')
+        self.assertEqual(detail['kind'],'FileNotFoundError')
+        self.assertEqual(detail['errno'],2)
+        self.assertEqual(detail['function'],'consume')
+        self.assertIs(type(detail['line']),int)
+        self.assertNotIn('PRIVATE',json.dumps(result))
+
     def test_native_deleted_fd_suffix_is_a_literal_enospc_write_receipt(self):
         from hosted_storage_trace import WriteStream
         # Sanitized strace 6.8 owned-file format: deletion is OUTSIDE <path>.

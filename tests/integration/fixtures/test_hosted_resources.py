@@ -1116,4 +1116,220 @@ class HostedResources(unittest.TestCase):
         engine.assert_not_called()
 
 
+class IndependentVerifierDiagnostics(unittest.TestCase):
+    """Owned offline child processes; never hosted runtime acceptance evidence."""
+    def run_child_case(self, raw, child_result=None, case='enospc'):
+        import json,tempfile
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        import run_hosted_resources as hosted
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);target=root/case;target.mkdir()
+            receipt=target/'receipt.json';receipt.write_text(json.dumps(raw));before=receipt.read_bytes()
+            (target/'metrics.json').write_text('{}')
+            source=Path(hosted.__file__).resolve().parents[3]
+            args=SimpleNamespace(runtime=root,source=source,expected_source_sha256='d'*64,expected_image_id='candidate')
+            import contextlib
+            run=None
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch.object(hosted,'run_platform',return_value={'failed':False}))
+                stack.enter_context(patch.object(hosted,'verify_cleanup'))
+                if child_result is not None:
+                    run=stack.enter_context(patch.object(hosted.subprocess,'run',return_value=child_result))
+                public=hosted.run_case(args,case,None)
+                if child_result is not None:
+                    assert run is not None
+                    self.assertEqual(run.call_count,1)
+            self.assertEqual(receipt.read_bytes(),before)
+            self.assertEqual(json.loads((target/'public.json').read_text()),public)
+            return public,(target/'verification.log').read_text(),before
+
+    def test_parent_exit_is_exact_parent_owned_and_contradictions_are_unavailable(self):
+        import json
+        from types import SimpleNamespace
+        import run_hosted_resources as hosted
+        import verify_resource_failures as verifier
+        stderr=verifier.DIAGNOSTIC_MARKER+json.dumps(self.descriptor())+'\n'
+        for code in (0,1,2,255,256,-1,-9,True,False,1.0,None,'1','PRIVATE-CANARY',[],{}):
+            with self.subTest(code=code):
+                result=hosted.public_independent_verifier(SimpleNamespace(returncode=code,stderr=stderr,stdout=''),'a'*64,verifier.diagnostic_program_sha256())
+                self.assertEqual(result['status'],'observed' if type(code) is int and code==1 else 'unavailable')
+                self.assertEqual(result['child_exit_code'],code if type(code) is int and 0<=code<=255 else None)
+                self.assertNotIn('PRIVATE-CANARY',json.dumps(result))
+        for code in (1,2,255,-9):
+            # Missing/forged diagnostics cannot suppress or retry a failed child.
+            result=SimpleNamespace(returncode=code,stdout='PRIVATE-CANARY',stderr=stderr)
+            public,_,_=self.run_child_case({},result)
+            self.assertTrue(public['failed']);self.assertFalse(public['verified'])
+            self.assertNotIn('failure_safety',public);self.assertNotIn('verifier_sha256',public)
+            self.assertEqual(public['independent_verifier']['status'],'unavailable','foreign raw binding')
+            self.assertEqual(public['independent_verifier']['child_exit_code'],None if code<0 else code)
+
+    def test_child_descriptor_bounds_frames_and_unknown_values_without_exception_text(self):
+        import json,tempfile
+        from pathlib import Path
+        import verify_resource_failures as verifier
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory);(root/'receipt.json').write_text('{}')
+            def failure(code,filename):
+                namespace={};exec(compile(code,filename,'exec'),namespace)
+                try:namespace['main']()
+                except Exception as error:return error
+            unknown=failure('def main():\n    raise ValueError("PRIVATE-CANARY")',verifier.__file__)
+            foreign=failure('\n'*21+'def main():\n    raise ValueError("PRIVATE-CANARY")','/private/verify_resource_failures.py')
+            for error in (unknown,foreign):
+                value=verifier.diagnostic_descriptor(error,root)
+                self.assertIsNone(value['frame']);self.assertNotIn('PRIVATE-CANARY',json.dumps(value))
+            namespace={}
+            exec(compile('\n'*16+'def main():\n'+'    pass\n'*5+'    raise ValueError("PRIVATE-CANARY")',verifier.__file__,'exec'),namespace)
+            def nested(n):
+                if n:nested(n-1)
+                else:namespace['main']()
+            try:nested(65)
+            except Exception as error:
+                self.assertIsNone(verifier.diagnostic_descriptor(error,root)['frame'],'overlong traceback is not a partial location')
+            # A foreign exception class and message are not a new public enum.
+            self.assertIsNone(verifier.diagnostic_descriptor(type('PRIVATE-CANARY',(Exception,),{})('PRIVATE-CANARY'),root)['error_class'])
+
+    def test_parent_binding_inputs_fail_closed_without_canary_passthrough(self):
+        import json
+        from types import SimpleNamespace
+        import run_hosted_resources as hosted
+        import verify_resource_failures as verifier
+        for binding in (None,True,1,[],{},'PRIVATE-CANARY','a'*63,'A'*64,'g'*64):
+            with self.subTest(binding=binding):
+                descriptor={**self.descriptor(),'raw_receipt_sha256':binding}
+                result=hosted.public_independent_verifier(SimpleNamespace(returncode=1,stdout='',
+                    stderr=verifier.DIAGNOSTIC_MARKER+json.dumps(descriptor)+'\n'),binding,verifier.diagnostic_program_sha256())
+                self.assertEqual(result['status'],'unavailable')
+                self.assertIsNone(result['raw_receipt_sha256']);self.assertIsNone(result['frame'])
+                self.assertNotIn('PRIVATE-CANARY',json.dumps(result))
+
+    def test_cli_diagnostic_failure_preserves_original_exception_and_single_call(self):
+        import contextlib,io,tempfile,sys
+        from unittest.mock import patch
+        import verify_resource_failures as verifier
+        for failure in (AssertionError('PRIVATE-CANARY'),ValueError('PRIVATE-CANARY'),
+                        SystemExit(7),KeyboardInterrupt()):
+            with self.subTest(kind=type(failure).__name__),tempfile.TemporaryDirectory() as directory:
+                stderr=io.StringIO()
+                with patch.object(verifier,'main',side_effect=failure) as main,patch.object(sys,'argv',['verify','--runtime',directory]),patch.object(verifier,'diagnostic_descriptor',side_effect=OSError('PRIVATE-CANARY')) as diagnostic,contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(type(failure)) as caught:verifier.cli()
+                self.assertIs(caught.exception,failure);main.assert_called_once_with()
+                self.assertEqual(diagnostic.call_count,1 if isinstance(failure,Exception) else 0)
+                self.assertEqual(stderr.getvalue(),'')
+
+    def test_program_binding_reads_every_fixed_python_file_not_the_go_fingerprint(self):
+        import hashlib
+        from pathlib import Path
+        from unittest.mock import patch
+        import verify_resource_failures as verifier
+        real_sha=verifier.sha;folder=Path(verifier.__file__).parent
+        baseline=verifier.diagnostic_program_sha256()
+        for changed in verifier.DIAGNOSTIC_PROGRAMS:
+            def changed_sha(path):return '0'*64 if path.name==changed else real_sha(path)
+            with self.subTest(file=changed),patch.object(verifier,'sha',side_effect=changed_sha) as read:
+                actual=verifier.diagnostic_program_sha256()
+                self.assertNotEqual(actual,baseline)
+                self.assertEqual([c.args[0] for c in read.call_args_list],[folder/name for name in sorted(verifier.DIAGNOSTIC_PROGRAMS)])
+                expected=hashlib.sha256()
+                for name in sorted(verifier.DIAGNOSTIC_PROGRAMS):expected.update(name.encode()+b'\0'+bytes.fromhex(changed_sha(folder/name)))
+                self.assertEqual(actual,expected.hexdigest())
+        # Finite location bounds refer to actual source functions, not arbitrary lines.
+        import ast
+        for name,functions in verifier.DIAGNOSTIC_FUNCTIONS.items():
+            tree=ast.parse((folder/name).read_text())
+            for function,bounds in functions.items():
+                node=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name==function)
+                self.assertEqual(bounds,(node.lineno,node.end_lineno))
+
+    def test_parent_binds_program_before_launch_and_change_only_hides_diagnostic(self):
+        import hashlib,json
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        import verify_resource_failures as verifier
+        good=self.descriptor();good['raw_receipt_sha256']=hashlib.sha256(b'{}').hexdigest()
+        result=SimpleNamespace(returncode=1,stdout='',stderr=verifier.DIAGNOSTIC_MARKER+json.dumps(good)+'\n')
+        for sequence in ([good['program_sha256'],'e'*64],[OSError('PRIVATE-CANARY'),good['program_sha256']]):
+            with self.subTest(sequence=str(sequence)),patch.object(verifier,'diagnostic_program_sha256',side_effect=sequence):
+                public,_,_=self.run_child_case({},result)
+                self.assertEqual(public['independent_verifier']['status'],'unavailable')
+                self.assertIsNone(public['independent_verifier']['frame'])
+                self.assertTrue(public['failed']);self.assertFalse(public['verified'])
+                self.assertNotIn('PRIVATE-CANARY',json.dumps(public))
+
+    def descriptor(self):
+        import verify_resource_failures as verifier
+        return {'schema_version':1,'error_class':'AssertionError',
+                'frame':{'file':'verify_resource_failures.py','function':'main','line':23},
+                'program_sha256':verifier.diagnostic_program_sha256(),'raw_receipt_sha256':'a'*64}
+
+    def test_parent_rejects_nonclosed_ambiguous_foreign_and_unbounded_transport(self):
+        import copy,json
+        from types import SimpleNamespace
+        import run_hosted_resources as hosted
+        import verify_resource_failures as verifier
+        marker=verifier.DIAGNOSTIC_MARKER;good=self.descriptor()
+        def wire(value):return marker+json.dumps(value,separators=(',',':'))+'\n'
+        valid=wire(good)
+        cases=[('missing','',''),('duplicate',valid*2,''),('stdout','',valid),
+               ('stdout-duplicate',valid,valid),('oversize',valid+'x'*65537,''),
+               ('large-descriptor',marker+json.dumps({**good,'Env':['PRIVATE-CANARY']*1024})+'\n',''),
+               ('forged-in-traceback','Traceback:\n'+valid,''),('trailing-marker',valid+'PRIVATE-CANARY '+marker,''),
+               ('invalid-json',marker+'{\n',''),('non-object',marker+'[]\n',''),
+               ('duplicate-key',valid.replace('"schema_version":1','"schema_version":1,"schema_version":1'),''),
+               ('truncated',valid.rstrip('\n'),''),('extra-line',valid.rstrip('\n')+'junk\n','')]
+        for key in good:
+            missing=copy.deepcopy(good);del missing[key];cases.append(('missing-'+key,wire(missing),''))
+        for key,value in (('schema_version',True),('schema_version',2),('error_class',None),
+                          ('error_class','PRIVATE-CANARY'),('error_class',[]),('frame',None),
+                          ('program_sha256','b'*64),('raw_receipt_sha256','b'*64)):
+            cases.append((key,wire({**good,key:value}),''))
+        for key in ('Env','message','path','child_exit_code','status','frames'):
+            cases.append((key,wire({**good,key:'PRIVATE-CANARY'}),''))
+        for key,value in (('file','/private/verify_resource_failures.py'),('file','run_resource_probe.py'),
+                          ('function','PRIVATE-CANARY'),('line',True),('line',0),('line',-1),
+                          ('line',10001),('line',1.5),('line','23'),('line',71),('extra','PRIVATE-CANARY')):
+            cases.append(('frame-'+key,wire({**good,'frame':{**good['frame'],key:value}}),''))
+        cases.append(('frames-unbounded',wire({**good,'frame':[good['frame']]*100}),''))
+        for label,stderr,stdout in cases:
+            with self.subTest(case=label):
+                result=hosted.public_independent_verifier(SimpleNamespace(returncode=1,stderr=stderr,stdout=stdout),'a'*64,verifier.diagnostic_program_sha256())
+                self.assertEqual(result['status'],'unavailable')
+                self.assertIsNone(result['error_class']);self.assertIsNone(result['frame'])
+                self.assertNotIn('PRIVATE-CANARY',json.dumps(result))
+        self.assertEqual(hosted.public_independent_verifier(SimpleNamespace(returncode=1,stderr=valid+'PRIVATE-CANARY',stdout='PRIVATE-CANARY'),'a'*64,verifier.diagnostic_program_sha256())['status'],'observed')
+
+    def test_actual_cli_failure_reaches_closed_parent_boundary(self):
+        import hashlib,json
+        from pathlib import Path
+        import verify_resource_failures as verifier
+        public,private,raw=self.run_child_case({'error':'PRIVATE-CANARY'})
+        self.assertTrue(public['failed']);self.assertFalse(public['verified'])
+        diagnostic=public.get('independent_verifier')
+        self.assertIsNotNone(diagnostic,'original nonzero child loses its independent failure location')
+        self.assertEqual(set(diagnostic),{'status','child_exit_code','program_sha256','raw_receipt_sha256','error_class','frame'})
+        self.assertEqual(diagnostic['status'],'observed');self.assertEqual(diagnostic['child_exit_code'],1)
+        self.assertEqual(diagnostic['error_class'],'AssertionError')
+        self.assertEqual(diagnostic['frame'],{'file':'verify_resource_failures.py','function':'main','line':23})
+        self.assertEqual(diagnostic['raw_receipt_sha256'],hashlib.sha256(raw).hexdigest())
+        digest=hashlib.sha256();folder=Path(verifier.__file__).parent
+        for name in sorted(('verify_resource_failures.py','run_resource_failures.py','run_resource_probe.py')):
+            digest.update(name.encode()+b'\0'+hashlib.sha256((folder/name).read_bytes()).digest())
+        self.assertEqual(diagnostic['program_sha256'],digest.hexdigest())
+        self.assertIn('PRIVATE-CANARY',private)
+        self.assertNotIn('PRIVATE-CANARY',json.dumps(public))
+        # A marker smuggled through the original arbitrary assertion message is
+        # private traceback content, not a second authoritative descriptor.
+        forged=verifier.DIAGNOSTIC_MARKER+json.dumps({**self.descriptor(),'Env':['PRIVATE-CANARY']})
+        public,private,_=self.run_child_case({'error':'PRIVATE-CANARY\n'+forged})
+        self.assertTrue(public['failed']);self.assertFalse(public['verified'])
+        self.assertEqual(public['independent_verifier']['status'],'unavailable')
+        self.assertIsNone(public['independent_verifier']['frame'])
+        self.assertGreaterEqual(private.count(verifier.DIAGNOSTIC_MARKER),2)
+        self.assertNotIn('PRIVATE-CANARY',json.dumps(public))
+
+
+
 if __name__=='__main__':unittest.main()
