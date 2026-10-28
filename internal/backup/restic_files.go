@@ -6,16 +6,18 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 )
 
 // RestoreFiles is the low-level transport; callers MUST first enforce physical
 // identity/exclusions and hold an empty destination open (files.OpenRestore).
-// Restic 0.18.1 supports ID:subfolder, flattening exactly the one source root.
+// Restic 0.18.1's ID:subfolder omits the subfolder root's own metadata.
+// Restore its parent with an exact include so the source root remains a node.
 // ExtraFiles makes fd 3 survive exec. Bare /proc/self/fd/3 is NOT supported as
 // the restore root by 0.18.1 (it tries to unlink that symlink). The files package
 // creates a real .bakabel-restore child beneath the descriptor, then flattens
-// with renameat. That moves directory entries, not a copied/staged data stream.
+// the restored source node with renameat, without copying a data stream.
 func (r Repository) RestoreFiles(ctx context.Context, s Snapshot, target *os.File) error {
 	m, e := s.Restorable()
 	if e != nil {
@@ -44,7 +46,7 @@ func (r Repository) RestoreFiles(ctx context.Context, s Snapshot, target *os.Fil
 	if !found {
 		return errors.New("exact snapshot no longer present")
 	}
-	cmd := exec.CommandContext(ctx, r.Binary, "--no-cache", "restore", s.ID+":"+m.Paths[0], "--target", "/proc/self/fd/3/.bakabel-restore", "--verify", "--overwrite", "never")
+	cmd := exec.CommandContext(ctx, r.Binary, "--no-cache", "restore", s.ID+":"+filepath.Dir(m.Paths[0]), "--include", "/"+filepath.Base(m.Paths[0]), "--target", "/proc/self/fd/3/.bakabel-restore", "--verify", "--overwrite", "never")
 	cmd.Env = r.Env
 	cmd.ExtraFiles = []*os.File{target}
 	cmd.Stdout = io.Discard

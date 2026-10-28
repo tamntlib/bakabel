@@ -24,6 +24,14 @@ class DocumentationGuards(unittest.TestCase):
         mounted=re.search(r'-v "\$RUNNER_TEMP/restic:([^:"]+):ro"',workflow).group(1)
         self.assertEqual(configured,production)
         self.assertEqual(mounted,production)
+    def test_ci_runs_real_restic_root_acl_regressions(self):
+        workflow=(ROOT/'.github/workflows/ci.yaml').read_text()
+        configured=re.findall(r'-e BAKABEL_FILES_RESTIC=(\S+)',workflow)
+        mounted=re.findall(r'-v "\$RUNNER_TEMP/restic:([^:\"]+):ro"',workflow)
+        self.assertEqual(len(mounted),1, 'pinned Restic mount must be present once')
+        self.assertEqual(configured,mounted, 'real root ACL regressions must not be skipped in CI')
+        self.assertIn('go test -race -count=1 -v ./...',workflow)
+
     def test_credential_install_is_fail_closed(self):
         for case in ('fresh','existing','missing-input','dangling-symlink'):
             with self.subTest(case=case),tempfile.TemporaryDirectory(prefix='bakabel-doc-test-') as directory:

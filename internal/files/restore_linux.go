@@ -42,11 +42,19 @@ func (t *RestoreTarget) Restore(ctx context.Context, r backup.Repository) error 
 	if e = r.RestoreFiles(ctx, t.Snapshot, t.File); e != nil {
 		return e
 	}
-	fd, e := syscall.Openat(int(t.File.Fd()), child, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	containerFD, e := syscall.Openat(int(t.File.Fd()), child, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
 	if e != nil {
 		return e
 	}
-	staged := os.NewFile(uintptr(fd), child)
+	defer syscall.Close(containerFD)
+	// Restore the source as a directory node, not as Restic's metadata-free
+	// target root. Both levels stay pinned even if their pathnames are moved.
+	rootName := filepath.Base(t.Snapshot.Paths[0])
+	fd, e := syscall.Openat(containerFD, rootName, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0)
+	if e != nil {
+		return e
+	}
+	staged := os.NewFile(uintptr(fd), rootName)
 	defer staged.Close()
 	names, e := staged.Readdirnames(-1)
 	if e != nil {
@@ -74,18 +82,30 @@ func (t *RestoreTarget) Restore(ctx context.Context, r backup.Repository) error 
 	if e = syscall.Fstat(fd, &st); e != nil {
 		return e
 	}
+	acls, e := readRootACLs(fd)
+	if e != nil {
+		return e
+	}
 	for _, name := range names {
 		if e = syscall.Renameat(fd, name, int(t.File.Fd()), name); e != nil {
 			return e
 		}
 	}
+	if e = os.Remove("/proc/self/fd/" + strconv.Itoa(containerFD) + "/" + rootName); e != nil {
+		return e
+	}
 	if e = os.Remove("/proc/self/fd/" + strconv.FormatUint(uint64(t.File.Fd()), 10) + "/" + child); e != nil {
 		return e
 	}
+	// chown may clear special mode bits; chmod changes an access ACL's mask.
+	// Apply the exact ACLs last, including removal of stale destination ACLs.
 	if e = syscall.Fchown(int(t.File.Fd()), int(st.Uid), int(st.Gid)); e != nil {
 		return e
 	}
 	if e = syscall.Fchmod(int(t.File.Fd()), st.Mode&07777); e != nil {
+		return e
+	}
+	if e = acls.apply(int(t.File.Fd())); e != nil {
 		return e
 	}
 	return t.File.Sync()
