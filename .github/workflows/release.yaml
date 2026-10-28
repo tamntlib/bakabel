@@ -39,8 +39,6 @@ jobs:
       VERSION: ${{ inputs.version }}
       CI_RUN_ID: ${{ inputs.ci_run_id }}
       ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
-      DOCKER_CONFIG: ${{ runner.temp }}/bakabel-docker-auth
-      TMPDIR: ${{ runner.temp }}/bakabel-release-tmp
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -50,6 +48,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          export DOCKER_CONFIG="$RUNNER_TEMP/bakabel-docker-auth"
+          export TMPDIR="$RUNNER_TEMP/bakabel-release-tmp"
+          printf 'DOCKER_CONFIG=%s\nTMPDIR=%s\n' "$DOCKER_CONFIG" "$TMPDIR" >> "$GITHUB_ENV"
           install -d -m 0700 "$TMPDIR"
           python3 -B -m unittest discover -s tests -p test_release.py -v
           printf 'IMAGE=ghcr.io/%s\n' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
@@ -101,7 +102,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if test -d "$DOCKER_CONFIG"; then
+          if test -n "${DOCKER_CONFIG:-}" && test -d "$DOCKER_CONFIG"; then
             docker logout ghcr.io >/dev/null 2>&1 || true
             rm -rf -- "$DOCKER_CONFIG"
           fi

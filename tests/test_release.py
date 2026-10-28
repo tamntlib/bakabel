@@ -152,6 +152,33 @@ class ReleaseGuards(unittest.TestCase):
                             opener.error('http', request, None, status, 'redirect', headers)
                         followup.assert_not_called()
 
+    def test_runner_paths_are_initialized_at_step_runtime(self):
+        import re
+        import subprocess
+        import tempfile
+        import textwrap
+        workflow = (ROOT / '.github/workflows/release.yaml').read_text()
+        job_env = workflow.split('    env:\n', 1)[1].split('    steps:\n', 1)[0]
+        self.assertNotIn('runner.', job_env, 'runner context is unavailable in job-level env')
+        blocks = re.findall(r'(?m)^        run: \|\n((?:(?:          [^\n]*|)\n)+)', workflow)
+        init = textwrap.dedent(blocks[0]).split('python3 -B -m unittest', 1)[0]
+        cleanup = textwrap.dedent(blocks[-1])
+        with tempfile.TemporaryDirectory(prefix='release runner ') as directory:
+            runtime = Path(directory) / 'runner temp'; runtime.mkdir()
+            env_file = Path(directory) / 'github-env'
+            env = {k: v for k, v in os.environ.items() if k not in ('DOCKER_CONFIG', 'TMPDIR')}
+            env.update(RUNNER_TEMP=str(runtime), GITHUB_ENV=str(env_file))
+            result = subprocess.run(['bash', '-c', init], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(dict(line.split('=', 1) for line in env_file.read_text().splitlines()), {
+                'DOCKER_CONFIG': str(runtime / 'bakabel-docker-auth'),
+                'TMPDIR': str(runtime / 'bakabel-release-tmp'),
+            })
+            self.assertEqual((runtime / 'bakabel-release-tmp').stat().st_mode & 0o777, 0o700)
+            # Checkout or initialization failure must not make cleanup dereference an unset path.
+            result = subprocess.run(['bash', '-c', cleanup], env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_manual_workflow_publication_boundaries_and_shell_syntax(self):
         import re
         import subprocess
