@@ -780,7 +780,15 @@ class HostedCapacityTests(unittest.TestCase):
                     p.e.call('POST', '/volumes/create', {**good, **mutation})
                 self.assertFalse(any(method == 'POST' for method, path in calls))
 
+    def test_pg_protocol_double_does_not_depend_on_host_affinity(self):
+        from unittest.mock import patch
+        for affinity in ({0, 1, 2, 3}, {2, 3}):
+            with self.subTest(host_affinity=affinity), patch('os.sched_getaffinity', return_value=affinity) as host:
+                self.test_inherited_pg_create_keeps_request_and_cleans_exact_volume_once()
+                host.assert_not_called()
+
     def test_inherited_pg_create_keeps_request_and_cleans_exact_volume_once(self):
+        from unittest.mock import patch
         import run_hosted_capacity as c
         # Deterministic protocol double, not Docker acceptance evidence.
         with tempfile.TemporaryDirectory(dir=SCRATCH) as root:
@@ -789,7 +797,7 @@ class HostedCapacityTests(unittest.TestCase):
             p.prefix = 'owned-fixture';p.daemon = 'offline-daemon';p.image = 'offline-image'
             p.capacity = {'cleanup': {}};p.result = {};p.values = [];p.samples = []
             p.containers = {};p.volumes = [];p.roles = {};p.worker_records = {}
-            cid = 'a'*64;name = p.prefix+'-source-pg-data'
+            cid = 'a'*64;name = p.prefix+'-source-pg-data';source_pid = 424242
             calls = [];container = {};volume = {}
             class Lifecycle:
                 def call(self, method, path, body=None, **kwargs):
@@ -800,7 +808,7 @@ class HostedCapacityTests(unittest.TestCase):
                         return dict(volume)
                     if method == 'POST' and path.startswith('/containers/create?name='):
                         container.update(Id=cid, Name='/'+p.prefix+'-source-pg', Config=body,
-                            Mounts=[{'Type': 'volume', 'Name': name}], State={'Running': False, 'Pid': os.getpid()})
+                            Mounts=[{'Type': 'volume', 'Name': name}], State={'Running': False, 'Pid': source_pid})
                         return {'Id': cid}
                     if method == 'POST' and path.endswith('/start'): return None
                     if method == 'GET' and path == '/volumes/'+name: return dict(volume) if volume else None
@@ -813,7 +821,9 @@ class HostedCapacityTests(unittest.TestCase):
                 def inspect(self, *args, **kwargs): return dict(container) if container else None
                 def exec(self, *args, **kwargs): return {'exit': 0}
             p.e = Lifecycle()
-            self.assertEqual(p.startpg('source-pg', True), cid)
+            with patch('run_resource_probe.os.sched_getaffinity', return_value={0, 1}) as affinity:
+                self.assertEqual(p.startpg('source-pg', True), cid)
+            affinity.assert_called_once_with(source_pid)
             self.assertFalse(p.unresolved_creates)
             self.assertEqual(container['Config']['Image'], c.PG)
             self.assertEqual(container['Config']['Entrypoint'], ['sh', '-c'])
