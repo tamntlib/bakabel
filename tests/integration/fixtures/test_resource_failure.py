@@ -942,6 +942,122 @@ class FailureProof(unittest.TestCase):
                     self.assertGreaterEqual(probe.e.inspect.call_count,1 if terminal else 2)
                     self.assertLessEqual(probe.e.inspect.call_count,20)
 
+
+    def activation_capture_fixture(self,directory,*,oom=True,settle=False,complete=False):
+        """Owned regular files / synthetic Engine seam, never native OOM proof."""
+        import copy
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from run_resource_probe import sha
+        import run_resource_failures as module
+        probe,owner,worker,cg=self.cgroup_probe(directory)
+        probe.args=SimpleNamespace(memory_mib=16)
+        owner.update(phase='exec_started',status='active',sourceContainerID='c'*64,
+                     sourceStartedAt='2026-01-01T00:00:00Z',execID='d'*64)
+        worker['State'].update(StartedAt='2026-01-01T00:00:00Z',ExitCode=0,OOMKilled=False)
+        worker['HostConfig']={'Memory':16777216,'MemorySwap':16777216}
+        terminal=copy.deepcopy(worker);terminal['State'].update(Pid=0,Running=False,ExitCode=137,OOMKilled=oom)
+        probe.result.update(daemon=probe.daemon,active_before_failure=owner,
+            workers={owner['workerContainerID']:{**copy.deepcopy(worker),'runID':owner['runID']}},
+            failure_probe_sha256=sha(Path(module.__file__)))
+        probe.blocked=Mock(return_value=owner);probe.unlock=Mock();probe.arm_kernel_counter=Mock()
+        def update(*args):
+            if not complete:
+                (cg/'memory.max').unlink();(cg/'memory.swap.max').unlink()
+            if settle:probe.cgroup=Mock(return_value=None)
+            return {'Warnings':[]}
+        probe.e=SimpleNamespace(inspect=Mock(side_effect=[worker,worker,terminal] if settle else [worker,terminal]),call=Mock(side_effect=update))
+        return probe,owner,worker,cg
+
+    def test_activation_terminal_missing_limits_stays_fatal_but_public_state_is_available(self):
+        import json
+        from types import SimpleNamespace
+        import run_hosted_resources as hosted
+        for oom in (True,False):
+            with self.subTest(oom=oom),tempfile.TemporaryDirectory() as directory:
+                probe,owner,worker,cg=self.activation_capture_fixture(directory,oom=oom)
+                with self.assertRaisesRegex(AssertionError,'^effective_limits$'):probe.activate_oom('pg',owner)
+                probe.unlock.assert_not_called();self.assertEqual(probe.e.call.call_count,1)
+                self.assertEqual(probe.e.inspect.call_count,2)
+                target=Path(directory)/'oom-active';target.mkdir()
+                receipt=target/'receipt.json';receipt.write_text(json.dumps(probe.result));before=receipt.read_bytes()
+                with patch.object(hosted,'run_platform',return_value={'failed':True}):
+                    public=hosted.run_case(SimpleNamespace(runtime=Path(directory),expected_image_id=probe.image),'oom-active',None)
+                self.assertTrue(public['failed']);self.assertFalse(public['verified'])
+                capture=public['failure_diagnostics'].get('activation_readback')
+                self.assertIsNotNone(capture,'exact activation readback must reach saved public.json even on fatal assertion')
+                self.assertIs(capture['after']['OOMKilled'],oom)
+                self.assertEqual(capture['after']['Pid'],0)
+                self.assertEqual(capture['route'],'initial_terminal')
+                self.assertEqual(capture['returned']['memory.max'],{'status':'absent','value':None})
+                self.assertEqual(json.loads((target/'public.json').read_text()),public)
+                self.assertEqual(receipt.read_bytes(),before)
+
+    def test_activation_live_to_terminal_keeps_initial_inspect_separate_from_exact_return(self):
+        import copy
+        import run_hosted_resources as hosted
+        for settle in (False,True):
+            with self.subTest(settle=settle),tempfile.TemporaryDirectory() as directory:
+                probe,owner,worker,cg=self.activation_capture_fixture(directory,settle=settle)
+                # Deliberately older existing FD evidence: not post-update/atomic.
+                pinned={'container':owner['workerContainerID'],'observer_pid':123,'counter_status':'observed',
+                        'cpu.max':'200000 100000','memory.max':'536870912','memory.swap.max':'536870912','memory.events':'oom_kill 0'}
+                probe.result['kernel_counter_sample']=pinned
+                before=copy.deepcopy(pinned)
+                with self.assertRaisesRegex(AssertionError,'^effective_limits$'):probe.activate_oom('pg',owner)
+                capture=hosted.public_failure_diagnostics(probe.result,probe.image,probe.result['failure_probe_sha256'])['activation_readback']
+                self.assertEqual(capture['route'],'live_to_terminal' if settle else 'initial_terminal')
+                self.assertEqual(capture['returned']['observer_pid'],0)
+                self.assertEqual(capture['after']['Pid'],123 if settle else 0)
+                self.assertIs(capture['after']['OOMKilled'],False if settle else True)
+                self.assertEqual(capture['returned']['cpu_quota'],{'status':'decimal','value':200000})
+                self.assertEqual(capture['returned']['cpu_period'],{'status':'decimal','value':100000})
+                self.assertEqual(capture['returned']['unavailable_errno']['memory.max'],2)
+                self.assertIsNone(capture['returned']['cgroup_errno'])
+                self.assertEqual(capture['latest_existing_pinned_fd']['memory.max'],{'status':'decimal','value':536870912})
+                self.assertEqual(capture['latest_existing_pinned_fd']['oom_kill'],0)
+                self.assertEqual(capture['pinned_basis'],'latest_existing_not_postupdate_or_atomic')
+                self.assertFalse(capture['returned']['paired_16mib_no_swap'])
+                self.assertEqual(pinned,before,'capture must not mutate shared returned/kernel rows')
+                probe.unlock.assert_not_called();self.assertEqual(probe.e.inspect.call_count,3 if settle else 2)
+                self.assertEqual(probe.e.call.call_count,1)
+
+    def test_activation_capture_failure_never_replaces_original_acceptance_or_exception(self):
+        import copy
+        import run_resource_failures as module
+        from unittest.mock import Mock
+        for complete in (False,True):
+            for failure in (OSError(5,'PRIVATE-CANARY'),ValueError('PRIVATE-CANARY')):
+                with self.subTest(complete=complete,failure=type(failure).__name__),tempfile.TemporaryDirectory() as directory:
+                    probe,owner,worker,cg=self.activation_capture_fixture(directory,complete=complete)
+                    probe.capture_activation_readback=Mock(side_effect=failure)
+                    if complete:probe.activate_oom('pg',owner)
+                    else:
+                        with self.assertRaisesRegex(AssertionError,'^effective_limits$'):probe.activate_oom('pg',owner)
+                    self.assertEqual(probe.unlock.call_count,int(complete));self.assertNotIn('activation_readback',probe.result)
+                    self.assertEqual(probe.e.call.call_count,1);self.assertEqual(probe.e.inspect.call_count,2)
+        for settle in (False,True):
+            with self.subTest(complete_pair=True,settle=settle),tempfile.TemporaryDirectory() as directory:
+                probe,owner,worker,cg=self.activation_capture_fixture(directory,complete=True,settle=settle)
+                events=[];inspect=probe.e.inspect.side_effect
+                probe.e.inspect.side_effect=lambda *args,**kw:events.append('inspect') or next(inspect)
+                call=probe.e.call.side_effect
+                probe.e.call.side_effect=lambda *args,**kw:events.append('POST') or call(*args,**kw)
+                probe.unlock.side_effect=lambda pg:events.append('unlock')
+                capture=probe.capture_activation_readback
+                def no_new_io(after,row,active):
+                    before=copy.deepcopy(row)
+                    with patch.object(Path,'read_text',side_effect=AssertionError('new read forbidden')),patch.object(module.os,'pread',side_effect=AssertionError('new FD read forbidden')),patch.object(probe.e,'inspect',side_effect=AssertionError('new inspect forbidden')),patch.object(probe.e,'call',side_effect=AssertionError('new POST forbidden')):
+                        capture(after,row,active)
+                    self.assertEqual(row,before);events.append('capture')
+                probe.capture_activation_readback=no_new_io
+                probe.activate_oom('pg',owner)
+                self.assertEqual(events,['inspect','POST','inspect']+(['inspect'] if settle else [])+['capture','unlock'])
+                capture=probe.result['activation_readback']
+                self.assertTrue(capture['returned']['paired_16mib_no_swap'])
+                self.assertEqual(capture['returned']['memory.max']['value'],16777216)
+                self.assertEqual(capture['returned']['memory.swap.max']['value'],0)
+
     def test_oom_activation_reads_effective_no_swap_cap_before_unlock(self):
         from types import SimpleNamespace
         from unittest.mock import Mock

@@ -15,7 +15,7 @@ from urllib.parse import quote
 
 from run_compose_pg_acceptance import fingerprint
 from run_hosted_acceptance import require_hosted_daemon,run_platform
-from run_resource_failures import FailureProbe,observer_error_fields,is_write_enospc
+from run_resource_failures import FailureProbe,observer_error_fields,is_write_enospc,activation_binding,activation_fields
 from run_resource_probe import Engine,PG,Probe,kv_numbers,sha,utc
 from summarize_resource_probe import summarize
 from hosted_evidence import public_receipt
@@ -121,7 +121,34 @@ def public_scheduler_diagnostics(raw):
     return out
 
 
-def public_failure_diagnostics(raw):
+def public_activation_readback(raw,image,program):
+    """Bind a fixed typed projection, not an input-size bound on the raw receipt.
+
+    Reject unknown top-level keys without visiting their values. Nested extras
+    are ignored by activation_fields; only its bounded scalars are serialized.
+    """
+    try:
+        from run_resource_probe import worker_owned
+        value=raw.get('activation_readback');owner=raw.get('active_before_failure');daemon=raw.get('daemon')
+        keys={'after','returned','latest_existing_pinned_fd','route','pinned_basis','binding'}
+        if (not isinstance(value,dict) or len(value)>len(keys) or not value.keys()<=keys or
+            not isinstance(owner,dict) or len(owner)>13):return None
+        cid=owner.get('workerContainerID');run=owner.get('runID')
+        if (raw.get('mode')!='oom-active' or not isinstance(cid,str) or not re.fullmatch(r'[0-9a-f]{64}',cid) or
+            not isinstance(run,str) or not re.fullmatch(r'[0-9a-f]{32}',run) or
+            not isinstance(program,str) or not re.fullmatch(r'[0-9a-f]{64}',program) or raw.get('failure_probe_sha256')!=program):return None
+        binding=activation_binding(owner,image,daemon,program)
+        record=raw['workers'][cid]
+        if record.get('runID')!=run or not worker_owned(record,owner,image,daemon):return None
+        if value.get('binding')!=binding:return None
+        fields=activation_fields(value)
+        if fields is None:return None
+        out={**fields,'binding':binding}
+        return out if len(json.dumps(out).encode())<=8192 else None
+    except Exception:return None  # Never affect acceptance or the original failure.
+
+
+def public_failure_diagnostics(raw,image=None,program=None):
     """Small typed fault/readback receipt; no paths, errors, logs or Env."""
     value=raw.get('failure_diagnostics',{})
     if not isinstance(value,dict):value={}
@@ -139,6 +166,8 @@ def public_failure_diagnostics(raw):
         item=value.get(key);out[key]=item if isinstance(item,str) and item in allowed else None
     fields=scheduler_completion_fields({'targets':value.get('targets',[])})
     out['targets']=[] if fields is None else [{k:row[k] for k in ('failureCode','resticExitCode','resticReason')} for row in fields['targets']]
+    capture=public_activation_readback(raw,image,program)
+    if capture is not None:out['activation_readback']=capture
     out['observer_errors']={}
     for label,key in (('fast','fast_observer_errors'),('sampler','sampler_errors')):
         rows=raw.get(key,[]);count=raw.get(key+'_count',len(rows) if isinstance(rows,list) else None)
@@ -496,6 +525,10 @@ def public_independent_verifier(result,raw_receipt_sha256,program_sha256):
 def run_case(args,case,engine):
     args=copy.copy(args);args.runtime=args.runtime/case;args.platform='resources-'+case
     for key,value in case_settings(case).items():setattr(args,key,value)
+    program=None
+    if case=='oom-active':
+        try:program=sha(Path(__file__).with_name('run_resource_failures.py'))
+        except Exception:pass  # Diagnostic only; retain the original execution.
     row=run_platform(args,probe_class=HostedResourceProbe if case=='scheduler' else HostedFailureProbe)
     directory=args.runtime;raw=json.loads((directory/'receipt.json').read_text())
     # Bound the legacy shared projection too, before it touches untrusted rows.
@@ -506,7 +539,7 @@ def run_case(args,case,engine):
     if errors:public['sampler_diagnostics']=sampler
     public['raw_receipt_sha256']=sha(directory/'receipt.json')
     if case!='scheduler':
-        public['failure_diagnostics']=public_failure_diagnostics(raw)
+        public['failure_diagnostics']=public_failure_diagnostics(raw,getattr(args,'expected_image_id',None),program)
         terminal=raw.get('worker_terminal_before_recovery',raw.get('worker_last_inspect',{}))
         state=terminal.get('State',{});config=terminal.get('HostConfig',{})
         samples=raw.get('failure_cgroup_samples',[])

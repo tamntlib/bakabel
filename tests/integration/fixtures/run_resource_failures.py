@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Actual candidate PG-stream OOM/ENOSPC, exact owned rootless fixtures only."""
-import argparse, datetime, json, math, os, secrets, select, threading, time, traceback
+import argparse, datetime, hashlib, json, math, os, re, secrets, select, threading, time, traceback
 from pathlib import Path
 from run_resource_probe import Engine, Probe, PG, worker_owned, sha, utc, kv_numbers
 
@@ -212,7 +212,106 @@ def assert_oom_proof(rows,state):
     return max(observed)
 
 
+def activation_binding(owner,image,daemon,program):
+    """Digest the already admitted owner; no new I/O in activation."""
+    required={'workerContainerID','runID','workerName','daemonID','phase','status','sourceContainerID','sourceStartedAt','execID'}
+    optional={'workerStartAuthorized','targetID','execKind','importRunID'}
+    token=lambda value:isinstance(value,str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,128}',value)
+    if (not isinstance(owner,dict) or not required<=owner.keys()<=required|optional or
+        owner['phase']!='exec_started' or owner['status']!='active' or not token(image) or not token(daemon) or owner['daemonID']!=daemon or
+        any(not token(owner[key]) for key in ('workerContainerID','runID','workerName','sourceContainerID','execID')) or
+        any(key in owner and (not isinstance(owner[key],str) or (owner[key] and not token(owner[key]))) for key in ('targetID','importRunID')) or
+        ('workerStartAuthorized' in owner and type(owner['workerStartAuthorized']) is not bool) or
+        owner.get('execKind','') not in ('','dump') or owner.get('importRunID','')!=''):
+        raise ValueError('activation_binding')
+    stamp=owner['sourceStartedAt']
+    if not isinstance(stamp,str) or len(stamp)>64 or not re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,9})?(?:Z|[+-]\d\d:\d\d)',stamp):raise ValueError('activation_binding')
+    datetime.datetime.fromisoformat(stamp.replace('Z','+00:00'))
+    digest=lambda value:hashlib.sha256(value.encode()).hexdigest()
+    return {'container':owner['workerContainerID'],'run_id':owner['runID'],
+            'owner_sha256':digest(json.dumps(owner,sort_keys=True,separators=(',',':'))),
+            'image_sha256':digest(image),'daemon_sha256':digest(daemon),'failure_probe_sha256':program}
+
+
+def activation_uint(value,maximum=2**63-1):
+    return value if type(value) is int and 0<=value<=maximum else None
+
+
+def activation_limit(value):
+    status='absent' if value is None else 'invalid'
+    number=None
+    if isinstance(value,str):
+        if value in ('','max'):status='empty' if value=='' else 'max'
+        elif len(value)<=19 and value.isascii() and value.isdecimal():
+            number=activation_uint(int(value));status='decimal' if number is not None else 'invalid'
+    return {'status':status,'value':number}
+
+
+def activation_fields(value):
+    """Re-project the closed diagnostic at the public boundary too."""
+    if not isinstance(value,dict):return None
+    state=value.get('after',{});row=value.get('returned',{})
+    if not isinstance(state,dict) or not isinstance(row,dict):return None
+    out={'after':{key:state.get(key) if type(state.get(key)) is bool else None for key in ('Running','OOMKilled')},'returned':{}}
+    out['after'].update(Pid=activation_uint(state.get('Pid'),2**31-1),ExitCode=activation_uint(state.get('ExitCode'),255))
+    for label in ('returned','latest_existing_pinned_fd'):
+        row=value.get(label)
+        out[label]=None
+        if not isinstance(row,dict):continue
+        fields={}
+        for key in ('cpu_quota','cpu_period','memory.max','memory.swap.max','memory.current','memory.peak'):
+            item=row.get(key,{})
+            if not isinstance(item,dict):item={}
+            status=item.get('status');number=activation_uint(item.get('value'))
+            status=status if isinstance(status,str) and status in ('decimal','max','empty','invalid','absent') else None
+            if status=='decimal' and number is None:status='invalid'
+            fields[key]={'status':status,'value':number if status=='decimal' else None}
+        for key,maximum in (('observer_pid',2**31-1),('oom_kill',2**63-1),('cgroup_errno',4095)):
+            fields[key]=activation_uint(row.get(key),maximum)
+        status=row.get('counter_status')
+        fields['counter_status']=status if isinstance(status,str) and status in ('observed','unavailable') else None
+        errors=row.get('unavailable_errno',{})
+        fields['unavailable_errno']={key:activation_uint(errors.get(key),4095) if isinstance(errors,dict) else None
+            for key in ('cpu.max','memory.max','memory.swap.max','memory.current','memory.peak','memory.events')}
+        # Diagnostic only. Never consulted by activation or any verifier.
+        fields['paired_16mib_no_swap']=all(fields[key]=={'status':'decimal','value':number} for key,number in
+            (('cpu_quota',200000),('cpu_period',100000),('memory.max',16777216),('memory.swap.max',0)))
+        out[label]=fields
+    pid=out['after']['Pid'];returned=out['returned']['observer_pid']
+    out['route']='unavailable'
+    if pid==0:out['route']='initial_terminal'
+    elif pid is not None and pid>0 and returned is not None:
+        out['route']='live_to_terminal' if returned==0 else 'live_return_unspecified'
+    out['pinned_basis']='latest_existing_not_postupdate_or_atomic' if out['latest_existing_pinned_fd'] is not None else None
+    return out
+
+
+def activation_row(row):
+    """Project one exact row, never extrema, logs, timestamps or fallback limits."""
+    cpu=row.get('cpu.max');parts=cpu.split() if isinstance(cpu,str) and len(cpu)<=64 else []
+    bad=None if cpu is None else '' if cpu=='' else 'invalid'
+    events=row.get('memory.events');counter=None
+    if isinstance(events,str) and len(events)<=4096:
+        matches=[line.split() for line in events.splitlines() if line.split()[:1]==['oom_kill']]
+        if len(matches)==1 and len(matches[0])==2:counter=activation_limit(matches[0][1])['value']
+    return {**{key:activation_limit(row.get(key)) for key in ('memory.max','memory.swap.max','memory.current','memory.peak')},
+        'cpu_quota':activation_limit(parts[0] if len(parts)==2 else bad),
+        'cpu_period':activation_limit(parts[1] if len(parts)==2 else bad),
+        'observer_pid':row.get('observer_pid'),'counter_status':row.get('counter_status'),
+        'oom_kill':counter,'cgroup_errno':row.get('cgroup_errno'),'unavailable_errno':row.get('unavailable_errno',{})}
+
+
 class FailureProbe(Probe):
+    def capture_activation_readback(self,after,row,active):
+        assert row.get('container')==active['workerContainerID']
+        # One reference to the latest existing pinned-FD snapshot. No new reads,
+        # wait, history search, post-update ordering or atomic-pair claim.
+        pinned=self.result.get('kernel_counter_sample')
+        value={'after':after['State'],'returned':activation_row(row),
+            'latest_existing_pinned_fd':activation_row(pinned) if isinstance(pinned,dict) and pinned.get('container')==active['workerContainerID'] else None}
+        self.result['activation_readback']={**activation_fields(value),
+            'binding':activation_binding(active,self.image,self.daemon,self.result.get('failure_probe_sha256'))}
+
     def observer_errors(self,key):
         code='sampler_failure' if key=='sampler_errors' else 'observer_failure'
         return self.result.setdefault(key,_ObserverErrors(self.result,key,code))
@@ -444,6 +543,8 @@ class FailureProbe(Probe):
         assert worker_owned(after,active,self.image,self.daemon), 'worker_identity'
         config=after['HostConfig'];self.result['updated_worker_hostconfig']=config
         row=self.sample_failure_cgroup(after,active)
+        try:self.capture_activation_readback(after,row,active)
+        except Exception:pass  # Optional evidence must never replace the original guards/errors.
         def number(key):
             value=row.get(key,'')
             return int(value) if value.isdecimal() else None

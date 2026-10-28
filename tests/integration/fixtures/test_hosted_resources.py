@@ -4,6 +4,155 @@ import unittest
 
 
 class HostedResources(unittest.TestCase):
+    def test_activation_rejects_unknown_capture_without_serializing_its_values(self):
+        import json
+        from unittest.mock import patch
+        module=self.module();dumps=json.dumps
+        raw=json.loads(dumps({'activation_readback':{'discarded':{'Env':['x'*262144]}},
+                              'active_before_failure':{}}))
+        sizes=[]
+        def observed(value,*args,**kwargs):
+            result=dumps(value,*args,**kwargs);sizes.append(len(result.encode()));return result
+        with patch.object(module.json,'dumps',observed):
+            self.assertIsNone(module.public_activation_readback(raw,None,None))
+        self.assertLessEqual(max(sizes,default=0),8192,
+                             'untrusted discarded values serialized before rejection')
+
+    def test_activation_admitted_capture_serializes_only_fixed_typed_projection(self):
+        import copy,json,tempfile
+        from unittest.mock import patch
+        from test_resource_failure import FailureProof
+        module=self.module();dumps=json.dumps
+        with tempfile.TemporaryDirectory() as directory:
+            probe,owner,worker,cg=FailureProof().activation_capture_fixture(directory)
+            with self.assertRaisesRegex(AssertionError,'^effective_limits$'):probe.activate_oom('pg',owner)
+            base=probe.result;program=base['failure_probe_sha256']
+            self.assertIsNotNone(module.public_activation_readback(base,probe.image,program))
+            for size in (16384,65536,262144):
+                private={'Env':['PRIVATE-CANARY'+'x'*size]}
+                cases=[('extra',{'extra':private},True),
+                       ('many_keys',{str(i):None for i in range(128)},True),
+                       ('nested_after',{'after':{**base['activation_readback']['after'],'extra':private}},False),
+                       ('nested_returned',{'returned':{**base['activation_readback']['returned'],'extra':private}},False),
+                       ('nested_limit',{'returned':{'memory.max':{'status':'decimal','value':1,'extra':private}}},False),
+                       ('known_scalar',{'after':{'Pid':private,'Running':'x'*size},
+                                        'returned':{'counter_status':'x'*size,'oom_kill':private,
+                                                    'memory.max':{'status':'x'*size,'value':private},
+                                                    'unavailable_errno':{'memory.max':private}},
+                                        'route':private,'pinned_basis':'x'*size},False),
+                       ('known_container',{'returned':private},False),
+                       ('invalid_after',{'after':'x'*size},True),
+                       ('invalid_returned',{'returned':'x'*size},True),
+                       ('ignored_pinned',{'latest_existing_pinned_fd':private},False),
+                       ('foreign_binding',{'binding':private},True)]
+                for name,change,rejected in cases:
+                    with self.subTest(size=size,case=name):
+                        raw=copy.deepcopy(base);raw['activation_readback'].update(change)
+                        raw=json.loads(dumps(raw));before=dumps(raw);sizes=[]
+                        def observed(value,*args,**kwargs):
+                            result=dumps(value,*args,**kwargs);sizes.append(len(result.encode()));return result
+                        with patch.object(module.json,'dumps',observed):
+                            out=module.public_activation_readback(raw,probe.image,program)
+                        self.assertLessEqual(max(sizes,default=0),8192,'serialized unprojected capture')
+                        self.assertEqual(out is None,rejected)
+                        self.assertEqual(dumps(raw),before,'projection mutated private input')
+                        if out is not None:
+                            self.assertLessEqual(len(dumps(out).encode()),8192)
+                            self.assertNotIn('PRIVATE-CANARY',dumps(out))
+            # Validate owner shape before any key-set traversal or worker-name copy.
+            for change in ({'workerName':'x'*262144},{str(i):None for i in range(8192)}):
+                raw=copy.deepcopy(base);raw['active_before_failure'].update(change)
+                raw=json.loads(dumps(raw));sizes=[]
+                with patch.object(module.json,'dumps',observed):
+                    self.assertIsNone(module.public_activation_readback(raw,probe.image,program))
+                self.assertLessEqual(max(sizes,default=0),8192)
+
+    def test_activation_binding_rejects_foreign_malformed_and_oversized_public_inputs(self):
+        import copy,json,tempfile
+        from pathlib import Path
+        from test_resource_failure import FailureProof
+        from run_resource_failures import activation_binding
+        module=self.module()
+        with tempfile.TemporaryDirectory() as directory:
+            probe,owner,worker,cg=FailureProof().activation_capture_fixture(directory)
+            with self.assertRaisesRegex(AssertionError,'effective_limits'):probe.activate_oom('pg',owner)
+            base=probe.result;program=base['failure_probe_sha256']
+            def capture(raw,image=probe.image,code=program):
+                return module.public_failure_diagnostics(raw,image,code).get('activation_readback')
+            self.assertIsNotNone(capture(base))
+            for key in base['activation_readback']['binding']:
+                raw=copy.deepcopy(base);raw['activation_readback']['binding'][key]='foreign'
+                self.assertIsNone(capture(raw),key)
+            for field in ('runID','workerName','workerContainerID','daemonID'):
+                raw=copy.deepcopy(base);raw['active_before_failure'][field]='foreign'
+                self.assertIsNone(capture(raw),field)
+            for field in ('Id','Image','Name','runID'):
+                raw=copy.deepcopy(base);raw['workers'][owner['workerContainerID']][field]='foreign'
+                self.assertIsNone(capture(raw),field)
+            for change in ({'phase':'PRIVATE-CANARY'},{'status':'blocked'},{'workerStartAuthorized':1},
+                           {'execID':[]},{'sourceStartedAt':'PRIVATE-CANARY'},{'extra':'PRIVATE-CANARY'},
+                           {'workerName':'x'*4097},{'targetID':True}):
+                raw=copy.deepcopy(base);raw['active_before_failure'].update(change)
+                try:raw['activation_readback']['binding']=activation_binding(raw['active_before_failure'],probe.image,probe.daemon,program)
+                except (ValueError,TypeError):pass
+                self.assertIsNone(capture(raw),change)
+            for code in (None,True,'f'*64,'PRIVATE-CANARY'):
+                self.assertIsNone(capture(base,code=code))
+            self.assertIsNone(capture(base,image='foreign'))
+            raw=copy.deepcopy(base);raw['activation_readback']['extra']='x'*8193
+            self.assertIsNone(capture(raw),'oversized diagnostic must be rejected, not forwarded')
+            for key in ('after','returned'):
+                for value in (None,True,[], 'PRIVATE-CANARY'):
+                    raw=copy.deepcopy(base);raw['activation_readback'][key]=value
+                    self.assertIsNone(capture(raw))
+            for case in ('scheduler','oom','enospc'):
+                raw=copy.deepcopy(base);raw['mode']=case
+                self.assertIsNone(capture(raw))
+
+    def test_activation_limit_statuses_and_public_type_reprojection_never_invent_zero(self):
+        import copy,json
+        from run_resource_failures import activation_fields,activation_row
+        module=self.module()
+        # Real activation + saved producer fields, terminal missing memory, exact returned swap.
+        from test_resource_failure import FailureProof
+        import tempfile
+        for text,status in (('max','max'),('','empty'),('PRIVATE-CANARY','invalid'),
+                            ('9'*5000,'invalid'),('-1','invalid')):
+            with self.subTest(text=text[:20]),tempfile.TemporaryDirectory() as directory:
+                probe,owner,worker,cg=FailureProof().activation_capture_fixture(directory,complete=True)
+                original=probe.e.call.side_effect
+                def update(*args):
+                    result=original(*args);(cg/'memory.max').unlink();(cg/'memory.swap.max').write_text(text);return result
+                probe.e.call.side_effect=update
+                # Preserve even the original numeric conversion ValueError for huge input.
+                with self.assertRaises(ValueError if len(text)>4300 else AssertionError):probe.activate_oom('pg',owner)
+                capture=module.public_failure_diagnostics(probe.result,probe.image,probe.result['failure_probe_sha256'])['activation_readback']
+                self.assertEqual(capture['returned']['memory.swap.max'],{'status':status,'value':None})
+                self.assertNotIn('PRIVATE-CANARY',json.dumps(capture));probe.unlock.assert_not_called()
+        with tempfile.TemporaryDirectory() as directory:
+            probe,owner,worker,cg=FailureProof().activation_capture_fixture(directory)
+            with self.assertRaises(AssertionError):probe.activate_oom('pg',owner)
+            base=probe.result;program=base['failure_probe_sha256']
+            for bad in (True,-1,2**63,1.5,'PRIVATE-CANARY',[],{}):
+                raw=copy.deepcopy(base);value=raw['activation_readback']
+                value['after']={'Running':bad,'OOMKilled':bad,'Pid':bad,'ExitCode':bad,'Env':'PRIVATE-CANARY'}
+                value['returned'].update(observer_pid=bad,oom_kill=bad,cgroup_errno=bad,counter_status='PRIVATE-CANARY',
+                    unavailable_errno={'memory.max':bad,'PRIVATE-CANARY':bad},
+                    **{'memory.max':{'status':'decimal','value':bad,'extra':'PRIVATE-CANARY'}})
+                value['route']='PRIVATE-CANARY';value['pinned_basis']='PRIVATE-CANARY'
+                capture=module.public_failure_diagnostics(raw,probe.image,program)['activation_readback']
+                self.assertEqual(capture['returned']['memory.max'],{'status':'invalid','value':None})
+                for key in ('Pid','ExitCode'):self.assertIsNone(capture['after'][key])
+                self.assertIsNone(capture['returned']['oom_kill'])
+                self.assertIsNone(capture['returned']['unavailable_errno']['memory.max'])
+                self.assertNotIn('PRIVATE-CANARY',json.dumps(capture))
+                self.assertLess(len(json.dumps(capture).encode()),8192)
+            # Empty CPU readbacks and unknown returned pid are distinct from live/zero.
+            raw=activation_row({'cpu.max':''})
+            fields=activation_fields({'after':{'Pid':123},'returned':raw})
+            self.assertEqual(fields['returned']['cpu_quota'],{'status':'empty','value':None})
+            self.assertEqual(fields['route'],'unavailable')
+
     def captured_failure_raw(self):
         """Synthetic raw states, NOT recovered raw evidence from hosted 133.
 
