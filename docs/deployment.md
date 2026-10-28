@@ -8,7 +8,7 @@ These are independent backup deployments, **not** application manifests. Updatin
 
 Prepare all absolute bind sources first, including private state and explicit read-only config/password files. `BAKABEL_HOME` selects their host parent directory (default `/srv/bakabel`); `DOCKER_SOCKET` selects the local socket bind source (default `/var/run/docker.sock`). Set the latter to the actual inspected socket for rootless Docker. Internal config paths stay unchanged. The example disables automatic bind-path creation. It publishes no port. Docker logs rotate; log rotation is not a backup history or an alert.
 
-The service runs `serve`. Use the documented `compose run` overrides for `plan`, `run`, `snapshots` and an independent restore drill before starting the scheduled service. See [operations](operations.md) for the implemented `health` command and independent monitoring; a scheduler process cannot detect its own death. Final lifecycle/resource acceptance remains a pre-release gate.
+The service runs `serve`. Use the documented `compose run` overrides for `plan`, `run`, `snapshots` and an independent restore drill before starting the scheduled service. See [operations](operations.md) for the implemented `health` command and independent monitoring; a scheduler process cannot detect its own death. Use [testing](testing.md) for full acceptance and its limits; manifest validation alone is not runtime evidence.
 
 ## Swarm
 
@@ -16,7 +16,7 @@ The service runs `serve`. Use the documented `compose run` overrides for `plan`,
 
 1. Change config `platform` to `swarm` and scope it to the **application stack**, not the backup stack.
 2. Replace `REPLACE_WITH_EXACT_MANAGER_NODE_ID`; constrain the controller and each selected single-replica source to that exact manager. Local volumes must already exist there. No cross-node relocation or primary guessing is supported.
-3. Prepare the same absolute host paths **on that node**. Keep the operator-built image available locally there, use its immutable ID for config and service, and avoid registry resolution when deploying a local-only image. There is no published Bakabel registry image to pull.
+3. Prepare the same absolute host paths **on that node**. Keep the locally built image available there, use its immutable ID for config and service, and avoid registry resolution for a local-only image. For a GHCR publication, first verify the actual package digest/access and pin the same immutable image for controller and worker; see [releasing](releasing.md).
 4. Keep the controller's `labels` at container level even in Swarm. By contrast, **application source** labels belong in `deploy.labels`; see [source fragments](sources.md).
 5. Perform a one-shot backup and independent restore drill before scheduling. A stack/config syntax pass does not establish backup, restore or lifecycle acceptance.
 

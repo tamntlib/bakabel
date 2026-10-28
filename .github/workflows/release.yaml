@@ -1,0 +1,107 @@
+name: Publish GHCR
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'New version, strictly vN.N.N (no leading zeros)'
+        type: string
+        required: true
+        default: v0.1.0
+      ci_run_id:
+        description: 'Successful push CI run on this exact commit'
+        type: string
+        required: true
+      acceptance_run_id:
+        description: 'Successful acceptance.yaml full all/all run on this exact commit'
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: bakabel-ghcr-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+      packages: write
+    outputs:
+      digest: ${{ steps.publish.outputs.digest }}
+    env:
+      VERSION: ${{ inputs.version }}
+      CI_RUN_ID: ${{ inputs.ci_run_id }}
+      ACCEPTANCE_RUN_ID: ${{ inputs.acceptance_run_id }}
+      DOCKER_CONFIG: ${{ runner.temp }}/bakabel-docker-auth
+      TMPDIR: ${{ runner.temp }}/bakabel-release-tmp
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Offline release regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$TMPDIR"
+          python3 -B -m unittest discover -s tests -p test_release.py -v
+          printf 'IMAGE=ghcr.io/%s\n' "${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+      - name: Require successful CI and full acceptance on exact source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 -B .github/release.py gate
+      - name: Build and smoke before registry login
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --platform linux/amd64 \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            -t "$IMAGE:$VERSION" -t "$IMAGE:sha-$GITHUB_SHA" .
+          docker run --rm --network none --read-only \
+            --cap-drop ALL --security-opt no-new-privileges \
+            --entrypoint /usr/bin/restic "$IMAGE:$VERSION" version
+          status=0
+          docker run --rm --network none --read-only \
+            --cap-drop ALL --security-opt no-new-privileges \
+            "$IMAGE:$VERSION" __release_smoke_invalid__ > "$TMPDIR/usage.txt" 2>&1 || status=$?
+          test "$status" -eq 1
+          grep -Fx 'bakabel: usage: bakabel --config FILE plan|run|serve|health|snapshots|restore' "$TMPDIR/usage.txt"
+      - name: Refuse existing tags, publish and verify digests
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          install -d -m 0700 "$DOCKER_CONFIG"
+          python3 -B .github/release.py check
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:$VERSION"
+          docker push "$IMAGE:sha-$GITHUB_SHA"
+          digest=$(python3 -B .github/release.py verify)
+          printf 'digest=%s\n' "$digest" >> "$GITHUB_OUTPUT"
+          printf 'Published `%s@%s` (linux/amd64)\n\nTags: `%s`, `sha-%s`. No deployment.\n' \
+            "$IMAGE" "$digest" "$VERSION" "$GITHUB_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove registry credentials
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -d "$DOCKER_CONFIG"; then
+            docker logout ghcr.io >/dev/null 2>&1 || true
+            rm -rf -- "$DOCKER_CONFIG"
+          fi

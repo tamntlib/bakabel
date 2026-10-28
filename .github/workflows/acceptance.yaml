@@ -53,7 +53,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          matrix=$(taskset -c 0,1 python3 -B tests/integration/fixtures/verify_hosted_selection.py \
+          matrix=$(python3 -B tests/integration/fixtures/verify_hosted_selection.py \
             --plan --scope "$REQUESTED_SCOPE" --case "$REQUESTED_CASE")
           printf 'matrix=%s\n' "$matrix" >> "$GITHUB_OUTPUT"
 
@@ -104,7 +104,6 @@ jobs:
           python3 - <<'PY'
           import os, shutil
           from pathlib import Path
-          assert {0,1} <= os.sched_getaffinity(0), 'CPU 0,1 unavailable'
           memory=int(next(l.split()[1] for l in Path('/proc/meminfo').read_text().splitlines() if l.startswith('MemTotal:')))*1024
           assert memory >= 4*1024**3, 'at least 4 GiB VM RAM required'
           assert shutil.disk_usage(os.environ['RUNNER_TEMP']).free >= 12*1024**3, 'at least 12 GiB scratch space required'
@@ -115,11 +114,11 @@ jobs:
           set -euo pipefail
           if test "$ACCEPTANCE_SCOPE" != all; then
             # Do not let F14's live tracer regression block unrelated scoped gates.
-            taskset -c 0,1 python3 -m unittest discover -s tests/integration/fixtures -p test_hosted_selection.py -v
+            python3 -m unittest discover -s tests/integration/fixtures -p test_hosted_selection.py -v
           else
-            taskset -c 0,1 python3 -m unittest discover -s tests/integration/fixtures -p 'test_*.py' -v
+            python3 -m unittest discover -s tests/integration/fixtures -p 'test_*.py' -v
           fi
-          taskset -c 0,1 python3 -m unittest discover -s tests -p test_documentation.py -v
+          python3 -m unittest discover -s tests -p test_documentation.py -v
       - name: Fetch pinned tools and verified unmodified MinIO source
         shell: bash
         run: |
@@ -140,18 +139,18 @@ jobs:
           assert hashlib.sha256(archive.read_bytes()).hexdigest()==os.environ['MINIO_SOURCE_SHA256'], 'upstream archive changed'
           with tarfile.open(archive) as tar: tar.extractall(root,filter='data')
           PY
-          docker run --rm --name "$HELPER" --cpus 2 --entrypoint taskset \
-            -e CGO_ENABLED=0 -e GOAMD64=v1 -e GOMAXPROCS=2 -e GOTOOLCHAIN=local \
+          docker run --rm --name "$HELPER" \
+            -e CGO_ENABLED=0 -e GOAMD64=v1 -e GOTOOLCHAIN=local \
             -v "$RUNNER_TEMP/bakabel-tools:/build" \
             -w /build/minio-RELEASE.2024-01-18T22-51-28Z \
-            "$GO_IMAGE" -c 0,1 go build -p 2 -trimpath -o /build/minio .
+            "$GO_IMAGE" go build -trimpath -o /build/minio .
           test -x "$RUNNER_TEMP/bakabel-tools/minio"
       - name: Build candidate and bind exact commit source image and daemon
         shell: bash
         run: |
           set -euo pipefail
-          docker build --platform linux/amd64 --build-arg BUILD_CPUSET=0,1 \
-            --cpu-quota 200000 --cpu-period 100000 -t "$CANDIDATE" .
+          docker build --platform linux/amd64 \
+            -t "$CANDIDATE" .
           python3 - <<'PY'
           import hashlib,json,os,subprocess,sys
           from pathlib import Path
@@ -174,7 +173,7 @@ jobs:
           source_hash=$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/bakabel-candidate.json"))["source_sha256"])')
           image_id=$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/bakabel-candidate.json"))["image_id"])')
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP \
-            taskset -c 0,1 python3 tests/integration/fixtures/run_hosted_acceptance.py \
+            python3 tests/integration/fixtures/run_hosted_acceptance.py \
             --socket "$ENGINE_SOCKET" --exclusive-hosted-daemon --platform all \
             --source "$PWD" --runtime "$RUNNER_TEMP/bakabel-acceptance" \
             --minio-binary "$RUNNER_TEMP/bakabel-tools/minio" --image "$image_id" \
@@ -184,7 +183,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo taskset -c 0,1 python3 tests/integration/fixtures/verify_hosted_acceptance.py \
+          sudo python3 tests/integration/fixtures/verify_hosted_acceptance.py \
             --socket "$ENGINE_SOCKET" --source "$PWD" \
             --candidate "$RUNNER_TEMP/bakabel-candidate.json" \
             --runtime "$RUNNER_TEMP/bakabel-acceptance" \
@@ -197,7 +196,7 @@ jobs:
           source_hash=$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/bakabel-candidate.json"))["source_sha256"])')
           image_id=$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/bakabel-candidate.json"))["image_id"])')
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP \
-            taskset -c 0,1 python3 tests/integration/fixtures/run_hosted_resources.py \
+            python3 tests/integration/fixtures/run_hosted_resources.py \
             --socket "$ENGINE_SOCKET" --exclusive-hosted-daemon \
             --source "$PWD" --runtime "$RUNNER_TEMP/bakabel-resources" \
             --minio-binary "$RUNNER_TEMP/bakabel-tools/minio" --image "$image_id" \
@@ -210,7 +209,7 @@ jobs:
           source_hash=$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/bakabel-candidate.json"))["source_sha256"])')
           image_id=$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/bakabel-candidate.json"))["image_id"])')
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP \
-            taskset -c 0,1 python3 tests/integration/fixtures/run_hosted_capacity.py \
+            python3 tests/integration/fixtures/run_hosted_capacity.py \
             --socket "$ENGINE_SOCKET" --exclusive-hosted-daemon \
             --source "$PWD" --runtime "$RUNNER_TEMP/bakabel-capacity" \
             --minio-binary "$RUNNER_TEMP/bakabel-tools/minio" --image "$image_id" \
@@ -223,11 +222,11 @@ jobs:
           source_hash=$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/bakabel-candidate.json"))["source_sha256"])')
           image_id=$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/bakabel-candidate.json"))["image_id"])')
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP \
-            taskset -c 0,1 python3 tests/integration/fixtures/run_hosted_faults.py \
+            python3 tests/integration/fixtures/run_hosted_faults.py \
             --socket "$ENGINE_SOCKET" --exclusive-hosted-daemon \
             --source "$PWD" --runtime "$RUNNER_TEMP/bakabel-faults" \
             --image "$image_id" --expected-source-sha256 "$source_hash" --expected-image-id "$image_id"
-          sudo taskset -c 0,1 python3 tests/integration/fixtures/verify_hosted_faults.py \
+          sudo python3 tests/integration/fixtures/verify_hosted_faults.py \
             --runtime "$RUNNER_TEMP/bakabel-faults"
       - name: Additive bounded storage and extension prerequisite gates
         if: matrix.suite == 'faults'
@@ -238,11 +237,11 @@ jobs:
           source_hash=$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/bakabel-candidate.json"))["source_sha256"])')
           image_id=$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/bakabel-candidate.json"))["image_id"])')
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP \
-            taskset -c 0,1 python3 tests/integration/fixtures/run_hosted_storage_prereqs.py \
+            python3 tests/integration/fixtures/run_hosted_storage_prereqs.py \
             --socket "$ENGINE_SOCKET" --exclusive-hosted-daemon \
             --source "$PWD" --runtime "$RUNNER_TEMP/bakabel-storage" \
             --image "$image_id" --expected-source-sha256 "$source_hash" --expected-image-id "$image_id"
-          sudo taskset -c 0,1 python3 tests/integration/fixtures/verify_hosted_storage_prereqs.py \
+          sudo python3 tests/integration/fixtures/verify_hosted_storage_prereqs.py \
             --runtime "$RUNNER_TEMP/bakabel-storage"
       - name: Independent remaining fault gate on fresh VM
         if: inputs.scope == 'remaining-faults' || inputs.scope == 'single-fault'
@@ -257,11 +256,11 @@ jobs:
           source_hash=$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/bakabel-candidate.json"))["source_sha256"])')
           image_id=$(python3 -c 'import json,os; print(json.load(open(os.environ["RUNNER_TEMP"]+"/bakabel-candidate.json"))["image_id"])')
           sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT,RUNNER_TEMP \
-            taskset -c 0,1 python3 "tests/integration/fixtures/$runner" \
+            python3 "tests/integration/fixtures/$runner" \
             --socket "$ENGINE_SOCKET" --exclusive-hosted-daemon --case "$ACCEPTANCE_CASE" \
             --source "$PWD" --runtime "$runtime" \
             --image "$image_id" --expected-source-sha256 "$source_hash" --expected-image-id "$image_id"
-          sudo taskset -c 0,1 python3 tests/integration/fixtures/verify_hosted_selection.py \
+          sudo python3 tests/integration/fixtures/verify_hosted_selection.py \
             --suite "$ACCEPTANCE_SUITE" --case "$ACCEPTANCE_CASE" \
             --source "$PWD" --candidate "$RUNNER_TEMP/bakabel-candidate.json" \
             --runtime "$runtime" --output "$runtime/selected-verified.json"
@@ -274,7 +273,7 @@ jobs:
             if test -f "$RUNNER_TEMP/bakabel-candidate.json"; then
               sudo cp "$RUNNER_TEMP/bakabel-candidate.json" "$RUNNER_TEMP/bakabel-acceptance/candidate.json"
             fi
-            sudo taskset -c 0,1 python3 tests/integration/fixtures/hosted_evidence.py \
+            sudo python3 tests/integration/fixtures/hosted_evidence.py \
               --runtime "$RUNNER_TEMP/bakabel-acceptance" --output "$RUNNER_TEMP/bakabel-public"
           fi
           sudo mkdir -p "$RUNNER_TEMP/bakabel-public"
@@ -289,7 +288,7 @@ jobs:
               sudo cp "$RUNNER_TEMP/bakabel-capacity/$file" "$RUNNER_TEMP/bakabel-public/$file"
             fi
           done
-          sudo --preserve-env=RUNNER_TEMP,ACCEPTANCE_SUITE taskset -c 0,1 python3 - <<'PY'
+          sudo --preserve-env=RUNNER_TEMP,ACCEPTANCE_SUITE python3 - <<'PY'
           import os, shutil, sys
           from pathlib import Path
           sys.path.insert(0,'tests/integration/fixtures')

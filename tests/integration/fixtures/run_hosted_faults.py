@@ -28,7 +28,7 @@ from run_hosted_acceptance import require_hosted_daemon, failure_location
 from run_hosted_capacity import CapacityEngine
 
 # Reviewed completion-protocol candidate; never infer admission from CLI input.
-FROZEN_SOURCE = '853633d737405ddbb2b35138b007fdf5cdb4515f610869619df2ff2980e9cff5'
+FROZEN_SOURCE = 'd4045f8bfc54dfa21f156cd590136a60d280cb39b9d6254cac4c3007cb70f605'
 PG_FIXTURE_PIN = 'postgres:18.6-alpine3.24@sha256:83148c0bc09eac4d598b70a61e1404d0212b76c95c504bfd6c81a4c59ec91792'
 PG_FIXTURE_VOLUMES = {'/var/lib/postgresql': {}}
 

@@ -121,7 +121,7 @@ class Probe:
         for image in (inventory_images if inventory_images is not None else [args.image,PG,'restic/restic:0.18.1','golang:1.26.8-bookworm']):
             v=self.e.call('GET','/images/'+quote(image,safe='')+'/json')
             self.result['images'][image]={'id':v['Id'],'repo_digests':v.get('RepoDigests'),'engine_reported_size_bytes':v['Size'],'size_semantics':'Engine29 containerd store, NOT unpacked size'}
-        self.result['fingerprint']={'source_files':{str(f.relative_to(args.source)):sha(f) for f in sorted(args.source.rglob('*')) if f.is_file() and f.suffix in ['.go','.mod','.sum'] and '.git' not in f.parts},'plan_sha256':sha(args.source/'PLAN.md'),'minio_sha256':sha(args.minio_binary)}
+        self.result['fingerprint']={'source_files':{str(f.relative_to(args.source)):sha(f) for f in sorted(args.source.rglob('*')) if f.is_file() and f.suffix in ['.go','.mod','.sum'] and '.git' not in f.parts},'minio_sha256':sha(args.minio_binary)}
         self.result['fingerprint']['dockerfile_sha256']=sha(args.source/'Dockerfile')
         self.result['fingerprint']['probe_sha256']=sha(Path(__file__))
         self.result['affinity_boundary']='PID1 PG gated as root and pinned before stock entrypoint/UID change; root controller/worker/MinIO threads pinned immediately after start and every sample. Rootless cpuset is not relied on; unavoidable create-to-pin startup gaps and short exec lifetimes are not continuous affinity proof. Actual per-container cpu.max=200000 100000 remains enforced.'

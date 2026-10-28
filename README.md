@@ -2,13 +2,26 @@
 
 Bakabel is a Go + Restic backup tool for online PostgreSQL databases and selected Docker volumes. Labels select sources within an explicit Compose project or Swarm stack scope. Each run discovers once, processes targets sequentially in one temporary worker, and uses the same immutable image as the controller. It does not stop, restart, or scale applications.
 
-**Pre-release, not production-approved:** source is public at [tamntlib/bakabel](https://github.com/tamntlib/bakabel); no registry image or release is published. Build locally; no GHCR pull is promised. The public CLI is `--config FILE plan|run|serve|health|snapshots|restore`.
+Use it to protect explicitly selected online sources in a single-node Compose or
+Swarm installation, with local or S3-compatible Restic storage and restore into
+separate empty targets. It provides one-shot backups, scheduling, read-only
+health checks and repository-based snapshot discovery. It is not a whole-host,
+whole-cluster, PITR/WAL or application-consistency solution.
 
-The current R3 production core passed [GitHub-hosted acceptance](https://github.com/tamntlib/bakabel/actions/runs/40236034625): Compose/Swarm × local/S3, online PostgreSQL/files backup, source/history-independent PostgreSQL and directory/volume restore, alias/status refusals, worker SIGKILL and S3 outage. Exact image/source/daemon bindings and cleanup were independently read back; see [hosted results](tests/integration/HOSTED_ACCEPTANCE_RESULT.md). This is the core runtime matrix, **not the entire PLAN release gate**. Remaining fault/capacity requirements, Astra reviews and historical evidence boundaries are recorded in the [implementation status](tests/integration/IMPLEMENTATION_STATUS.md) and [resource evidence](docs/resources.md). No production certification or deployment is implied.
+**Build locally for now.** The source is public at
+[tamntlib/bakabel](https://github.com/tamntlib/bakabel); this guide does not assume
+an available GHCR image or published release. The public CLI is
+`--config FILE plan|run|serve|health|snapshots|restore`. Image publication is a
+separate gated process described in [releasing](docs/releasing.md).
+
+Start with the supported baseline and guarded quick start below. Review
+[testing](docs/testing.md) for full acceptance procedures and their evidence
+limits, and [resources](docs/resources.md) before choosing capacity. Tests and
+reviews are bounded evidence, not a universal production certification.
 
 ## Supported baseline
 
-- Linux Docker Engine API **1.55**, tested with Engine **29.6.1**. The adapter does not negotiate older API versions. amd64 builds use `GOAMD64=v1`, without an advanced CPU requirement.
+- Linux Docker Engine API **1.55**, tested with Engine **29.6.1** and containerd image storage enabled. The adapter does not negotiate older API versions. amd64 builds use `GOAMD64=v1`, without an advanced CPU requirement.
 - Compose: one running container per selected service. Swarm: one running replica, on the exact manager/node/daemon used by Bakabel. No remote-node volume lookup or heuristic primary selection.
 - Files: default `local` Docker volumes with **no driver options**, selected at exact container mount destinations. Source bind mounts, volume subpaths, plugin/network volumes and opaque mount topologies are unsupported.
 - PostgreSQL: use the tested stock **18.6** baseline (see [sources](docs/sources.md)). The fixed clients run inside the source/restore PostgreSQL container, not the Bakabel image. Operator-configured Unix-socket superuser access is required; this is not arbitrary remote PostgreSQL support.
@@ -25,13 +38,12 @@ Run these commands only on the intended Docker host, after reviewing the paths, 
 From a reviewed checkout, use the supplied Dockerfile, which pins its build frontend, Go builder and Restic image by digest. The runtime is `scratch`: Bakabel, Restic, CA certificates and embedded Go timezone data; no shell or Docker CLI.
 
 ```bash
-docker build --platform linux/amd64 --build-arg BUILD_CPUSET=0,1 \
-  --cpu-period 100000 --cpu-quota 200000 -t bakabel:local . &&
+docker build --platform linux/amd64 -t bakabel:local . &&
 BAKABEL_IMAGE="$(docker image inspect bakabel:local --format '{{.Id}}')" &&
 test -n "$BAKABEL_IMAGE" && export BAKABEL_IMAGE
 ```
 
-Keep this exact image ID available on the same daemon for both controller and worker. Rebuilding a mutable tag is not an upgrade of the configured worker. The build-only CPU affinity assumes cores 0,1 are available; adjust it for a different builder. Measured resource baselines and their revision boundaries are recorded in `docs/resources.md`; they are not universal production budgets.
+Keep this exact image ID available on the same daemon for both controller and worker. Rebuilding a mutable tag is not an upgrade of the configured worker. See [resource defaults and sizing limits](docs/resources.md); fixture workloads are not universal production budgets.
 
 ### 2. Prepare private storage and a password-file reference
 
@@ -68,7 +80,7 @@ Read [configuration](docs/configuration.md) and add the minimal [source labels](
 Only initialize a deliberately new, empty repository. Access errors are not evidence that an existing repository needs initialization. Bakabel never auto-initializes.
 
 ```bash
-docker run --rm --network none --cpus 2 \
+docker run --rm --network none \
   --mount "type=bind,src=$BAKABEL_HOME/repository,dst=/repository" \
   --mount "type=bind,src=$BAKABEL_HOME/credentials/restic-password,dst=/run/secrets/restic-password,readonly" \
   --env RESTIC_PASSWORD_FILE=/run/secrets/restic-password \
@@ -97,3 +109,7 @@ Finish setup by performing and verifying an independent [restore drill](docs/res
 - [Compose / Swarm deployment examples](docs/deployment.md)
 - [Independent restore and verification](docs/restore.md)
 - [Scheduling, retention, failures and monitoring](docs/operations.md)
+- [Resource defaults and sizing](docs/resources.md)
+- [PostgreSQL streaming protocol and trust boundary](docs/streaming.md)
+- [Testing and full acceptance](docs/testing.md)
+- [Release process](docs/releasing.md)

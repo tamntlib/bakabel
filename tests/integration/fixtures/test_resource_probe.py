@@ -3,6 +3,40 @@ from pathlib import Path
 import unittest
 
 class ProbeSafety(unittest.TestCase):
+    def test_probe_fingerprint_does_not_require_internal_documents(self):
+        import hashlib
+        import tempfile
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        with tempfile.TemporaryDirectory(prefix='bakabel-probe-source-') as directory:
+            root = Path(directory)
+            source = root/'source'; source.mkdir()
+            for name in ('go.mod', 'go.sum', 'Dockerfile', 'main.go'):
+                (source/name).write_text('offline fixture source\n')
+            minio = root/'minio'; minio.write_bytes(b'offline binary fixture')
+            engine = Mock()
+            engine.call.side_effect = [
+                {'ID': 'offline-daemon', 'Swarm': {'LocalNodeState': 'inactive'}},
+                {'Id': 'sha256:'+'a'*64},
+            ]
+            args = SimpleNamespace(runtime=root/'runtime', source=source,
+                                   socket=root/'absent.sock', image='offline-image',
+                                   minio_binary=minio)
+            with patch.object(self.p, 'Engine', return_value=engine), patch.object(self.p.threading, 'Thread'):
+                try:
+                    probe = self.p.Probe(args, inventory_images=[])
+                except FileNotFoundError:
+                    self.fail('probe still requires an internal document outside its source inputs')
+            expected = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+            self.assertEqual(probe.result['fingerprint'], {
+                'source_files': {name: expected(source/name) for name in ('go.mod', 'go.sum', 'main.go')},
+                'minio_sha256': expected(minio),
+                'dockerfile_sha256': expected(source/'Dockerfile'),
+                'probe_sha256': expected(Path(__file__).with_name('run_resource_probe.py')),
+            })
+            self.assertEqual(engine.call.call_count, 2)
+            self.assertFalse(args.socket.exists())
+
     def test_removed_cgroup_requires_exact_container_exit_readback(self):
         import copy
         import errno

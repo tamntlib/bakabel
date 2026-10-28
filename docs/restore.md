@@ -40,7 +40,7 @@ The database name is literal; it is not a libpq connection string. Import stream
 
 ## Files: explicit empty native target
 
-**Historical acceptance boundary:** source `633192cbf00dfc98447cc8b27da57211e5d6030dbaecb6b2671d22af819733eb`, image `sha256:568e907bb73b56d6873a2ece3052c7d5076d48b36b92672bd139c62724522914`, restored via the real isolated-Engine CLI into both an empty directory and a new unused default-local volume after deleting source/old state, with payload, mode and numeric ownership readback. Physical-source/consumer aliases and partial/unknown snapshots were refused. This is not certification of later resource/security-review candidates. The newer Compose/local/S3 subset intentionally does **not** invoke file restore on the shared daemon, because its safety preflight inventories/mirrors all consumers. Full replay needs a supported disposable daemon with all storage in scope. The historical fixture's aggregate two-CPU limit did not prove per-inner cgroup enforcement or every host mount topology.
+Use an exclusive disposable daemon for file-restore acceptance: the safety preflight inventories/mirrors consumer backing storage. Do not run these probes on a shared production daemon or weaken visibility/resource/security checks to make an unsupported topology pass. See [testing](testing.md) for the full directory/volume matrix and expected readbacks.
 
 Choose exactly one:
 

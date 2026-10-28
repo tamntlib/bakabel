@@ -5,6 +5,7 @@ import re
 import subprocess
 import tempfile
 import unittest
+import unicodedata
 
 ROOT=Path(__file__).resolve().parents[1]
 
@@ -16,6 +17,32 @@ def block_containing(marker):
     return matches[0]
 
 class DocumentationGuards(unittest.TestCase):
+    def test_shared_build_and_workflows_do_not_pin_local_cpu_budget(self):
+        paths = [ROOT/'Dockerfile', *sorted((ROOT/'.github/workflows').glob('*.yaml'))]
+        local_policy = re.compile(r'GOMAXPROCS=2|BUILD_CPUSET|taskset|--cpus\b|--cpu-quota\b|--cpu-period\b|--cpuset-cpus\b|go (?:build|test) -p 2\b|sched_getaffinity')
+        for path in paths:
+            with self.subTest(path=path.name):
+                self.assertIsNone(local_policy.search(path.read_text()), 'local VPS CPU policy must stay outside shared build and workflow files')
+
+    def test_public_text_has_no_vietnamese_prose(self):
+        # NFC also catches decomposed accents. Unicode fixture values remain
+        # supported; this guard targets distinctive Vietnamese characters.
+        vietnamese = re.compile(r'[\u0102\u0103\u0110\u0111\u0128\u0129\u0168\u0169\u01a0\u01a1\u01af\u01b0\u1ea0-\u1ef9]')
+        roots = [ROOT/name for name in ('.github', 'cmd', 'deploy', 'docs', 'internal', 'tests')]
+        paths = list(ROOT.glob('*.md'))
+        for directory in roots:
+            paths.extend(path for path in directory.rglob('*') if path.is_file() and path.suffix in {'.go', '.py', '.md', '.yaml', '.yml', '.json', '.sh', '.txt', '.toml'})
+        found = [str(path.relative_to(ROOT)) for path in paths
+                 if vietnamese.search(unicodedata.normalize('NFC', path.read_text()))]
+        self.assertEqual(found, [])
+
+    def test_public_tree_excludes_internal_working_documents(self):
+        internal = [ROOT/'PLAN.md', *ROOT.glob('ASTRA*.md')]
+        integration = ROOT/'tests/integration'
+        for pattern in ('*HANDOFF*.md', 'ASTRA*.md', '*STATUS*.md', '*LEDGER*.md', '*RESULT*.md'):
+            internal.extend(integration.glob(pattern))
+        self.assertEqual([str(path.relative_to(ROOT)) for path in internal if path.exists()], [])
+
     def test_ci_runs_public_restore_launch_regression_at_production_path(self):
         workflow=(ROOT/'.github/workflows/ci.yaml').read_text()
         source=(ROOT/'internal/app/workflow_controller.go').read_text()

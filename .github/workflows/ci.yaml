@@ -30,36 +30,38 @@ jobs:
           docker cp "$extractor:/usr/bin/restic" "$RUNNER_TEMP/restic"
           docker volume create "$MODULE_CACHE"
           docker volume create "$BUILD_CACHE"
-          docker run --rm --cpus 2 --entrypoint taskset \
-            -e GOTOOLCHAIN=local -e GOMAXPROCS=2 \
+          docker run --rm \
+            -e GOTOOLCHAIN=local \
             -v "$PWD:/work" -w /work -v "$MODULE_CACHE:/go/pkg/mod" \
-            "$GO_IMAGE" -c 0,1 sh -c 'go mod download && go mod verify'
-      - name: Fixture transport and documentation guard tests
+            "$GO_IMAGE" sh -c 'go mod download && go mod verify'
+      - name: Fixture transport, documentation and release guard tests
         shell: bash
         run: |
           set -euo pipefail
-          taskset -c 0,1 python3 -m unittest discover \
+          python3 -m unittest discover \
             -s tests/integration/fixtures -p 'test_*.py' -v
-          taskset -c 0,1 python3 -m unittest discover \
+          python3 -m unittest discover \
             -s tests -p test_documentation.py -v
+          python3 -B -m unittest discover \
+            -s tests -p test_release.py -v
       - name: Race tests and vet
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm --network none --cpus 2 --cap-add DAC_READ_SEARCH --entrypoint taskset \
-            -e GOTOOLCHAIN=local -e GOAMD64=v1 -e GOMAXPROCS=2 \
+          docker run --rm --network none --cap-add DAC_READ_SEARCH \
+            -e GOTOOLCHAIN=local -e GOAMD64=v1 \
             -e RESTIC_TEST_BINARY=/usr/bin/restic -e BAKABEL_FILES_RESTIC=/usr/bin/restic \
             -v "$RUNNER_TEMP/restic:/usr/bin/restic:ro" \
             -v "$PWD:/work" -w /work \
             -v "$MODULE_CACHE:/go/pkg/mod" -v "$BUILD_CACHE:/root/.cache/go-build" \
-            "$GO_IMAGE" -c 0,1 sh -c 'umask 0077; go test -race -count=1 -v ./... && go vet ./...'
+            "$GO_IMAGE" sh -c 'umask 0077; go test -race -count=1 -v ./... && go vet ./...'
       - name: Build and smoke-test minimal image
         shell: bash
         run: |
           set -euo pipefail
-          docker build --build-arg BUILD_CPUSET=0,1 \
-            --cpu-quota 200000 --cpu-period 100000 -t bakabel:ci .
-          docker run --rm --network none --cpus 2 \
+          docker build \
+            -t bakabel:ci .
+          docker run --rm --network none \
             --entrypoint /usr/bin/restic bakabel:ci version
       - name: Remove only this job's caches
         if: always()

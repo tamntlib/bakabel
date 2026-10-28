@@ -2,9 +2,9 @@
 
 ## What is checked
 
-A clean Docker frame-boundary EOF plus a successful `exec` exit does not prove the entire stdout arrived. An isolated regression against the previous implementation delivered only 32768 of 40960 bytes while `StreamDump` returned success. This is a production-path unit counterexample; it does not establish corruption of a particular historical hosted snapshot.
+A clean Docker frame-boundary EOF plus a successful `exec` exit does not prove the entire stdout arrived. Bakabel therefore requires a run-correlated producer-completion trailer in addition to terminal exec status.
 
-The export now uses a fixed `/bin/sh -c` script and positional arguments:
+The export uses a fixed `/bin/sh -c` script and positional arguments:
 
 1. Execute the existing `/usr/local/bin/pg_dump` with the original literal conninfo and custom-format/compression arguments.
 2. Set `BAKABEL_RUN_ID` and `PGAPPNAME` only for that child. The shell itself has empty run tags, so source process scanning still selects only `pg_dump`.
@@ -25,4 +25,4 @@ The check assumes the producer/archive is not adaptively constructed to contain 
 
 Focused unit tests exercise full 40960-byte delivery, 32768-byte frame-boundary and mid-frame cuts, every suffix cut/split of a control stream, wrong-run/trailing markers, sink errors and child failure. A POSIX-shell test executes the actual fixed script with a synthetic `pg_dump` replacement and hostile literal connection values; it is not a real PostgreSQL acceptance test.
 
-The changed Go source invalidates reuse of the old Astra R3 fingerprint or old image as certification of this candidate. A fresh exact-source build, independent review and real `pg_dump → helper → Restic → restore` plus cancellation/fault acceptance are required. Historical failed runs remain failed; local tests do not close hosted release gates.
+For real `pg_dump → helper → Restic → restore`, cancellation and fault procedures, use [testing](testing.md). Evidence must bind the exact source and ordinary image: unit tests and historical images do not certify a changed build. Preserve failed/unknown attempts as such; a passing bounded fixture is not an authenticated-stream or universal production guarantee.

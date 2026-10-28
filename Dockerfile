@@ -2,21 +2,14 @@
 FROM --platform=$BUILDPLATFORM golang:1.26.8-bookworm@sha256:dc9ad6c05acc7a88e5b71bde60a5fe3bd4b9f0db209011711b464107438a8107 AS build
 ARG TARGETOS
 ARG TARGETARCH
-# Optional build-only affinity for constrained builders; no runtime knob.
-ARG BUILD_CPUSET
 WORKDIR /src
 COPY go.mod go.sum ./
-RUN --mount=type=cache,target=/go/pkg/mod \
-    set -eu; set -- go mod download; \
-    if [ -n "$BUILD_CPUSET" ]; then set -- taskset -c "$BUILD_CPUSET" "$@"; fi; \
-    GOMAXPROCS=2 "$@"
+RUN --mount=type=cache,target=/go/pkg/mod go mod download
 COPY cmd ./cmd
 COPY internal ./internal
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
-    set -eu; \
-    set -- go build -p 2 -trimpath -ldflags='-s -w' -o /out/bakabel ./cmd/bakabel; \
-    if [ -n "$BUILD_CPUSET" ]; then set -- taskset -c "$BUILD_CPUSET" "$@"; fi; \
-    CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" GOAMD64=v1 GOMAXPROCS=2 "$@"; \
+    CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" GOAMD64=v1 \
+    go build -trimpath -ldflags='-s -w' -o /out/bakabel ./cmd/bakabel && \
     mkdir -p /out/tmp
 
 FROM restic/restic:0.18.1@sha256:39d9072fb5651c80d75c7a811612eb60b4c06b32ffe87c2e9f3c7222e1797e76 AS restic

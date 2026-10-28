@@ -182,7 +182,7 @@ class WorkflowContract(unittest.TestCase):
                     runner = 'run_hosted_faults.py' if entry['suite'] in ('native','reader') else 'run_hosted_storage_prereqs.py'
                     self.assertEqual(Path(calls[0]['args'][0]).name, runner)
                     for call in calls:
-                        self.assertEqual(call['cpus'],[0,1])
+                        self.assertEqual(call['cpus'],sorted(os.sched_getaffinity(0)))
                         args = call['args']
                         self.assertEqual(args.count('--case'),1)
                         self.assertEqual(args[args.index('--case')+1],entry['case'])
