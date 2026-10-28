@@ -46,7 +46,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          docker run --rm --network none --cpus 2 --entrypoint taskset \
+          docker run --rm --network none --cpus 2 --cap-add DAC_READ_SEARCH --entrypoint taskset \
             -e GOTOOLCHAIN=local -e GOAMD64=v1 -e GOMAXPROCS=2 \
             -e RESTIC_TEST_BINARY=/usr/bin/restic -e BAKABEL_FILES_RESTIC=/usr/bin/restic \
             -v "$RUNNER_TEMP/restic:/usr/bin/restic:ro" \

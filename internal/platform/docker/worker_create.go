@@ -67,7 +67,7 @@ func (c *Client) CreateWorker(ctx context.Context, w Worker, s WorkerSpec) (Work
 			config["Env"] = []string{"RESTIC_PASSWORD_FILE=/run/secrets/restic-password", "AWS_SHARED_CREDENTIALS_FILE=/run/secrets/aws", "AWS_DEFAULT_REGION=" + s.S3Region}
 		}
 		if s.Files {
-			host["CapAdd"] = []string{"DAC_READ_SEARCH", "CHOWN", "FOWNER", "DAC_OVERRIDE"}
+			host["CapAdd"] = []string{"DAC_READ_SEARCH", "CHOWN", "FOWNER", "DAC_OVERRIDE", "FSETID"}
 		}
 	}
 	var response struct {
