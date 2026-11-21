@@ -13,6 +13,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -282,7 +283,7 @@ func (r *Runner) backupVolume(ctx context.Context, dc *docker.Client, self *dock
 		Cmd:         cmd,
 		Env:         env,
 		Mounts:      mounts,
-		NetworkMode: r.resolveWorkerNetwork(self),
+		NetworkMode: r.resolveWorkerNetwork(ctx, dc, self),
 		Labels:      map[string]string{"bakabel.role": "volume-helper"},
 	})
 	if err != nil {
@@ -551,7 +552,7 @@ func (r *Runner) restoreVolume(ctx context.Context, dc *docker.Client, snap rest
 		Cmd:         []string{"_volume-restore", "--snapshot", snap.ID},
 		Env:         env,
 		Mounts:      mounts,
-		NetworkMode: r.resolveWorkerNetwork(self),
+		NetworkMode: r.resolveWorkerNetwork(ctx, dc, self),
 		Labels:      map[string]string{"bakabel.role": "volume-helper"},
 	})
 	if err != nil {
@@ -592,7 +593,7 @@ func (r *Runner) resolveWorkerImage(self *docker.Container) string {
 	return ""
 }
 
-func (r *Runner) resolveWorkerNetwork(self *docker.Container) string {
+func (r *Runner) resolveWorkerNetwork(ctx context.Context, dc *docker.Client, self *docker.Container) string {
 	if r.Cfg.WorkerNetwork != "" {
 		return r.Cfg.WorkerNetwork
 	}
@@ -600,13 +601,24 @@ func (r *Runner) resolveWorkerNetwork(self *docker.Container) string {
 		return "none"
 	}
 	if self != nil {
+		// Sort user network names deterministically and skip built-in/Swarm-internal networks.
+		names := make([]string, 0, len(self.NetworkSettings.Networks))
 		for name := range self.NetworkSettings.Networks {
-			if name != "" && name != "none" {
+			switch name {
+			case "", "none", "ingress", "docker_gwbridge", "bridge":
+				continue
+			}
+			names = append(names, name)
+		}
+		slices.Sort(names)
+		for _, name := range names {
+			if dc == nil {
 				return name
 			}
-		}
-		if self.HostConfig.NetworkMode != "" && self.HostConfig.NetworkMode != "default" {
-			return self.HostConfig.NetworkMode
+			netInfo, err := dc.InspectNetwork(ctx, name)
+			if err == nil && (netInfo.Scope == "local" || netInfo.Attachable) {
+				return name
+			}
 		}
 	}
 	return "bridge"

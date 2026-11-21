@@ -130,4 +130,188 @@ jobs:
           docker exec "$BAK_CTR" bakabel restore "$VOL_SNAP" --volume "$DST_VOL"
           CONTENT=$(docker run --rm -v "$DST_VOL:/check:ro" alpine:3.21 cat /check/sub/note.txt)
           test "$CONTENT" = "hello-bakabel"
-          echo "End-to-end CI test PASSED!"
+          echo "End-to-end Compose + Local CI test PASSED!"
+
+      - name: End-to-end Docker Swarm + S3 (MinIO) backup, retention, and restore test
+        run: |
+          set -euo pipefail
+          docker swarm init --advertise-addr 127.0.0.1 >/dev/null
+          NODE_ID=$(docker info --format '{{.Swarm.NodeID}}')
+          S3_NET="bakabel-s3-net"
+          MINIO_CTR="bakabel-ci-minio"
+          PG_DST="bakabel-swarm-pg-dst"
+          VOL_DST="bakabel-swarm-vol-dst"
+          WORK=$(mktemp -d)
+          cleanup() {
+            docker stack rm backup testapp >/dev/null 2>&1 || true
+            docker rm -f "$MINIO_CTR" "$PG_DST" >/dev/null 2>&1 || true
+            for i in $(seq 1 20); do
+              if [ -z "$(docker ps -aq --filter label=com.docker.stack.namespace=backup)" ] && \
+                 [ -z "$(docker ps -aq --filter label=com.docker.stack.namespace=testapp)" ]; then break; fi
+              sleep 1
+            done
+            docker volume rm "$VOL_DST" testapp_pgdata testapp_filesdata backup_bakabel-state >/dev/null 2>&1 || true
+            docker network rm "$S3_NET" >/dev/null 2>&1 || true
+            rm -rf "$WORK"
+          }
+          trap cleanup EXIT
+
+          # Create attachable overlay network and MinIO S3 backend with bucket "backups"
+          docker network create --driver overlay --attachable "$S3_NET" >/dev/null
+          docker run -d --name "$MINIO_CTR" --network "$S3_NET" --network-alias minio \
+            -e MINIO_ROOT_USER=bakabeltest -e MINIO_ROOT_PASSWORD=bakabelsecret \
+            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data >/dev/null
+
+          # Wait for MinIO and create bucket via minio/mc
+          MINIO_READY=0
+          for i in $(seq 1 30); do
+            if docker run --rm --network "$S3_NET" --entrypoint sh minio/mc:RELEASE.2025-04-16T18-13-26Z -c \
+              'mc alias set local http://minio:9000 bakabeltest bakabelsecret >/dev/null && mc mb --ignore-existing local/backups >/dev/null' >/dev/null 2>&1; then
+              MINIO_READY=1
+              break
+            fi
+            sleep 1
+          done
+          test "$MINIO_READY" = "1"
+
+          # Deploy application Swarm stack with deploy.labels (bakabel.type=postgres & volume)
+          cat > "$WORK/testapp.yaml" <<EOF
+          services:
+            db:
+              image: postgres:18.6-alpine3.24
+              environment:
+                POSTGRES_USER: app
+                POSTGRES_PASSWORD: swarmpw
+                POSTGRES_DB: appdb
+              volumes:
+                - pgdata:/var/lib/postgresql
+              deploy:
+                replicas: 1
+                placement:
+                  constraints:
+                    - node.id == ${NODE_ID}
+                labels:
+                  bakabel.type: postgres
+            files:
+              image: alpine:3.21
+              command: ["sh", "-c", "mkdir -p /data/nested && printf 'swarm-s3-ok\n' > /data/nested/file.txt && sleep 600"]
+              volumes:
+                - filesdata:/data
+              deploy:
+                replicas: 1
+                placement:
+                  constraints:
+                    - node.id == ${NODE_ID}
+                labels:
+                  bakabel.type: volume
+                  bakabel.paths: /data
+          volumes:
+            pgdata:
+            filesdata:
+          EOF
+          docker stack deploy --resolve-image never -c "$WORK/testapp.yaml" testapp >/dev/null
+
+          # Deploy independent backup Swarm stack (100% env vars, S3 backend, auto-init, retention).
+          # Attach both default (non-attachable Swarm overlay) and s3net (attachable) to prove
+          # Bakabel's volume helper skips non-attachable overlays and picks s3net.
+          cat > "$WORK/backup.yaml" <<EOF
+          services:
+            bakabel:
+              image: bakabel:ci
+              environment:
+                BAKABEL_REPOSITORY: s3:http://minio:9000/backups/swarm-repo
+                BAKABEL_SCHEDULE: "0 2 * * *"
+                BAKABEL_TZ: Asia/Ho_Chi_Minh
+                BAKABEL_SCOPE: testapp
+                BAKABEL_RETENTION: "last=1"
+                RESTIC_PASSWORD: swarm-s3-passphrase
+                AWS_ACCESS_KEY_ID: bakabeltest
+                AWS_SECRET_ACCESS_KEY: bakabelsecret
+                AWS_DEFAULT_REGION: us-east-1
+              volumes:
+                - bakabel-state:/var/lib/bakabel
+                - /var/run/docker.sock:/var/run/docker.sock:ro
+              networks:
+                - default
+                - s3net
+              deploy:
+                replicas: 1
+                placement:
+                  constraints:
+                    - node.role == manager
+                    - node.id == ${NODE_ID}
+          volumes:
+            bakabel-state:
+          networks:
+            default:
+            s3net:
+              external: true
+              name: ${S3_NET}
+          EOF
+          docker stack deploy --resolve-image never -c "$WORK/backup.yaml" backup >/dev/null
+
+          # Wait for Swarm task containers
+          wait_task_ctr() {
+            for i in $(seq 1 45); do
+              cid=$(docker ps -q --filter "label=com.docker.swarm.service.name=$1" | head -n 1)
+              if [ -n "$cid" ]; then echo "$cid"; return 0; fi
+              sleep 1
+            done
+            return 1
+          }
+          PG_SRC_CTR=$(wait_task_ctr testapp_db)
+          FILES_CTR=$(wait_task_ctr testapp_files)
+          BAK_CTR=$(wait_task_ctr backup_bakabel)
+
+          for i in $(seq 1 30); do
+            if docker exec "$PG_SRC_CTR" pg_isready -U app -d appdb >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          for i in $(seq 1 15); do
+            if docker exec "$FILES_CTR" test -f /data/nested/file.txt >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          docker exec "$PG_SRC_CTR" psql -U app -d appdb -c \
+            "CREATE TABLE records (id INT PRIMARY KEY, body TEXT); INSERT INTO records SELECT g, 'row-' || g FROM generate_series(1, 1000) g;"
+
+          echo "=== Swarm plan ==="
+          PLAN=$(docker exec "$BAK_CTR" bakabel plan)
+          echo "$PLAN"
+          printf '%s' "$PLAN" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["platform"]=="swarm" and len(d["targets"])==2, d'
+
+          echo "=== Swarm + S3 run #1 (auto-init S3 repo + backup + retention) ==="
+          docker exec "$BAK_CTR" bakabel run
+          echo "=== Swarm + S3 run #2 (verify retention keeps 1 per target) ==="
+          docker exec "$BAK_CTR" bakabel run
+
+          # Verify source DB stayed online with 0 restarts
+          RESTARTS=$(docker inspect -f '{{.RestartCount}}' "$PG_SRC_CTR")
+          test "$RESTARTS" = "0"
+
+          echo "=== Swarm health & snapshots ==="
+          docker exec "$BAK_CTR" bakabel health
+          SNAPS=$(docker exec "$BAK_CTR" bakabel snapshots)
+          echo "$SNAPS"
+          printf '%s' "$SNAPS" | python3 -c 'import json,sys; s=json.load(sys.stdin); assert len(s)==2, f"expected 2 snapshots after last=1 retention, got {len(s)}"'
+
+          PG_SNAP=$(printf '%s' "$SNAPS" | python3 -c 'import json,sys; print([s["id"] for s in json.load(sys.stdin) if "type:postgres" in s["tags"]][0])')
+          VOL_SNAP=$(printf '%s' "$SNAPS" | python3 -c 'import json,sys; print([s["id"] for s in json.load(sys.stdin) if "type:volume" in s["tags"]][0])')
+
+          echo "=== Restore Swarm Postgres snapshot from S3 into fresh DB ==="
+          docker run -d --name "$PG_DST" -e POSTGRES_USER=app -e POSTGRES_PASSWORD=swarmpw -e POSTGRES_DB=appdb postgres:18.6-alpine3.24 >/dev/null
+          for i in $(seq 1 30); do
+            if docker exec "$PG_DST" pg_isready -U app -d appdb >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          docker exec "$BAK_CTR" bakabel restore "$PG_SNAP" --container "$PG_DST"
+          COUNT=$(docker exec "$PG_DST" psql -At -U app -d appdb -c "SELECT count(*) FROM records;")
+          echo "Restored Swarm Postgres rows: $COUNT"
+          test "$COUNT" = "1000"
+
+          echo "=== Restore Swarm Volume snapshot from S3 into fresh volume ==="
+          docker volume create "$VOL_DST" >/dev/null
+          docker exec "$BAK_CTR" bakabel restore "$VOL_SNAP" --volume "$VOL_DST"
+          CONTENT=$(docker run --rm -v "$VOL_DST:/check:ro" alpine:3.21 cat /check/nested/file.txt)
+          echo "Restored Swarm Volume content: $CONTENT"
+          test "$CONTENT" = "swarm-s3-ok"
+          echo "End-to-end Swarm + S3 (MinIO) CI test PASSED!"

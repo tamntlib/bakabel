@@ -284,6 +284,23 @@ func (c *Client) InspectVolume(ctx context.Context, name string) (Volume, error)
 	return vol, err
 }
 
+// Network represents metadata from GET /networks/<name>.
+type Network struct {
+	Name       string `json:"Name"`
+	Scope      string `json:"Scope"`
+	Attachable bool   `json:"Attachable"`
+}
+
+// InspectNetwork returns metadata for a Docker network.
+func (c *Client) InspectNetwork(ctx context.Context, name string) (Network, error) {
+	var netInfo Network
+	if strings.TrimSpace(name) == "" {
+		return netInfo, errors.New("network name is required")
+	}
+	err := c.request(ctx, http.MethodGet, "/networks/"+url.PathEscape(name), nil, &netInfo)
+	return netInfo, err
+}
+
 var mountinfoContainerRe = regexp.MustCompile(`/containers/([0-9a-f]{64})/`)
 
 // SelfContainer resolves the container Bakabel is currently running inside, or nil if running on a host.
