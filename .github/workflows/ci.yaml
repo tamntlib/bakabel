@@ -132,47 +132,50 @@ jobs:
           test "$CONTENT" = "hello-bakabel"
           echo "End-to-end Compose + Local CI test PASSED!"
 
-      - name: End-to-end Docker Swarm + S3 (MinIO) backup, retention, and restore test
+      - name: End-to-end Docker Swarm + S3 (VersityGW) backup, retention, and restore test
         run: |
           set -euo pipefail
           docker swarm init --advertise-addr 127.0.0.1 >/dev/null
           NODE_ID=$(docker info --format '{{.Swarm.NodeID}}')
           S3_NET="bakabel-s3-net"
-          MINIO_CTR="bakabel-ci-minio"
+          S3_CTR="bakabel-ci-s3"
+          S3_VOL="bakabel-ci-s3-data"
           PG_DST="bakabel-swarm-pg-dst"
           VOL_DST="bakabel-swarm-vol-dst"
           WORK=$(mktemp -d)
           cleanup() {
             docker stack rm backup testapp >/dev/null 2>&1 || true
-            docker rm -f "$MINIO_CTR" "$PG_DST" >/dev/null 2>&1 || true
+            docker rm -f "$S3_CTR" "$PG_DST" >/dev/null 2>&1 || true
             for i in $(seq 1 20); do
               if [ -z "$(docker ps -aq --filter label=com.docker.stack.namespace=backup)" ] && \
                  [ -z "$(docker ps -aq --filter label=com.docker.stack.namespace=testapp)" ]; then break; fi
               sleep 1
             done
-            docker volume rm "$VOL_DST" testapp_pgdata testapp_filesdata backup_bakabel-state >/dev/null 2>&1 || true
+            docker volume rm "$S3_VOL" "$VOL_DST" testapp_pgdata testapp_filesdata backup_bakabel-state >/dev/null 2>&1 || true
             docker network rm "$S3_NET" >/dev/null 2>&1 || true
             rm -rf "$WORK"
           }
           trap cleanup EXIT
 
-          # Create attachable overlay network and MinIO S3 backend with bucket "backups"
+          # Create attachable overlay network and VersityGW S3 backend with bucket "backups"
           docker network create --driver overlay --attachable "$S3_NET" >/dev/null
-          docker run -d --name "$MINIO_CTR" --network "$S3_NET" --network-alias minio \
-            -e MINIO_ROOT_USER=bakabeltest -e MINIO_ROOT_PASSWORD=bakabelsecret \
-            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data >/dev/null
+          docker volume create "$S3_VOL" >/dev/null
+          docker run --rm -v "$S3_VOL:/data" alpine:3.21 mkdir -p /data/backups
+          docker run -d --name "$S3_CTR" --network "$S3_NET" --network-alias s3 \
+            -e ROOT_ACCESS_KEY=bakabeltest -e ROOT_SECRET_KEY=bakabelsecret \
+            -v "$S3_VOL:/data" \
+            ghcr.io/versity/versitygw:v1.11.0 --port :7070 posix /data >/dev/null
 
-          # Wait for MinIO and create bucket via minio/mc
-          MINIO_READY=0
+          # Wait for VersityGW S3 endpoint to accept connections
+          S3_READY=0
           for i in $(seq 1 30); do
-            if docker run --rm --network "$S3_NET" --entrypoint sh minio/mc:RELEASE.2025-04-16T18-13-26Z -c \
-              'mc alias set local http://minio:9000 bakabeltest bakabelsecret >/dev/null && mc mb --ignore-existing local/backups >/dev/null' >/dev/null 2>&1; then
-              MINIO_READY=1
+            if docker run --rm --network "$S3_NET" alpine:3.21 nc -z s3 7070 >/dev/null 2>&1; then
+              S3_READY=1
               break
             fi
             sleep 1
           done
-          test "$MINIO_READY" = "1"
+          test "$S3_READY" = "1"
 
           # Deploy application Swarm stack with deploy.labels (bakabel.type=postgres & volume)
           cat > "$WORK/testapp.yaml" <<EOF
@@ -219,7 +222,7 @@ jobs:
             bakabel:
               image: bakabel:ci
               environment:
-                BAKABEL_REPOSITORY: s3:http://minio:9000/backups/swarm-repo
+                BAKABEL_REPOSITORY: s3:http://s3:7070/backups/swarm-repo
                 BAKABEL_SCHEDULE: "0 2 * * *"
                 BAKABEL_TZ: Asia/Ho_Chi_Minh
                 BAKABEL_SCOPE: testapp
@@ -314,4 +317,4 @@ jobs:
           CONTENT=$(docker run --rm -v "$VOL_DST:/check:ro" alpine:3.21 cat /check/nested/file.txt)
           echo "Restored Swarm Volume content: $CONTENT"
           test "$CONTENT" = "swarm-s3-ok"
-          echo "End-to-end Swarm + S3 (MinIO) CI test PASSED!"
+          echo "End-to-end Swarm + S3 (VersityGW) CI test PASSED!"
