@@ -1,0 +1,23 @@
+services:
+  bakabel:
+    image: ghcr.io/tamntlib/bakabel:v0.2.0
+    environment:
+      BAKABEL_REPOSITORY: /repository # or s3:https://s3.example.com/my-bucket
+      BAKABEL_SCHEDULE: "0 2 * * *"
+      BAKABEL_TZ: Asia/Ho_Chi_Minh
+      # BAKABEL_SCOPE: myapp # optional; empty discovers all labeled services
+      # BAKABEL_RETENTION: "7d,4w,6m" # optional; disabled by default
+      RESTIC_PASSWORD: ${RESTIC_PASSWORD:?set restic repository password}
+      # For S3-compatible storage:
+      # AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      # AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      # AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION}
+    volumes:
+      - bakabel-state:/var/lib/bakabel
+      - bakabel-repo:/repository # remove if storing directly in S3
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    restart: unless-stopped
+
+volumes:
+  bakabel-state:
+  bakabel-repo:

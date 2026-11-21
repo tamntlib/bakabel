@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run Go unit tests (-race) and go vet
+        run: |
+          set -euo pipefail
+          MOD_VOL="bakabel-mod-$$"
+          extractor=$(docker create restic/restic:0.18.1 version)
+          cleanup() {
+            docker rm "$extractor" >/dev/null 2>&1 || true
+            docker volume rm "$MOD_VOL" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          docker cp "$extractor:/usr/bin/restic" "$RUNNER_TEMP/restic"
+          docker volume create "$MOD_VOL" >/dev/null
+          docker run --rm \
+            -e GOTOOLCHAIN=local \
+            -v "$PWD:/work:ro" -w /work -v "$MOD_VOL:/go/pkg/mod" \
+            golang:1.26.10-bookworm \
+            sh -eu -c 'go mod download && go mod verify'
+          docker run --rm --network none \
+            -e GOTOOLCHAIN=local -e GOAMD64=v1 -e RESTIC_BIN=/usr/bin/restic \
+            -v "$RUNNER_TEMP/restic:/usr/bin/restic:ro" \
+            -v "$MOD_VOL:/go/pkg/mod:ro" \
+            -v "$PWD:/work:ro" -w /work \
+            golang:1.26.10-bookworm \
+            sh -eu -c 'go test -race -count=1 -v ./... && go vet ./...'
+
+      - name: Build image and run end-to-end Postgres + Volume backup/restore test
+        run: |
+          set -euo pipefail
+          docker build --platform linux/amd64 --build-arg VERSION=ci -t bakabel:ci .
+          docker run --rm --network none bakabel:ci version
+          docker run --rm --network none --entrypoint /usr/bin/restic bakabel:ci version
+
+          # End-to-end live integration test: Compose-labeled Postgres + Volume -> auto-init -> backup -> restore
+          NET="bakabel-ci-net-$$"
+          SRC_VOL="bakabel-ci-src-$$"
+          DST_VOL="bakabel-ci-dst-$$"
+          REPO_VOL="bakabel-ci-repo-$$"
+          STATE_VOL="bakabel-ci-state-$$"
+          PG_SRC="bakabel-ci-pg-src-$$"
+          PG_DST="bakabel-ci-pg-dst-$$"
+          VOL_CTR="bakabel-ci-vol-ctr-$$"
+          BAK_CTR="bakabel-ci-runner-$$"
+          cleanup() {
+            docker rm -f "$BAK_CTR" "$PG_SRC" "$PG_DST" "$VOL_CTR" >/dev/null 2>&1 || true
+            docker volume rm "$SRC_VOL" "$DST_VOL" "$REPO_VOL" "$STATE_VOL" >/dev/null 2>&1 || true
+            docker network rm "$NET" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker network create "$NET" >/dev/null
+          docker volume create "$SRC_VOL" >/dev/null
+          docker volume create "$DST_VOL" >/dev/null
+          docker volume create "$REPO_VOL" >/dev/null
+          docker volume create "$STATE_VOL" >/dev/null
+
+          # Start labeled Postgres source and empty restore target
+          docker run -d --name "$PG_SRC" --network "$NET" \
+            -e POSTGRES_USER=app -e POSTGRES_PASSWORD=testpw -e POSTGRES_DB=appdb \
+            -l com.docker.compose.project=ciapp -l com.docker.compose.service=db \
+            -l bakabel.type=postgres \
+            postgres:18.6-alpine3.24 >/dev/null
+          docker run -d --name "$PG_DST" --network "$NET" \
+            -e POSTGRES_USER=app -e POSTGRES_PASSWORD=testpw -e POSTGRES_DB=appdb \
+            postgres:18.6-alpine3.24 >/dev/null
+
+          # Start labeled volume source with test files
+          docker run -d --name "$VOL_CTR" --network "$NET" \
+            -v "$SRC_VOL:/data" \
+            -l com.docker.compose.project=ciapp -l com.docker.compose.service=files \
+            -l bakabel.type=volume -l bakabel.paths=/data \
+            alpine:3.21 sh -c 'mkdir -p /data/sub && printf "hello-bakabel\n" > /data/sub/note.txt && sleep 300' >/dev/null
+
+          # Wait for Postgres containers to be ready
+          for ctr in "$PG_SRC" "$PG_DST"; do
+            for i in $(seq 1 30); do
+              if docker exec "$ctr" pg_isready -U app -d appdb >/dev/null 2>&1; then break; fi
+              sleep 1
+            done
+          done
+          docker exec "$PG_SRC" psql -U app -d appdb -c "CREATE TABLE items (id INT PRIMARY KEY, name TEXT); INSERT INTO items VALUES (1, 'alpha'), (2, 'beta');"
+
+          # Start Bakabel container (100% env vars, zero manual restic init!)
+          docker run -d --name "$BAK_CTR" --network "$NET" \
+            -e BAKABEL_REPOSITORY=/repository \
+            -e RESTIC_PASSWORD=ci-secret-password \
+            -e BAKABEL_SCOPE=ciapp \
+            -e BAKABEL_SCHEDULE="0 2 * * *" \
+            -v "$STATE_VOL:/var/lib/bakabel" \
+            -v "$REPO_VOL:/repository" \
+            -v /var/run/docker.sock:/var/run/docker.sock:ro \
+            bakabel:ci serve >/dev/null
+
+          echo "=== plan ==="
+          docker exec "$BAK_CTR" bakabel plan
+          echo "=== run (with auto-init) ==="
+          docker exec "$BAK_CTR" bakabel run
+          echo "=== health ==="
+          docker exec "$BAK_CTR" bakabel health
+          echo "=== snapshots ==="
+          SNAPS=$(docker exec "$BAK_CTR" bakabel snapshots)
+          echo "$SNAPS"
+
+          PG_SNAP=$(printf '%s' "$SNAPS" | python3 -c 'import json,sys; print([s["id"] for s in json.load(sys.stdin) if "type:postgres" in s["tags"]][0])')
+          VOL_SNAP=$(printf '%s' "$SNAPS" | python3 -c 'import json,sys; print([s["id"] for s in json.load(sys.stdin) if "type:volume" in s["tags"]][0])')
+
+          echo "=== restore postgres ==="
+          docker exec "$BAK_CTR" bakabel restore "$PG_SNAP" --container "$PG_DST"
+          ROWS=$(docker exec "$PG_DST" psql -At -U app -d appdb -c "SELECT count(*) FROM items;")
+          test "$ROWS" = "2"
+
+          echo "=== restore volume ==="
+          docker exec "$BAK_CTR" bakabel restore "$VOL_SNAP" --volume "$DST_VOL"
+          CONTENT=$(docker run --rm -v "$DST_VOL:/check:ro" alpine:3.21 cat /check/sub/note.txt)
+          test "$CONTENT" = "hello-bakabel"
+          echo "End-to-end CI test PASSED!"

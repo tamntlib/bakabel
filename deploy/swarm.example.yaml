@@ -1,0 +1,30 @@
+services:
+  bakabel:
+    image: ghcr.io/tamntlib/bakabel:v0.2.0
+    environment:
+      BAKABEL_REPOSITORY: /repository # or s3:https://s3.example.com/my-bucket
+      BAKABEL_SCHEDULE: "0 2 * * *"
+      BAKABEL_TZ: Asia/Ho_Chi_Minh
+      # BAKABEL_SCOPE: llmproxy-data # optional; empty discovers all labeled services
+      # BAKABEL_RETENTION: "7d,4w,6m" # optional; disabled by default
+      RESTIC_PASSWORD: ${RESTIC_PASSWORD:?set restic repository password}
+      # Or use RESTIC_PASSWORD_FILE: /run/secrets/restic-password
+    volumes:
+      - bakabel-state:/var/lib/bakabel
+      - bakabel-repo:/repository # remove if storing directly in S3
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  bakabel-state:
+  bakabel-repo:
