@@ -207,7 +207,7 @@ func (r *Runner) backupPostgres(ctx context.Context, dc *docker.Client, t docker
 	if t.DBPassword != "" {
 		execEnv = []string{"PGPASSWORD=" + t.DBPassword}
 	}
-	script := `set -eu; pg_dump --format=custom --no-password -U "$1" -d "$2"; printf '\000BAKABEL_DONE:%s\000' "$3"`
+	script := `set -eu; pg_dump --format=custom --compress=0 --no-password -U "$1" -d "$2"; printf '\000BAKABEL_DONE:%s\000' "$3"`
 
 	var stderrBuf bytes.Buffer
 	execDone := make(chan error, 1)
