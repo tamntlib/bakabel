@@ -10,16 +10,13 @@ COPY cmd ./cmd
 COPY internal ./internal
 RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS="$TARGETOS" GOARCH="$TARGETARCH" GOAMD64=v1 \
-    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/bakabel ./cmd/bakabel && \
-    mkdir -p /out/tmp /out/var/lib/bakabel
+    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/bakabel ./cmd/bakabel
 
 FROM restic/restic:0.18.1 AS restic
 
-FROM scratch
+FROM alpine:3.21
+RUN apk add --no-cache sqlite ca-certificates && mkdir -p /var/lib/bakabel && chmod 0700 /var/lib/bakabel
 COPY --from=build /out/bakabel /usr/local/bin/bakabel
 COPY --from=restic /usr/bin/restic /usr/bin/restic
-COPY --from=restic /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
-COPY --from=build --chmod=0700 /out/tmp /tmp
-COPY --from=build --chmod=0700 /out/var/lib/bakabel /var/lib/bakabel
 ENTRYPOINT ["/usr/local/bin/bakabel"]
 CMD ["serve"]

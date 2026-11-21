@@ -9,9 +9,10 @@ Drop Bakabel in as an independent backup stack, add `bakabel.type` labels to the
 - **100% environment-variable configuration** (`*_FILE` supported for all secrets) — no required YAML config file.
 - **Zero-touch safe `restic init`:** on first run, if the repository does not exist and is empty, Bakabel initializes it automatically and pins its `repository_id` in state. If storage ever disappears or changes later, Bakabel fails closed and refuses to re-initialize.
 - **Online PostgreSQL streaming:** runs `pg_dump --format=custom` via Docker exec and streams directly into `restic backup --stdin` with header + completion-sentinel verification (no staging dump file, no silent truncation, no database downtime).
+- **Online SQLite WAL-safe backup:** uses an ephemeral helper container with `sqlite3` Online Backup API (`PRAGMA query_only=ON` + `.backup`, dropping to the DB file's UID:GID so `-wal`/`-shm` ownership is untouched), verifies `PRAGMA integrity_check`, and streams the consistent snapshot into Restic — works even when the app container has no `sqlite3` CLI.
 - **Named Docker volumes:** mounts each labeled local named volume read-only into an ephemeral helper container using Bakabel's own image (auto-detected — no `worker_image` duplication) and backs it up with Restic.
 - **Safe restore & health checks:** restores only into explicit empty targets (`bakabel restore`), includes read-only `bakabel health`, optional retention (`BAKABEL_RETENTION`), and optional failure webhooks.
-- **Tiny `scratch` image:** static Go binary (`GOAMD64=v1`) + Restic + CA certs + embedded timezone data.
+- **Minimal Alpine image:** static Go binary (`GOAMD64=v1`) + Restic + `sqlite3` + CA certs + embedded timezone data.
 
 ## Quick start
 
@@ -47,6 +48,13 @@ bakabel.type: postgres
 # bakabel.postgres.user: app
 ```
 
+**SQLite** (Compose `labels:` or Swarm `deploy.labels:`):
+
+```yaml
+bakabel.type: sqlite
+bakabel.paths: /data/app.db # comma-separated SQLite DB file paths inside named volume(s)
+```
+
 **Named Docker volume** (Compose `labels:` or Swarm `deploy.labels:`):
 
 ```yaml
@@ -54,7 +62,7 @@ bakabel.type: volume
 bakabel.paths: /data # comma-separated exact container mount destinations
 ```
 
-> Do not use `bakabel.type: volume` for live database data directories (PGDATA is explicitly refused; use `bakabel.type: postgres`).
+> Do not use `bakabel.type: volume` for live database data directories (PGDATA is explicitly refused; use `bakabel.type: postgres` or `bakabel.type: sqlite`).
 
 ### 3. CLI commands
 

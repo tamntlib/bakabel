@@ -47,6 +47,7 @@ jobs:
           docker build --platform linux/amd64 --build-arg VERSION=ci -t bakabel:ci .
           docker run --rm --network none bakabel:ci version
           docker run --rm --network none --entrypoint /usr/bin/restic bakabel:ci version
+          docker run --rm --network none --entrypoint /usr/bin/sqlite3 bakabel:ci --version
 
           # End-to-end live integration test: Compose-labeled Postgres + Volume -> auto-init -> backup -> restore
           NET="bakabel-ci-net-$$"
@@ -142,6 +143,7 @@ jobs:
           S3_VOL="bakabel-ci-s3-data"
           PG_DST="bakabel-swarm-pg-dst"
           VOL_DST="bakabel-swarm-vol-dst"
+          SQLITE_DST="bakabel-swarm-sqlite-dst"
           WORK=$(mktemp -d)
           cleanup() {
             docker stack rm backup testapp >/dev/null 2>&1 || true
@@ -151,7 +153,7 @@ jobs:
                  [ -z "$(docker ps -aq --filter label=com.docker.stack.namespace=testapp)" ]; then break; fi
               sleep 1
             done
-            docker volume rm "$S3_VOL" "$VOL_DST" testapp_pgdata testapp_filesdata backup_bakabel-state >/dev/null 2>&1 || true
+            docker volume rm "$S3_VOL" "$VOL_DST" "$SQLITE_DST" testapp_pgdata testapp_filesdata testapp_usagedata backup_bakabel-state >/dev/null 2>&1 || true
             docker network rm "$S3_NET" >/dev/null 2>&1 || true
             rm -rf "$WORK"
           }
@@ -208,9 +210,32 @@ jobs:
                 labels:
                   bakabel.type: volume
                   bakabel.paths: /data
+            usage:
+              image: bakabel:ci
+              entrypoint: ["/bin/sh", "-eu", "-c"]
+              command:
+                - |
+                  exec sqlite3 /data/app.db \
+                    -cmd "PRAGMA journal_mode=WAL;" \
+                    -cmd "PRAGMA wal_autocheckpoint=0;" \
+                    -cmd "CREATE TABLE events(id INTEGER PRIMARY KEY, label TEXT);" \
+                    -cmd "WITH RECURSIVE cnt(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM cnt WHERE x<500) INSERT INTO events SELECT x, 'evt-' || x FROM cnt;" \
+                    -cmd ".shell chown 100:101 /data /data/app.db /data/app.db-wal /data/app.db-shm" \
+                    -cmd ".shell sleep 600"
+              volumes:
+                - usagedata:/data
+              deploy:
+                replicas: 1
+                placement:
+                  constraints:
+                    - node.id == ${NODE_ID}
+                labels:
+                  bakabel.type: sqlite
+                  bakabel.paths: /data/app.db
           volumes:
             pgdata:
             filesdata:
+            usagedata:
           EOF
           docker stack deploy --resolve-image never -c "$WORK/testapp.yaml" testapp >/dev/null
 
@@ -264,6 +289,7 @@ jobs:
           }
           PG_SRC_CTR=$(wait_task_ctr testapp_db)
           FILES_CTR=$(wait_task_ctr testapp_files)
+          USAGE_CTR=$(wait_task_ctr testapp_usage)
           BAK_CTR=$(wait_task_ctr backup_bakabel)
 
           for i in $(seq 1 30); do
@@ -274,31 +300,38 @@ jobs:
             if docker exec "$FILES_CTR" test -f /data/nested/file.txt >/dev/null 2>&1; then break; fi
             sleep 1
           done
+          for i in $(seq 1 15); do
+            if [ "$(docker exec "$USAGE_CTR" stat -c '%u:%g' /data/app.db-wal 2>/dev/null || true)" = "100:101" ]; then break; fi
+            sleep 1
+          done
           docker exec "$PG_SRC_CTR" psql -U app -d appdb -c \
             "CREATE TABLE records (id INT PRIMARY KEY, body TEXT); INSERT INTO records SELECT g, 'row-' || g FROM generate_series(1, 1000) g;"
 
           echo "=== Swarm plan ==="
           PLAN=$(docker exec "$BAK_CTR" bakabel plan)
           echo "$PLAN"
-          printf '%s' "$PLAN" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["platform"]=="swarm" and len(d["targets"])==2, d'
+          printf '%s' "$PLAN" | python3 -c 'import json,sys; d=json.load(sys.stdin); assert d["platform"]=="swarm" and len(d["targets"])==3, d'
 
           echo "=== Swarm + S3 run #1 (auto-init S3 repo + backup + retention) ==="
           docker exec "$BAK_CTR" bakabel run
           echo "=== Swarm + S3 run #2 (verify retention keeps 1 per target) ==="
           docker exec "$BAK_CTR" bakabel run
 
-          # Verify source DB stayed online with 0 restarts
-          RESTARTS=$(docker inspect -f '{{.RestartCount}}' "$PG_SRC_CTR")
-          test "$RESTARTS" = "0"
+          # Verify source DBs stayed online with 0 restarts and SQLite owner stayed 100:101
+          test "$(docker inspect -f '{{.RestartCount}}' "$PG_SRC_CTR")" = "0"
+          test "$(docker inspect -f '{{.RestartCount}}' "$USAGE_CTR")" = "0"
+          test "$(docker exec "$USAGE_CTR" stat -c '%u:%g' /data/app.db)" = "100:101"
+          test "$(docker exec "$USAGE_CTR" stat -c '%u:%g' /data/app.db-wal)" = "100:101"
 
           echo "=== Swarm health & snapshots ==="
           docker exec "$BAK_CTR" bakabel health
           SNAPS=$(docker exec "$BAK_CTR" bakabel snapshots)
           echo "$SNAPS"
-          printf '%s' "$SNAPS" | python3 -c 'import json,sys; s=json.load(sys.stdin); assert len(s)==2, f"expected 2 snapshots after last=1 retention, got {len(s)}"'
+          printf '%s' "$SNAPS" | python3 -c 'import json,sys; s=json.load(sys.stdin); assert len(s)==3, f"expected 3 snapshots after last=1 retention, got {len(s)}"'
 
           PG_SNAP=$(printf '%s' "$SNAPS" | python3 -c 'import json,sys; print([s["id"] for s in json.load(sys.stdin) if "type:postgres" in s["tags"]][0])')
           VOL_SNAP=$(printf '%s' "$SNAPS" | python3 -c 'import json,sys; print([s["id"] for s in json.load(sys.stdin) if "type:volume" in s["tags"]][0])')
+          SQLITE_SNAP=$(printf '%s' "$SNAPS" | python3 -c 'import json,sys; print([s["id"] for s in json.load(sys.stdin) if "type:sqlite" in s["tags"]][0])')
 
           echo "=== Restore Swarm Postgres snapshot from S3 into fresh DB ==="
           docker run -d --name "$PG_DST" -e POSTGRES_USER=app -e POSTGRES_PASSWORD=swarmpw -e POSTGRES_DB=appdb postgres:18.6-alpine3.24 >/dev/null
@@ -317,4 +350,12 @@ jobs:
           CONTENT=$(docker run --rm -v "$VOL_DST:/check:ro" alpine:3.21 cat /check/nested/file.txt)
           echo "Restored Swarm Volume content: $CONTENT"
           test "$CONTENT" = "swarm-s3-ok"
+
+          echo "=== Restore Swarm SQLite WAL snapshot from S3 into fresh volume ==="
+          docker volume create "$SQLITE_DST" >/dev/null
+          docker exec "$BAK_CTR" bakabel restore "$SQLITE_SNAP" --volume "$SQLITE_DST"
+          SQLITE_CHECK=$(docker run --rm --entrypoint sh -v "$SQLITE_DST:/check:ro" bakabel:ci -eu -c \
+            'printf "%s %s %s" "$(sqlite3 /check/app.db "PRAGMA integrity_check;")" "$(sqlite3 /check/app.db "SELECT count(*) FROM events;")" "$(stat -c %u:%g /check/app.db)"')
+          echo "Restored Swarm SQLite check: $SQLITE_CHECK"
+          test "$SQLITE_CHECK" = "ok 500 100:101"
           echo "End-to-end Swarm + S3 (VersityGW) CI test PASSED!"

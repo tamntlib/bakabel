@@ -55,6 +55,7 @@ jobs:
             -t "$IMAGE:$VERSION" -t "$IMAGE:sha-$GITHUB_SHA" .
           docker run --rm --network none "$IMAGE:$VERSION" version
           docker run --rm --network none --entrypoint /usr/bin/restic "$IMAGE:$VERSION" version
+          docker run --rm --network none --entrypoint /usr/bin/sqlite3 "$IMAGE:$VERSION" --version
 
       - name: Push to GHCR
         env:

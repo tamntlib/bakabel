@@ -150,3 +150,87 @@ func TestDiscoverSwarmPlacementAndLabels(t *testing.T) {
 		t.Fatalf("expected unsupported placement error, got: %v", err)
 	}
 }
+
+func TestDiscoverSqliteTargetAndGuards(t *testing.T) {
+	c := startFakeDocker(t, func(w http.ResponseWriter, r *http.Request) {
+		p := strings.TrimPrefix(r.URL.Path, "/v1.55")
+		switch p {
+		case "/_ping":
+			w.Header().Set("Api-Version", "1.55")
+			_, _ = w.Write([]byte("OK"))
+		case "/info":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"ID": "daemon-1",
+				"Swarm": map[string]any{
+					"LocalNodeState":   "active",
+					"NodeID":           "node-mgr",
+					"ControlAvailable": true,
+				},
+			})
+		case "/services":
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{
+					"ID": "svc-sqlite",
+					"Spec": map[string]any{
+						"Name": "llmproxy_cli-proxy-api-usage",
+						"Labels": map[string]string{
+							"com.docker.stack.namespace": "llmproxy",
+							"bakabel.type":               "sqlite",
+							"bakabel.paths":              "/data/app.db",
+						},
+					},
+				},
+			})
+		case "/tasks":
+			_ = json.NewEncoder(w).Encode([]map[string]any{{
+				"ID": "t-sql", "ServiceID": "svc-sqlite", "NodeID": "node-mgr",
+				"Status": map[string]any{"State": "running", "ContainerStatus": map[string]any{"ContainerID": "ctr-sql"}},
+			}})
+		case "/containers/ctr-sql/json":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"Id":    "ctr-sql",
+				"State": map[string]any{"Running": true, "StartedAt": "2026-11-21T00:00:00Z"},
+				"Mounts": []map[string]any{
+					{"Type": "volume", "Name": "llmproxy_cli-proxy-api-usage-data", "Destination": "/data", "RW": true},
+				},
+			})
+		case "/volumes/llmproxy_cli-proxy-api-usage-data":
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"Name":   "llmproxy_cli-proxy-api-usage-data",
+				"Driver": "local",
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	})
+
+	res, err := Discover(context.Background(), c, DiscoverOptions{Platform: "auto"})
+	if err != nil {
+		t.Fatalf("Discover sqlite failed: %v", err)
+	}
+	if len(res.Targets) != 1 {
+		t.Fatalf("expected 1 sqlite target, got %+v", res.Targets)
+	}
+	got := res.Targets[0]
+	if got.Type != "sqlite" || got.ID != "llmproxy/cli-proxy-api-usage/sqlite/data/app.db" || got.VolumeName != "llmproxy_cli-proxy-api-usage-data" || got.MountPath != "/data" || got.DBPath != "app.db" {
+		t.Fatalf("unexpected sqlite target: %+v", got)
+	}
+
+	// Reject mount root directory without file path and reject bind mounts.
+	ctr := Container{
+		ID: "ctr-bad",
+		Mounts: []Mount{
+			{Type: "volume", Name: "vol-a", Destination: "/data", RW: true},
+			{Type: "bind", Source: "/host/db", Destination: "/bind-data", RW: true},
+		},
+	}
+	if _, err := resolveTarget(context.Background(), c, "swarm", "s", "svc", map[string]string{LabelType: "sqlite", LabelPaths: "/data"}, ctr, nil); err == nil {
+		t.Fatal("expected error when bakabel.paths points to mount directory")
+	}
+	if _, err := resolveTarget(context.Background(), c, "swarm", "s", "svc", map[string]string{LabelType: "sqlite", LabelPaths: "/bind-data/app.db"}, ctr, nil); err == nil {
+		t.Fatal("expected error when sqlite path is on a bind mount")
+	}
+	if _, err := resolveTarget(context.Background(), c, "swarm", "s", "svc", map[string]string{LabelType: "sqlite", LabelPaths: "/other/app.db"}, ctr, nil); err == nil {
+		t.Fatal("expected error when sqlite path is outside any mount")
+	}
+}

@@ -157,6 +157,44 @@ func run(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 
+	case "_sqlite-backup":
+		fs := flag.NewFlagSet("_sqlite-backup", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		var targetID, stack, service, volume, mountPath, dbPath string
+		fs.StringVar(&targetID, "target-id", "", "")
+		fs.StringVar(&stack, "stack", "", "")
+		fs.StringVar(&service, "service", "", "")
+		fs.StringVar(&volume, "volume", "", "")
+		fs.StringVar(&mountPath, "mount-path", "", "")
+		fs.StringVar(&dbPath, "db-path", "", "")
+		if err := fs.Parse(rest); err != nil {
+			return 1
+		}
+		snapID, err := r.RunSqliteBackupInternal(ctx, targetID, stack, service, volume, mountPath, dbPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "%v\n", err)
+			return 1
+		}
+		writeJSON(stdout, map[string]string{"snapshot_id": snapID})
+		return 0
+
+	case "_sqlite-restore":
+		fs := flag.NewFlagSet("_sqlite-restore", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		var snapID, snapPath, dbPath, owner string
+		fs.StringVar(&snapID, "snapshot", "", "")
+		fs.StringVar(&snapPath, "snap-path", "", "")
+		fs.StringVar(&dbPath, "db-path", "", "")
+		fs.StringVar(&owner, "owner", "", "")
+		if err := fs.Parse(rest); err != nil {
+			return 1
+		}
+		if err := r.RunSqliteRestoreInternal(ctx, snapID, snapPath, dbPath, owner); err != nil {
+			fmt.Fprintf(stderr, "%v\n", err)
+			return 1
+		}
+		return 0
+
 	default:
 		fmt.Fprintf(stderr, "bakabel: unknown command %q\n", cmd)
 		printUsage(stderr)

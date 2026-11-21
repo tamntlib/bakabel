@@ -153,6 +153,8 @@ func (r *Runner) Run(ctx context.Context) (state.RunResult, error) {
 		switch target.Type {
 		case "postgres":
 			snapID, tErr = r.backupPostgres(runCtx, dc, target)
+		case "sqlite":
+			snapID, tErr = r.backupSqlite(runCtx, dc, self, target)
 		case "volume":
 			snapID, tErr = r.backupVolume(runCtx, dc, self, target)
 		default:
@@ -426,6 +428,8 @@ func (r *Runner) Restore(ctx context.Context, opts RestoreOptions) error {
 	switch snap.TagValue("type") {
 	case "postgres":
 		return r.restorePostgres(ctx, dc, snap, opts)
+	case "sqlite":
+		return r.restoreSqlite(ctx, dc, snap, opts)
 	case "volume":
 		return r.restoreVolume(ctx, dc, snap, opts)
 	default:
@@ -710,6 +714,9 @@ func targetTags(t docker.Target) []string {
 	}
 	if t.VolumeName != "" {
 		tags = append(tags, "volume:"+t.VolumeName)
+	}
+	if t.DBPath != "" {
+		tags = append(tags, "db:"+t.DBPath)
 	}
 	return tags
 }

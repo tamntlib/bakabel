@@ -35,6 +35,7 @@ type Config struct {
 	ResticPassword     string
 	ResticPasswordFile string
 	ResticBin          string
+	SqliteBin          string
 	ResticCacheDir     string
 
 	AWSAccessKeyID     string
@@ -80,6 +81,7 @@ func Load(getenv func(string) string) (Config, error) {
 		ResticPassword:     getenv("RESTIC_PASSWORD"),
 		ResticPasswordFile: get("RESTIC_PASSWORD_FILE"),
 		ResticBin:          get("RESTIC_BIN"),
+		SqliteBin:          get("SQLITE3_BIN"),
 		ResticCacheDir:     get("RESTIC_CACHE_DIR"),
 
 		AWSAccessKeyID:     getenv("AWS_ACCESS_KEY_ID"),
@@ -104,6 +106,9 @@ func Load(getenv func(string) string) (Config, error) {
 
 	if cfg.ResticBin == "" {
 		cfg.ResticBin = "restic"
+	}
+	if cfg.SqliteBin == "" {
+		cfg.SqliteBin = "sqlite3"
 	}
 	if cfg.Platform == "" {
 		cfg.Platform = "auto"

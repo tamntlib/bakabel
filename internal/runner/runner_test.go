@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -145,5 +147,136 @@ func TestResolveWorkerNetworkSwarmAndLocal(t *testing.T) {
 	overrideRunner := New(config.Config{Repository: "s3:http://minio:9000/backups", WorkerNetwork: "custom-net"}, nil)
 	if got := overrideRunner.resolveWorkerNetwork(t.Context(), dc, selfAttachable); got != "custom-net" {
 		t.Fatalf("explicit override = %q, want custom-net", got)
+	}
+}
+
+func TestSqliteHelpersAndValidation(t *testing.T) {
+	rel, full, err := resolveSafeSubpath("/sqlite-src", "nested/app.db")
+	if err != nil || rel != "nested/app.db" || full != "/sqlite-src/nested/app.db" {
+		t.Fatalf("resolveSafeSubpath valid failed: rel=%q full=%q err=%v", rel, full, err)
+	}
+	for _, bad := range []string{"", ".", "..", "../escape.db", "/abs.db"} {
+		if _, _, err := resolveSafeSubpath("/sqlite-src", bad); err == nil {
+			t.Fatalf("expected resolveSafeSubpath to reject %q", bad)
+		}
+	}
+
+	if u, g, ok := parseOwnerTag("100:101"); !ok || u != 100 || g != 101 {
+		t.Fatalf("parseOwnerTag valid failed: %d:%d ok=%v", u, g, ok)
+	}
+	for _, bad := range []string{"", "100", "a:b", "-1:0"} {
+		if _, _, ok := parseOwnerTag(bad); ok {
+			t.Fatalf("expected parseOwnerTag to reject %q", bad)
+		}
+	}
+
+	badFile := filepath.Join(t.TempDir(), "not-sqlite.db")
+	if err := os.WriteFile(badFile, []byte("plain text file, not sqlite"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkSqliteHeader(badFile); err == nil {
+		t.Fatal("expected checkSqliteHeader to reject non-SQLite file")
+	}
+}
+
+func TestSqliteWALBackupAndRestoreRoundTrip(t *testing.T) {
+	sqliteBin := os.Getenv("SQLITE3_BIN")
+	if sqliteBin == "" {
+		sqliteBin = "sqlite3"
+	}
+	if _, err := exec.LookPath(sqliteBin); err != nil {
+		t.Skip("sqlite3 binary not installed in unit test container")
+	}
+	resticBin := os.Getenv("RESTIC_BIN")
+	if resticBin == "" {
+		resticBin = "restic"
+	}
+	if _, err := exec.LookPath(resticBin); err != nil {
+		t.Skip("restic binary not installed in unit test container")
+	}
+
+	tmp := t.TempDir()
+	srcRoot := filepath.Join(tmp, "src")
+	dstRoot := filepath.Join(tmp, "dst")
+	repoDir := filepath.Join(tmp, "repo")
+	stateDir := filepath.Join(tmp, "state")
+	for _, d := range []string{srcRoot, dstRoot, repoDir, stateDir} {
+		if err := os.MkdirAll(d, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Create a WAL-mode database and insert rows with autocheckpoint disabled so data lives in -wal.
+	dbPath := filepath.Join(srcRoot, "app.db")
+	setupSQL := `
+PRAGMA journal_mode=WAL;
+PRAGMA wal_autocheckpoint=0;
+CREATE TABLE usage_events (id INTEGER PRIMARY KEY, model TEXT NOT NULL);
+INSERT INTO usage_events (model) VALUES ('gpt-5.4'), ('claude-4.6'), ('gemini-3');
+`
+	if out, err := exec.Command(sqliteBin, "-bail", dbPath, setupSQL).CombinedOutput(); err != nil {
+		t.Fatalf("setup sqlite db: %v: %s", err, out)
+	}
+
+	cfg := config.Config{
+		Repository:     repoDir,
+		ResticPassword: "test-sqlite-password",
+		ResticBin:      resticBin,
+		SqliteBin:      sqliteBin,
+		ResticCacheDir: filepath.Join(stateDir, "cache"),
+		StateDir:       stateDir,
+		Installation:   "test-host",
+		AutoInit:       true,
+	}
+	r := New(cfg, nil)
+	if _, _, err := r.Restic.EnsureRepo(t.Context(), r.Store); err != nil {
+		t.Fatalf("EnsureRepo: %v", err)
+	}
+
+	target := docker.Target{
+		ID:         "llmproxy/cli-proxy-api-usage/sqlite/data/app.db",
+		Type:       "sqlite",
+		Stack:      "llmproxy",
+		Service:    "cli-proxy-api-usage",
+		VolumeName: "llmproxy_cli-proxy-api-usage-data",
+		MountPath:  "/data",
+		DBPath:     "app.db",
+	}
+	snapID, err := r.backupSqliteFile(t.Context(), srcRoot, target)
+	if err != nil {
+		t.Fatalf("backupSqliteFile: %v", err)
+	}
+
+	snaps, err := r.Snapshots(t.Context())
+	if err != nil || len(snaps) != 1 {
+		t.Fatalf("Snapshots: %+v, %v", snaps, err)
+	}
+	snap := snaps[0]
+	if snap.ID != snapID || snap.TagValue("type") != "sqlite" || snap.TagValue("db") != "app.db" {
+		t.Fatalf("unexpected sqlite snapshot metadata: %+v", snap)
+	}
+
+	// Non-empty restore target must be refused.
+	nonEmpty := filepath.Join(tmp, "nonempty")
+	if err := os.MkdirAll(nonEmpty, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nonEmpty, "existing"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.restoreSqliteFile(t.Context(), nonEmpty, snap.ID, snap.Paths[0], snap.TagValue("db"), snap.TagValue("owner")); err == nil {
+		t.Fatal("expected restoreSqliteFile to refuse non-empty directory")
+	}
+
+	// Restore into empty directory and verify all 3 WAL rows survived cleanly.
+	if err := r.restoreSqliteFile(t.Context(), dstRoot, snap.ID, snap.Paths[0], snap.TagValue("db"), snap.TagValue("owner")); err != nil {
+		t.Fatalf("restoreSqliteFile: %v", err)
+	}
+	out, err := exec.Command(sqliteBin, "-bail", filepath.Join(dstRoot, "app.db"), "SELECT count(*) FROM usage_events;").CombinedOutput()
+	if err != nil {
+		t.Fatalf("query restored sqlite db: %v: %s", err, out)
+	}
+	if strings.TrimSpace(string(out)) != "3" {
+		t.Fatalf("restored row count = %q, want 3", strings.TrimSpace(string(out)))
 	}
 }

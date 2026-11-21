@@ -31,9 +31,10 @@ type Target struct {
 	DBUser     string `json:"db_user,omitempty"`
 	DBPassword string `json:"-"` // never serialized
 
-	// Volume fields
+	// Volume / SQLite fields
 	VolumeName string `json:"volume,omitempty"`
 	MountPath  string `json:"mount_path,omitempty"`
+	DBPath     string `json:"db_path,omitempty"`
 }
 
 // DiscoverOptions controls Docker label discovery.
@@ -324,8 +325,88 @@ func resolveTarget(
 		}
 		return out, nil
 
+	case "sqlite":
+		rawPaths := strings.TrimSpace(labels[LabelPaths])
+		if rawPaths == "" {
+			return nil, fmt.Errorf("service %s/%s has bakabel.type=sqlite but is missing %s", stack, service, LabelPaths)
+		}
+		var out []Target
+		seenPath := make(map[string]struct{})
+		for _, part := range strings.Split(rawPaths, ",") {
+			rawFile := strings.TrimSpace(part)
+			if rawFile == "" {
+				continue
+			}
+			if !strings.HasPrefix(rawFile, "/") {
+				return nil, fmt.Errorf("service %s/%s: bakabel.paths entry %q must be an absolute path", stack, service, rawFile)
+			}
+			cleanFile := path.Clean(rawFile)
+			if _, dup := seenPath[cleanFile]; dup {
+				continue
+			}
+			seenPath[cleanFile] = struct{}{}
+
+			var matched *Mount
+			matchedDest := ""
+			for i := range ctr.Mounts {
+				m := &ctr.Mounts[i]
+				mDest := path.Clean(m.Destination)
+				if cleanFile == mDest {
+					return nil, fmt.Errorf("service %s/%s: bakabel.paths entry %q points to mount directory, expected a SQLite file path", stack, service, cleanFile)
+				}
+				prefix := mDest + "/"
+				if mDest == "/" {
+					prefix = "/"
+				}
+				if strings.HasPrefix(cleanFile, prefix) && len(mDest) > len(matchedDest) {
+					matched = m
+					matchedDest = mDest
+				}
+			}
+			if matched == nil {
+				return nil, fmt.Errorf("service %s/%s: sqlite path %q is not inside any container mount", stack, service, cleanFile)
+			}
+			if matched.Type != "volume" || matched.Name == "" {
+				return nil, fmt.Errorf("service %s/%s: sqlite path %q is on mount type %q; only named Docker volumes are supported", stack, service, cleanFile, matched.Type)
+			}
+			if _, protected := protectedVolumes[matched.Name]; protected {
+				return nil, fmt.Errorf("service %s/%s: refusing to back up Bakabel's own volume %q", stack, service, matched.Name)
+			}
+			vol, err := c.InspectVolume(ctx, matched.Name)
+			if err != nil {
+				return nil, fmt.Errorf("service %s/%s: inspect volume %q: %w", stack, service, matched.Name, err)
+			}
+			if vol.Driver != "local" || len(vol.Options) > 0 {
+				return nil, fmt.Errorf("service %s/%s: volume %q uses unsupported driver/options (driver=%q)", stack, service, matched.Name, vol.Driver)
+			}
+			relPath := strings.TrimPrefix(cleanFile, matchedDest+"/")
+			if matchedDest == "/" {
+				relPath = strings.TrimPrefix(cleanFile, "/")
+			}
+			relPath = path.Clean(relPath)
+			if relPath == "" || relPath == "." || strings.HasPrefix(relPath, "../") || relPath == ".." {
+				return nil, fmt.Errorf("service %s/%s: invalid relative sqlite path %q", stack, service, cleanFile)
+			}
+			out = append(out, Target{
+				ID:                 fmt.Sprintf("%s/%s/sqlite/%s", stack, service, strings.TrimPrefix(cleanFile, "/")),
+				Type:               "sqlite",
+				Platform:           platform,
+				Stack:              stack,
+				Service:            service,
+				ContainerID:        ctr.ID,
+				ContainerStartedAt: ctr.State.StartedAt,
+				VolumeName:         matched.Name,
+				MountPath:          matchedDest,
+				DBPath:             relPath,
+			})
+		}
+		if len(out) == 0 {
+			return nil, fmt.Errorf("service %s/%s: %s resolved to no paths", stack, service, LabelPaths)
+		}
+		return out, nil
+
 	default:
-		return nil, fmt.Errorf("service %s/%s: unsupported %s=%q (expected postgres or volume)", stack, service, LabelType, btype)
+		return nil, fmt.Errorf("service %s/%s: unsupported %s=%q (expected postgres, sqlite, or volume)", stack, service, LabelType, btype)
 	}
 }
 
